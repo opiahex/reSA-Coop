@@ -633,8 +633,10 @@ float g_shotFrom = 0, g_shotTo = 0;  // the camera's clock (ms) at the next cut:
 struct Decision {
     Spot spot;
     float at;
+    uint8_t player;
 };
 std::deque<Decision> g_follow;  // partner: the host's choices still to come
+std::map<uint8_t, Spot> g_playerSpots;
 bool g_decided = false;         // host: a choice not sent yet
 float g_decidedAt = 0;
 struct {
@@ -1658,7 +1660,51 @@ bool TakeDecision(Spot& s, float& at) {
     return true;
 }
 
-void FollowSpot(const Spot& s, float at) { g_follow.push_back({s, at}); }
+void FollowSpot(const Spot& s, float at, uint8_t player) { g_follow.push_back({s, at, player}); }
+
+void SetPlayerSpot(uint8_t player, const Spot& s) { g_playerSpots[player] = s; }
+
+bool PlayerSpot(uint8_t player, Spot& out) {
+    auto it = g_playerSpots.find(player);
+    if (!g_live || !g_haveSpot || it == g_playerSpots.end()) return false;
+    out = it->second;
+    return true;
+}
+
+Spot CompanionSpot(const Spot& primary, int index) {
+    if (index == 0 || primary.pose == POSE_HIDDEN) return primary;
+    const Scene& sc = g_lastScene;
+    if (primary.pose == POSE_WALK) {
+        Track tr;
+        CEntity* cj = CutsceneCj();
+        if (cj && TrackOf(cj, tr)) {
+            for (int side : {-1, 1, 0}) {
+                if (side + 1 == primary.act || !WalkFits(sc, tr, side)) continue;
+                CVector forward = cj->Matrix() ? cj->Matrix()->forward : CVector{0, 1, 0};
+                Walker w = WalkerAt(PathOf(tr), tr.time, CVector{sc.cj.x, sc.cj.y, sc.floor}, forward, tr.time, side);
+                return Spot{w.feet, w.heading, POSE_WALK, (uint8_t)(side + 1)};
+            }
+        }
+    }
+    Spot best = primary;
+    best.pose = POSE_HIDDEN;  // a cramped shot can have room for just one extra
+    float score = kRejected;
+    auto offer = [&](Spot s) {
+        if ((s.ground - primary.ground).Length2D() < 1.0f) return;
+        float r = Rate(sc, s);
+        if (r > score) best = s, score = r;
+    };
+    // Reuse the scene's candidates, including chairs and walls, without putting two peds on one seat.
+    for (const Tried& t : g_tried) offer(t.spot);
+    for (float side : {-1.2f, 1.2f, -2.0f, 2.0f}) {
+        Spot s = primary;
+        s.pose = POSE_STAND;
+        s.act = 0;
+        s.ground = primary.ground + CVector{std::cos(s.heading) * side, std::sin(s.heading) * side, 0};
+        offer(s);
+    }
+    return best;
+}
 
 void Follow() {
     UpdateTalk();
@@ -1666,7 +1712,12 @@ void Follow() {
     if (!g_live || cam::Mode() != kModeFlyBy) return;
     float clock = Ref<float>(cam::Active() + 0x90);
     bool due = false;
-    for (; !g_follow.empty() && g_follow.front().at <= clock + 30.0f; g_follow.pop_front()) g_spot = g_follow.front().spot, due = true;
+    for (; !g_follow.empty() && g_follow.front().at <= clock + 30.0f; g_follow.pop_front()) {
+        const Decision& d = g_follow.front();
+        g_playerSpots[d.player] = d.spot;
+        g_spot = d.spot;
+        due = true;
+    }
     if (!due) return;
     g_haveSpot = true;
     ++g_shot;
@@ -1840,6 +1891,7 @@ void ReleaseAll() {
     g_live = false;
     g_cutscene[0] = 0;
     g_follow.clear();
+    g_playerSpots.clear();
     g_decided = false;
 }
 

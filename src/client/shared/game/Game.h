@@ -308,6 +308,7 @@ struct CPed : CPhysical {
     CEntity*& TargetedObject() { return Field<CEntity*>(this, 0x71C); }
     uint8_t& WeaponSkill() { return Field<uint8_t>(this, 0x72C); }
     uint8_t& FightingStyle() { return Field<uint8_t>(this, 0x72D); }
+    uint8_t& AllowedAttackMoves() { return Field<uint8_t>(this, 0x72E); }
 
     bool InVehicle() { return (PedFlags() >> 8) & 1; }
     bool IsDucking() { return (PedFlags() >> 26) & 1; }
@@ -348,6 +349,8 @@ struct CVehicle : CPhysical {
     int16_t& RemapTxd() { return Field<int16_t>(this, 0x59A); }
 
     bool EngineOn() { return (VehicleFlagsLo() >> 4) & 1; }
+    bool HandbrakeOn() { return (VehicleFlagsLo() >> 5) & 1; }
+    void SetHandbrake(bool v) { v ? VehicleFlagsLo() |= (1u << 5) : VehicleFlagsLo() &= ~(1u << 5); }
     void SetEngineOn(bool v) { v ? VehicleFlagsLo() |= (1u << 4) : VehicleFlagsLo() &= ~(1u << 4); }
     bool LightsOn() { return (VehicleFlagsLo() >> 6) & 1; }
     bool SirenOn() { return (VehicleFlagsHi() >> 15) & 1; }  // bit 47 overall
@@ -369,6 +372,8 @@ struct CPlayerInfo {
     uint8_t maxHealth;     // 0x14F
     uint8_t maxArmour;     // 0x150
     uint8_t _pad151[0x190 - 0x151];
+
+    void* PlayerData() { return reinterpret_cast<uint8_t*>(this) + 4; }  // embedded CPlayerPedData (0xAC bytes)
 };
 static_assert(sizeof(CPlayerInfo) == 0x190);
 

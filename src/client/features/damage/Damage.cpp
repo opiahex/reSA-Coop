@@ -2,7 +2,8 @@
 //  * NPCs and vehicles are damaged only by their owner's game: a hit of the local player on a mirror is
 //    sent to the owner, which applies it with the game's own damage functions (the NPC then reacts to
 //    the remote player as the attacker: flees, fights back, dies);
-//  * shots of the remote player are only replayed here (pad emulation): their damage is dropped, the
+//  * the remote gun pose/sound use pad emulation; actual bullet traces/impacts are replayed by Bullets.cpp.
+//    Their damage is dropped here; the
 //    shooter's game reports its hits itself. Vehicle collisions are the exception: they are simulated
 //    by the victim's owner anyway, so they are never forwarded;
 //  * everything else (NPC shots, explosions, fire) hurts whatever this game owns, the local player too;
@@ -22,6 +23,7 @@
 //    playing while this one watches, and a mission failed when its people got hurt in the scene.
 #include <algorithm>
 #include <cmath>
+#include <map>
 
 #include "common/api/protocol/Protocol.h"
 #include "common/lib/log/Log.h"
@@ -29,11 +31,17 @@
 #include "entities/ped/Peds.h"
 #include "entities/player/Players.h"
 #include "entities/vehicle/Vehicles.h"
+#include "entities/activity/Activities.h"
 #include "shared/api/net-session/Session.h"
 #include "shared/game/Game.h"
 #include "shared/game/Script.h"
+#include "shared/game/Anim.h"
 #include "shared/lib/core/Core.h"
 #include "shared/lib/memory/Memory.h"
+#include "features/damage/HitEvidence.h"
+#include "shared/api/story-actions/StoryActions.h"
+#include "shared/api/story-coop/StoryCoop.h"
+#include "shared/lib/sync/EventWindow.h"
 
 namespace coop {
 
@@ -66,17 +74,16 @@ struct KeepWanted {
     }
 };
 
-// SET_CHAR_ONLY_DAMAGED_BY_PLAYER and SET_CAR_ONLY_DAMAGED_BY_PLAYER (a mission's target, a vigilante's criminals)
-// let through only FindPlayerPed's hits (CEventDamage::AffectsPed, CVehicle::CanVehicleBeDamaged): the other
-// player is a player too, so the flag is off while its hit is applied
+// GTA's "only damaged by player" flag recognises its local CJ. A remote
+// player's validated hit is a player's hit too; retain every other proof.
 struct AsPlayersHit {
-    uint32_t& flags;
+    CPhysical* entity;
     bool had;
-    explicit AsPlayersHit(CPhysical* e) : flags(e->PhysicalFlags()), had(flags & CPhysical::PF_INVULNERABLE) {
-        flags &= ~CPhysical::PF_INVULNERABLE;
+    explicit AsPlayersHit(CPhysical* e) : entity(e), had(e->PhysicalFlags() & CPhysical::PF_INVULNERABLE) {
+        entity->PhysicalFlags() &= ~CPhysical::PF_INVULNERABLE;
     }
     ~AsPlayersHit() {
-        if (had) flags |= CPhysical::PF_INVULNERABLE;
+        if (had) entity->PhysicalFlags() |= CPhysical::PF_INVULNERABLE;
     }
 };
 
@@ -94,12 +101,13 @@ CPed* DriverOf(CEntity* e) { return e && e->IsVehicle() ? ((CVehicle*)e)->Driver
 
 bool IsLocalPlayerEntity(CEntity* e) {
     CPlayerPed* me = FindPlayerPed(0);
-    return e && me && (e == me || DriverOf(e) == me);
+    return e && me && (e == me || DriverOf(e) == me || (e->IsVehicle()&&CooperativeRemoteController((CVehicle*)e)==me));
 }
 
 bool IsRemotePlayerEntity(CEntity* e) {
     if (!e) return false;
     CPed* ped = e->IsPed() ? (CPed*)e : DriverOf(e);
+    if(!ped&&e->IsVehicle())ped=CooperativeRemoteController((CVehicle*)e);
     return ped && Players::Instance().FindByPed(ped);
 }
 
@@ -115,16 +123,23 @@ bool FromOtherSide(CEntity* e) {
     return np && np->owner != Net().MyId();
 }
 
+uint32_t damageSequence=0;EventWindow damageSeen[3];
 void SendDamage(uint8_t kind, uint8_t owner, uint16_t netId, int weapon, float damage, int piece, int dir, const CVector& pos) {
     Writer w(proto::G_DAMAGE);
+    if(++damageSequence==0)++damageSequence;w.U32(damageSequence);
     w.U8(kind);
     w.U8(owner);
-    w.U16(netId);
+    if(kind==TARGET_PED)w.Entity(ENTITY_PED,netId);else if(kind==TARGET_VEHICLE)w.Entity(ENTITY_VEHICLE,netId);else w.U16(netId);
     w.U8((uint8_t)weapon);
     w.F32(damage);
     w.U8((uint8_t)piece);
     w.U8((uint8_t)dir);
     w.Vec({pos.x, pos.y, pos.z});
+    CEntity* target=nullptr;
+    if(kind==TARGET_PED)target=GetPed(Peds::Instance().HandleOf(netId));
+    if(kind==TARGET_VEHICLE)if(auto*n=Vehicles::Instance().Find(netId))target=n->veh;
+    if(kind==TARGET_PLAYER_BY_PLAYER&&!IsCollision(weapon))if(auto*p=Players::Instance().Get(owner))target=p->ped;
+    WriteHitEvidence(w,target);
     Net().Send(proto::CH_RELIABLE, w);
 }
 
@@ -135,11 +150,12 @@ GenerateDamageFn g_origGenerateDamage = nullptr;
 // (bullets, melee, explosions, fire, vehicle hits) goes through it. It tells whether the hit counts (blood, a fight
 // hit): one decided in the other game still does here.
 bool __cdecl HookGenerateDamageEvent(CPed* victim, CEntity* creator, int weapon, int damage, int piece, int dir) {
+    if(TrainingIgnoresContact(victim,creator))return true;
     if (Net().Online() && victim && core::IsPlayerReady()) {
         if (cam::WideScreenOn() && FromOtherSide(creator)) return true;  // see the top of the file
         bool fromRemote = IsRemotePlayerEntity(creator);
         if (fromRemote && victim == FindPlayerPed(0))  // see the top of the file
-            return Net().FriendlyFire() && !IsDirect(weapon) ? g_origGenerateDamage(victim, creator, weapon, damage, piece, dir) : true;
+            return Net().FriendlyFire() && !IsDirect(weapon) && !IsCollision(weapon) ? g_origGenerateDamage(victim, creator, weapon, damage, piece, dir) : true;
         if (fromRemote && weapon == WEAPON_EXPLOSION) {  // see the top of the file
             NetPed* np = Peds::Instance().Find(victim);
             if ((np && np->owner != Net().MyId()) || Players::Instance().FindByPed(victim)) return true;
@@ -181,11 +197,24 @@ bool __cdecl HookGenerateDamageEvent(CPed* victim, CEntity* creator, int weapon,
 using KillWithCarFn = void(__fastcall*)(CPed*, void*, CVehicle*, float, int);
 KillWithCarFn g_origKillWithCar = nullptr;
 void __fastcall HookKillPedWithCar(CPed* ped, void* edx, CVehicle* car, float impulse, int flag) {
+    if(TrainingIgnoresContact(ped,car))return;
     if (Net().Online() && car && core::IsPlayerReady()) {
         if (cam::WideScreenOn() && FromOtherSide(car)) return;
         CPed* driver = car->Driver();
         if (driver && Players::Instance().FindByPed(driver)) {
-            if (Net().FriendlyFire() && ped == FindPlayerPed(0)) g_origKillWithCar(ped, edx, car, impulse, flag);
+            // The driver's report is authoritative, as for bullets. A second collision
+            // computed from the delayed mirror must not apply the same hit twice.
+            return;
+        }
+        if (auto* rp = Players::Instance().FindByPed(ped); rp && driver == FindPlayerPed(0)) {
+            static std::map<uint8_t, uint64_t> lastRam;
+            if (Net().FriendlyFire() && NowMs() - lastRam[rp->id] >= 500) {
+                lastRam[rp->id] = NowMs();
+                auto* sourceCar = Vehicles::Instance().EnsureNetworked(car);
+                SendDamage(TARGET_PLAYER_BY_PLAYER, rp->id, sourceCar ? sourceCar->netId : 0, WEAPON_RAMMEDBYCAR,
+                           std::clamp(impulse, 1.0f, 5000.0f), flag?1:0, 0, ped->GetPosition());
+                LOGI("Rammed player %u (impulse %.0f)", rp->id, impulse);
+            }
             return;
         }
         if (NetPed* np = Peds::Instance().Find(ped); np && np->owner != Net().MyId()) {
@@ -207,6 +236,7 @@ InflictDamageFn g_origInflictDamage = nullptr;
 
 // CVehicle::InflictDamage(damager, weapon, damage, position): bullets, explosions and fire on vehicles
 void __fastcall HookInflictDamage(CVehicle* v, void* edx, CEntity* damager, int weapon, float damage, CVector pos) {
+    if(TrainingIgnoresContact(v,damager))return;
     if (Net().Online() && v && core::IsPlayerReady()) {
         if (!IsCollision(weapon) && IsRemotePlayerEntity(damager)) return;
         if (cam::WideScreenOn() && FromOtherSide(damager)) return;
@@ -217,6 +247,10 @@ void __fastcall HookInflictDamage(CVehicle* v, void* edx, CEntity* damager, int 
         }
     }
     g_origInflictDamage(v, edx, damager, weapon, damage, pos);
+    if(damage>0&&IsLocalPlayerEntity(damager))RecordStoryEntityDamage(v,Net().MyId(),weapon);
+    if (Net().Online()) if (auto* nv = Vehicles::Instance().Find(v); nv && !Vehicles::Instance().IsMirror(*nv)) {
+        nv->lastChangeMs = NowMs(); nv->lastSendMs = 0; nv->lookCheckMs = 0;
+    }
 }
 
 using RegisterKillFn = void(__cdecl*)(CPed*, CEntity*, int, bool);
@@ -226,6 +260,11 @@ RegisterKillFn g_origRegisterKill = nullptr;
 // player is credited to that player's game and counts here as killed by somebody else (see the top of the file).
 void __cdecl HookRegisterKill(CPed* ped, CEntity* killer, int weapon, bool headshot) {
     CPlayerPed* me = FindPlayerPed(0);
+    if(Net().Online()&&ped&&killer&&core::IsPlayerReady()){
+        CPed*source=killer->IsPed()?(CPed*)killer:DriverOf(killer);
+        if(source==me)RecordStoryKill(ped,Net().MyId());
+        else if(auto*rp=source?Players::Instance().FindByPed(source):nullptr)RecordStoryKill(ped,rp->id);
+    }
     if (Net().Online() && ped && killer && killer->IsPed() && core::IsPlayerReady()) {
         if (RemotePlayer* rp = Players::Instance().FindByPed((CPed*)killer)) {
             if (NetPed* np = Peds::Instance().Find(ped); np && np->owner == Net().MyId())
@@ -239,26 +278,70 @@ void __cdecl HookRegisterKill(CPed* ped, CEntity* killer, int weapon, bool heads
     g_origRegisterKill(ped, killer, weapon, headshot);
 }
 
+struct PendingRamReaction {int handle=-1;uint8_t direction=0;uint64_t since=0;uint32_t afterFrame=0;}g_ramReaction;
+uint32_t g_damageFrame=0;
+void UpdateRamReaction(){
+    ++g_damageFrame;if(g_ramReaction.handle<0)return;
+    auto*me=FindPlayerPed(0);
+    if(!me||GetPedRef(me)!=g_ramReaction.handle||me->Health()<=0||me->InVehicle()||anim::FindTask(me,208)||anim::FindTask(me,205)){
+        g_ramReaction={};return;
+    }
+    if(g_damageFrame<g_ramReaction.afterFrame||NowMs()-g_ramReaction.since<100)return;
+    int direction=g_ramReaction.direction;g_ramReaction={};
+    // The native queued event has now had two frames to react. Only a missed
+    // mirror contact needs one native fall/get-up task; never preempt that event.
+    if(void*task=Call<0x61A5A0,void*>(0x18u)){
+        CallMethod<0x678700>(task,direction&3,1000);
+        CallMethod<0x681AF0>((uint8_t*)me->Intelligence()+4,task,0,false);
+        LOGD("Delayed native ram reaction restored (mirror contact missing)");
+    }
+}
+
 void HandleDamage(uint8_t from, Reader& r) {
+    uint32_t sequence=r.U32();
     uint8_t kind = r.U8(), owner = r.U8();
     uint16_t netId = r.U16();
     int weapon = r.U8();
     float damage = r.F32();
     int piece = r.U8(), dir = r.U8();
     Vec3 p = r.Vec();
-    if (!r.Ok() || owner != Net().MyId() || !core::IsPlayerReady() || damage <= 0.0f || damage > 10000.0f) return;
-    // the weapon info (80 entries), the ped pieces (to the head, 9) and the four hit directions are read at these unchecked
-    if (weapon > 58 /* WEAPON_FLARE */ || piece > 9 || dir > 3) return;
-    if (cam::WideScreenOn()) return;  // a scripted scene: the other game's hits are dropped (see the top of the file)
+    bool targetHere = owner == Net().MyId();
+    if (kind == TARGET_PED && Peds::Instance().FindOwned(netId)) targetHere = true;
+    if (kind == TARGET_VEHICLE) if (auto* nv = Vehicles::Instance().Find(netId); nv && !Vehicles::Instance().IsMirror(*nv)) targetHere = true;
+    if (!r.Ok() || !targetHere || !core::IsPlayerReady() || !std::isfinite(damage) || damage <= 0.0f || damage > 10000.0f) return;
+    if (weapon > 58 || piece > 9 || dir > 3 || !std::isfinite(damage)) return;
+    if (cam::WideScreenOn() && (kind == TARGET_PLAYER || kind == TARGET_PLAYER_BY_PLAYER)) return;
     const RemotePlayer* rp = Players::Instance().Get(from);
     CEntity* attacker = rp ? rp->ped : nullptr;
+    CEntity* target=(kind==TARGET_PLAYER||kind==TARGET_PLAYER_BY_PLAYER)?FindPlayerPed(0):nullptr;
+    if(kind==TARGET_PED)target=Peds::Instance().FindOwned(netId);
+    if(kind==TARGET_VEHICLE)if(auto*nv=Vehicles::Instance().Find(netId))target=nv->veh;
+    if(from>=3||!ReadHitEvidence(r,target)||!r.Ok()||!damageSeen[from].Accept(sequence)||TrainingIgnoresContact(target,attacker))return;
     if (kind == TARGET_PED) {
         if (CPed* ped = Peds::Instance().FindOwned(netId)) {
             {
                 KeepWanted keep;
                 AsPlayersHit player(ped);
+                bool fire=false;if(ped->Health()>0&&CallMethod<0x5448B0,bool>(ped,weapon,&fire))RecordStoryDamage(ped,from,weapon);
                 CVehicle* car = rp && rp->ped && rp->ped->InVehicle() ? rp->ped->Vehicle() : nullptr;
-                if (weapon == WEAPON_RAMMEDBYCAR && car) g_origKillWithCar(ped, nullptr, car, damage, 0);
+                auto* me = FindPlayerPed(0);
+                bool unloaded = (ped->AreaCode()!=13&&ped->AreaCode() != me->AreaCode()) || (ped->GetPosition() - me->GetPosition()).Length2D() > 120;
+                if (unloaded) {
+                    uint32_t proof = CPed::PF_INVULNERABLE;
+                    if (weapon <= WEAPON_LAST_MELEE) proof |= CPed::PF_MELEE_PROOF;
+                    else if (IsCollision(weapon)) proof |= CPed::PF_COLLISION_PROOF;
+                    else if (weapon == WEAPON_EXPLOSION) proof |= CPed::PF_EXPLOSION_PROOF;
+                    else if (weapon == 37 || weapon == 18) proof |= CPed::PF_FIRE_PROOF;
+                    else proof |= CPed::PF_BULLET_PROOF;
+                    if (ped->PhysicalFlags() & proof) return;
+                    // Event tasks are not processed outside the owner's loaded world. Use
+                    // the native calculator directly once; it applies armour and health now.
+                    alignas(4) uint8_t calculator[0x14] = {}, response[0x0C] = {};
+                    float was = ped->Health();
+                    CallMethod<0x4AD3F0>(calculator, attacker, damage, weapon, std::clamp(piece, 0, 9), false);
+                    CallMethod<0x4B5AC0>(calculator, ped, response, false);
+                    if (was > 0 && ped->Health() <= 0) HookRegisterKill(ped, attacker, weapon, piece == 9);
+                } else if (weapon == WEAPON_RAMMEDBYCAR && car) g_origKillWithCar(ped, nullptr, car, damage, 0);
                 else if (weapon != WEAPON_RAMMEDBYCAR) g_origGenerateDamage(ped, attacker, weapon, (int)damage, piece, dir);
             }
             LOGI("Player %d hit our ped %04X: weapon %d, damage %.0f, health now %.0f", from, netId, weapon, damage, ped->Health());
@@ -271,7 +354,16 @@ void HandleDamage(uint8_t from, Reader& r) {
         if (!Net().FriendlyFire()) return;
         {
             KeepWanted keep;
-            g_origGenerateDamage(FindPlayerPed(0), attacker, weapon, (int)damage, piece, dir);
+            auto* car = rp && rp->ped && rp->ped->InVehicle() ? rp->ped->Vehicle() : nullptr;
+            if (IsCollision(weapon) && netId) if (auto* nv = Vehicles::Instance().Find(netId)) car = nv->veh;
+            if (IsCollision(weapon) && car) {
+                auto* me = FindPlayerPed(0);
+                g_origKillWithCar(me, nullptr, car, damage, piece!=0);
+                if(!me->InVehicle()&&me->Health()>0&&!anim::FindTask(me,208)&&!anim::FindTask(me,205))
+                    g_ramReaction={GetPedRef(me),(uint8_t)dir,NowMs(),g_damageFrame+2};
+
+            }
+            else g_origGenerateDamage(FindPlayerPed(0), attacker, weapon, (int)damage, piece, dir);
         }
         LOGI("Player %d hit us: weapon %d, damage %.0f, health now %.0f", from, weapon, damage, FindPlayerPed(0)->Health());
     } else if (kind == TARGET_PLAYER) {
@@ -284,6 +376,8 @@ void HandleDamage(uint8_t from, Reader& r) {
             KeepWanted keep;
             AsPlayersHit player(nv->veh);
             g_origInflictDamage(nv->veh, nullptr, attacker, weapon, damage, CVector{p.x, p.y, p.z});
+            RecordStoryEntityDamage(nv->veh,from,weapon);
+            nv->lastChangeMs = NowMs(); nv->lastSendMs = 0; nv->lookCheckMs = 0;
         }
     } else if (kind == KILLED_BY_YOU) {
         int h = Peds::Instance().HandleOf(netId);  // its copy here: a civilian, it counts as what its owner has
@@ -305,6 +399,11 @@ void HandleDamage(uint8_t from, Reader& r) {
 class Damage : public Module {
 public:
     const char* Name() const override { return "Damage"; }
+    void OnPostProcess() override {if(Net().Online()&&core::IsPlayerReady())UpdateRamReaction();}
+    void OnPeerLeave(uint8_t id)override{if(id<3)damageSeen[id]={};}
+    void OnPeerResync(uint8_t id)override{OnPeerLeave(id);}
+    void OnSessionEnd() override {g_ramReaction={};for(auto&w:damageSeen)w={};damageSequence=0;}
+    void OnGameShutdown() override {g_ramReaction={};for(auto&w:damageSeen)w={};}
     void OnInstallHooks() override {
         mem::HookFn(0x73A530, &HookGenerateDamageEvent, &g_origGenerateDamage, "CWeapon::GenerateDamageEvent");
         mem::HookFn(0x6D7C90, &HookInflictDamage, &g_origInflictDamage, "CVehicle::InflictDamage");

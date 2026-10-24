@@ -6,6 +6,8 @@
 // puts out (water, an extinguisher) puts the owner's fire out too: the partner helps with the host's firefighting.
 #include <cmath>
 #include <map>
+#include <deque>
+#include <algorithm>
 
 #include "common/api/protocol/Protocol.h"
 #include "common/lib/log/Log.h"
@@ -17,6 +19,7 @@
 #include "shared/api/net-session/Session.h"
 #include "shared/game/Game.h"
 #include "shared/lib/core/Core.h"
+#include "shared/lib/sync/EventWindow.h"
 #include "shared/lib/memory/Memory.h"
 
 namespace coop {
@@ -27,8 +30,12 @@ using namespace game;
 constexpr uintptr_t kFireManager = 0xB71F80;  // gFireManager: CFire m_aFires[60], 0x28 bytes each
 constexpr int kFires = 60;
 constexpr uint32_t kFireProof = 1u << 19;     // CPhysical::physicalFlags.bFireProof
-enum : uint8_t { FIRE_START = 1, FIRE_STOP = 2, FIRE_OUT = 3 };  // OUT: a copy was put out, to the owner
+enum : uint8_t { FIRE_START = 1, FIRE_STOP = 2, FIRE_OUT = 3, FIRE_STATE = 4, FIRE_DOUSE = 5 };  // OUT: a copy was put out, to the owner
 enum : uint8_t { ON_SPOT = 0, ON_VEHICLE = 1, ON_PED = 2, ON_PLAYER = 3 };
+
+uint8_t SourceKind(uint8_t kind){return kind==ON_PED?ENTITY_PED:kind==ON_VEHICLE?ENTITY_VEHICLE:0;}
+void WriteSource(Writer&w,uint8_t kind,uint16_t id,bool optional=false,uint64_t generation=0){if(auto type=SourceKind(kind))w.Entity(type,id,optional?ENTITY_OPTIONAL:ENTITY_USE,255,generation);else w.U16(id);}
+bool SourceValid(uint8_t kind,uint16_t id,const std::vector<EntityRef>&refs){auto type=SourceKind(kind);if(!type)return true;for(auto ref:refs)if(ref.kind==type&&ref.id==id)return Net().EntityContextValid({ref});return false;}
 
 uintptr_t Fire(int i) { return kFireManager + (uintptr_t)i * 0x28; }
 bool Active(uintptr_t f) { return Ref<uint8_t>(f) & 1; }
@@ -37,28 +44,29 @@ CEntity* Target(uintptr_t f) { return Ref<CEntity*>(f + 0x10); }
 struct Sent {
     uint16_t id;
     CEntity* target;
+    int16_t generation=0;
+    float strength=0;
+    uint64_t sent=0;
+    int8_t area=0;
 };
 std::map<uintptr_t, Sent> g_sent;         // our fires the other game copied
 struct Copy {
     uintptr_t fire;
-    uint8_t from;      // whose fire it copies
-    CEntity* target;   // what it burns (nullptr: a spot)
-    CVector at;        // a spot's place
+    uint8_t from;  // whose fire it copies
+    CVector position;
+    float strength=1;
+    uint8_t kind=0;uint16_t entity=0;
+    int8_t area=0;
+    int16_t generation=0;
 };
 std::map<uint16_t, Copy> g_copies;    // fires lit here for the other game, by its id
+std::map<uint16_t,Copy> g_pendingFires;
 uint16_t g_nextId = 1;
 uint64_t g_scanMs = 0;
 
-// The copy's own fire still: the fire manager gives a slot that went out to the next fire (a molotov lights several),
-// and a fire of this game taken for the copy was never sent, and the owner's FIRE_STOP put it out.
-bool Burns(const Copy& c) {
-    if (!Active(c.fire) || Target(c.fire) != c.target) return false;
-    return c.target || (Ref<CVector>(c.fire + 0x04) - c.at).Length() < 0.5f;
-}
-
 bool IsCopy(uintptr_t f) {
     for (auto& [id, c] : g_copies)
-        if (c.fire == f && Burns(c)) return true;
+        if (c.fire == f && Ref<int16_t>(f+2)==c.generation) return true;
     return false;
 }
 
@@ -102,8 +110,17 @@ CEntity* Resolve(uint8_t kind, uint16_t id) {
 void SendStop(uint16_t id) {
     Writer w(proto::G_FIRE);
     w.U8(FIRE_STOP);
-    w.U16(id);
+    w.Entity(ENTITY_FIRE,id,ENTITY_REMOVE,(id>>12)-1);
     Net().Send(proto::CH_RELIABLE, w);
+}
+
+bool SendCurrentFire(uintptr_t f,const Sent&s){
+    if(!Active(f)||Ref<int16_t>(f+2)!=s.generation||Target(f)!=s.target)return false;
+    uint8_t kind=ON_SPOT;uint16_t entity=0;
+    if(s.target&&!Describe(s.target,kind,entity))return false;
+    auto p=Ref<CVector>(f+4);Writer w(proto::G_FIRE);w.U8(FIRE_START);w.Entity(ENTITY_FIRE,s.id,ENTITY_BIRTH|ENTITY_SNAPSHOT,(s.id>>12)-1);
+    w.U8(kind);WriteSource(w,kind,entity);w.Vec({p.x,p.y,p.z});w.F32(Ref<float>(f+0x1C));w.I8(s.area);
+    Net().Send(proto::CH_RELIABLE,w);return true;
 }
 
 void Scan() {
@@ -119,7 +136,14 @@ void Scan() {
         }
         CEntity* target = Target(f);
         if (sent != g_sent.end()) {
-            if (sent->second.target == target) continue;
+            if (sent->second.target == target && sent->second.generation==Ref<int16_t>(f+2)) {
+                float strength=Ref<float>(f+0x1C);
+                if(std::fabs(strength-sent->second.strength)>.02f||NowMs()-sent->second.sent>1000){
+                    Writer w(proto::G_FIRE);w.U8(FIRE_STATE);w.Entity(ENTITY_FIRE,sent->second.id,ENTITY_USE,(sent->second.id>>12)-1);w.F32(strength);
+                    Net().Send(proto::CH_RELIABLE,w);sent->second.strength=strength;sent->second.sent=NowMs();
+                }
+                continue;
+            }
             SendStop(sent->second.id);  // the slot holds another fire now
             g_sent.erase(sent);
         }
@@ -127,22 +151,23 @@ void Scan() {
         uint16_t entityId = 0;
         bool script = Ref<uint8_t>(f) & 2;  // bCreatedByScript
         if (target ? !Describe(target, kind, entityId) : !(script && Net().IsHost() && HostReplicating())) continue;
-        uint16_t id = g_nextId++;
-        g_sent[f] = {id, target};
+        uint16_t id;bool used;do{id=(uint16_t)(((Net().MyId()+1)<<12)|(g_nextId++&0xFFF));used=false;for(auto&[other,record]:g_sent)if(record.id==id)used=true;}while(used);
+        Net().BeginEntity(ENTITY_FIRE,id,Net().MyId());g_sent[f] = {id, target,Ref<int16_t>(f+2),Ref<float>(f+0x1C),NowMs(),target?target->AreaCode():FindPlayerPed(0)->AreaCode()};
         CVector pos = Ref<CVector>(f + 0x04);
         Writer w(proto::G_FIRE);
         w.U8(FIRE_START);
-        w.U16(id);
+        w.Entity(ENTITY_FIRE,id,ENTITY_BIRTH|ENTITY_SNAPSHOT,(id>>12)-1);
         w.U8(kind);
-        w.U16(entityId);
+        WriteSource(w,kind,entityId);
         w.Vec({pos.x, pos.y, pos.z});
         w.F32(Ref<float>(f + 0x1C));  // m_fStrength
+        w.I8(target?target->AreaCode():FindPlayerPed(0)->AreaCode());
         Net().Send(proto::CH_RELIABLE, w);
         LOGD("Fire %04X sent (on %d %04X)", id, kind, entityId);
     }
 }
 
-void Light(uint8_t from, uint16_t id, uint8_t kind, uint16_t entityId, const CVector& pos, float strength) {
+void Light(uint8_t from, uint16_t id, uint8_t kind, uint16_t entityId, const CVector& pos, float strength, int8_t area) {
     uintptr_t fire = 0;
     if (kind == ON_SPOT) {
         // CFireManager::StartFire(CVector, size, unused, creator, lifetime, generations, unused): no spreading
@@ -155,7 +180,7 @@ void Light(uint8_t from, uint16_t id, uint8_t kind, uint16_t entityId, const CVe
         }
     } else {
         CEntity* e = Resolve(kind, entityId);
-        if (!e) return;
+        if (!e){g_pendingFires[id]={0,from,pos,strength,kind,entityId,area,0};return;}
         auto* p = (CPhysical*)e;
         uint32_t flags = p->PhysicalFlags();
         p->PhysicalFlags() = flags & ~kFireProof;
@@ -164,35 +189,29 @@ void Light(uint8_t from, uint16_t id, uint8_t kind, uint16_t entityId, const CVe
         p->PhysicalFlags() = flags;
         fire = Field<uintptr_t>(e, e->IsPed() ? 0x730 : 0x490);  // CPed::m_pFire, CVehicle::m_pFire
     }
-    if (!fire) return;
-    g_copies[id] = {fire, from, Target(fire), Ref<CVector>(fire + 0x04)};
+    if (!fire){g_pendingFires[id]={0,from,pos,strength,kind,entityId,area,0};return;}
+    g_pendingFires.erase(id);
+    // Script copies never expire because a guest camera is outside the room.
+    Ref<uint8_t>(fire)|=2;Ref<uint8_t>(fire+0x20)=0;
+    g_copies[id] = {fire, from,pos,strength,kind,entityId,area,Ref<int16_t>(fire+2)};
     LOGD("Fire %04X lit (on %d %04X)", id, kind, entityId);
 }
 
 void PutOut(uint16_t id) {
+    g_pendingFires.erase(id);
     auto it = g_copies.find(id);
     if (it == g_copies.end()) return;
-    if (Burns(it->second)) CallMethod<0x5393F0>((void*)it->second.fire);  // CFire::Extinguish
+    if (Active(it->second.fire)&&Ref<int16_t>(it->second.fire+2)==it->second.generation){CallMethod<0x5393F0>((void*)it->second.fire);Ref<uint8_t>(it->second.fire)&=~2u;}
     g_copies.erase(it);
-}
-
-// a player's fires are gone with its game (it left or started over): theirs here burned on for ten minutes
-void PutOutCopiesOf(uint8_t from) {
-    for (auto it = g_copies.begin(); it != g_copies.end();) {
-        if (it->second.from != from) {
-            ++it;
-            continue;
-        }
-        if (Burns(it->second)) CallMethod<0x5393F0>((void*)it->second.fire);  // CFire::Extinguish
-        it = g_copies.erase(it);
-    }
 }
 
 // the owner's side of FIRE_OUT: its fire goes out as the copy did
 void PutOutOwn(uint16_t id) {
     for (auto it = g_sent.begin(); it != g_sent.end(); ++it)
         if (it->second.id == id) {
-            if (Active(it->first)) CallMethod<0x5393F0>((void*)it->first);  // CFire::Extinguish
+            if (Active(it->first)&&Ref<int16_t>(it->first+2)==it->second.generation&&Target(it->first)==it->second.target)
+                CallMethod<0x5393F0>((void*)it->first);  // CFire::Extinguish
+            SendStop(id); // both guests must observe the authoritative script result
             g_sent.erase(it);
             LOGI("Fire %04X put out by the other player", id);
             return;
@@ -220,33 +239,94 @@ bool OtherSide(CEntity* e) {
     return nv && Vehicles::Instance().IsMirror(*nv);
 }
 
-using AddExplosionFn = void(__cdecl*)(CEntity*, CEntity*, int, CVector, uint32_t, uint8_t, float, uint8_t);
+using AddExplosionFn = bool(__cdecl*)(CEntity*, CEntity*, int, CVector, uint32_t, uint8_t, float, uint8_t);
 AddExplosionFn g_origAddExplosion = nullptr;
+uint32_t g_blastSequence=0;EventWindow g_explosionsSeen[3],g_projectilesSeen[3];
+struct Flight {
+    CPhysical* object=nullptr;CEntity* creator=nullptr;
+    uint8_t kind=0;uint16_t id=0;bool authority=false;
+    uint32_t token=0;uint64_t created=0;
+    CVector lastPos;
+    int handle=-1;uint8_t from=255;uint64_t creatorGeneration=0;int weapon=0;
+};
+void RetireProjectile(uint8_t from,uint32_t token);
+void ClearReplicaProjectiles(uint8_t from);
+std::deque<Flight> g_flights;
+using RemoveProjectileFn=void(__cdecl*)(void*,CPhysical*);
+RemoveProjectileFn g_origRemoveProjectile=nullptr;
+CPhysical*g_detonatingProjectile=nullptr;
+void __cdecl HookRemoveProjectile(void*info,CPhysical*object){
+    struct Restore{CPhysical*saved=g_detonatingProjectile;~Restore(){g_detonatingProjectile=saved;}} restore;
+    g_detonatingProjectile=object;g_origRemoveProjectile(info,object);
+}
+// Copy authority belongs to this projectile, never to its creator's current owner.
+using DetonateFn=void(__cdecl*)();DetonateFn originalDetonate=nullptr;
+void __cdecl HookDetonate(){
+    struct Mask{int slot;CPhysical*object;uint8_t active;};std::vector<Mask> hidden;
+    if(Net().Online())for(auto&f:g_flights)if(f.weapon==39&&!f.authority)
+        for(int i=0;i<32;++i)if(Ref<CPhysical*>(0xC89110+i*4)==f.object&&Ref<uint8_t>(0xC891A8+i*0x24+0x10)){
+            auto&on=Ref<uint8_t>(0xC891A8+i*0x24+0x10);hidden.push_back({i,f.object,on});on=0;break;}
+    originalDetonate();
+    for(auto&m:hidden)if(Ref<CPhysical*>(0xC89110+m.slot*4)==m.object)Ref<uint8_t>(0xC891A8+m.slot*0x24+0x10)=m.active;
+}
+Flight* BlastFlight(CEntity*victim,CEntity*creator,const CVector&pos){
+    // RemoveProjectile is the native detonation path. Scope its exact object
+    // so two overlapping grenades whose thrower changes owner cannot borrow
+    // each other's authority by a nearest-position guess.
+    if(g_detonatingProjectile)for(auto&f:g_flights)if(f.object==g_detonatingProjectile)return &f;
+    Flight*best=nullptr;float distance=6.f;
+    for(auto&f:g_flights){
+        if((f.weapon!=39&&NowMs()-f.created>30000)||f.creator!=creator||!f.object)continue;
+        bool active=false;
+        for(int i=0;i<32;++i)if(Ref<CPhysical*>(0xC89110+i*4)==f.object&&Ref<uint8_t>(0xC891A8+i*0x24+0x10))active=true;
+        // Update may clear m_bActive before it calls AddExplosion. The last
+        // sampled point is safe even after the native object was deleted.
+        bool alive=f.handle>=0&&GetObject(f.handle)==f.object;
+        float d=(((active||alive)?f.object->GetPosition():f.lastPos)-pos).Length();
+        if(victim==f.object||d<distance){best=&f;distance=d;if(victim==f.object)break;}
+    }
+    return best;
+}
 bool g_settingOff = false;  // a blast of the other game
 
 // CExplosion::AddExplosion(victim, creator, type, position, lifetime, sound, camera shake, visible)
-void __cdecl HookAddExplosion(CEntity* victim, CEntity* creator, int type, CVector pos, uint32_t lifetime, uint8_t sound,
+bool __cdecl HookAddExplosion(CEntity* victim, CEntity* creator, int type, CVector pos, uint32_t lifetime, uint8_t sound,
                               float shake, uint8_t visible) {
     if (Net().Online() && core::IsPlayerReady() && IsBlast(type) && !g_settingOff) {
-        if (OtherSide(creator)) return;
+        auto*flight=BlastFlight(victim,creator,pos);
+        if(flight?!flight->authority:OtherSide(creator)){if(flight)LOGD("Projectile shadow blast suppressed token %u source %u",flight->token,flight->from);return true;}
         uint8_t kind = ON_SPOT;
         uint16_t id = 0;
-        if (!Describe(creator, kind, id)) kind = ON_SPOT, id = 0;  // nobody's, a SAM site's: on the spot
+        if(flight){kind=flight->kind;id=flight->id;}
+        else if (!Describe(creator, kind, id)) kind = ON_SPOT, id = 0;
+        // Original simulator may now hold only a mirror of the thrower.
         Writer w(proto::G_EXPLOSION);
+        if(++g_blastSequence==0)++g_blastSequence;w.U32(g_blastSequence);
         w.U8(kind);
-        w.U16(id);
+        WriteSource(w,kind,id,true,flight?flight->creatorGeneration:0);
         w.U8((uint8_t)type);
         w.Vec({pos.x, pos.y, pos.z});
         w.U32(lifetime);
         w.U8(sound);
         w.F32(shake);
-        w.U8(visible);
-        Net().Send(proto::CH_RELIABLE, w);
+        w.U8(visible);w.U32(flight?flight->token:0);
+        Net().Send(proto::CH_RELIABLE, w);LOGD("Explosion authority token %u creator %04X peer %u",flight?flight->token:0,id,Net().MyId());
     }
-    g_origAddExplosion(victim, creator, type, pos, lifetime, sound, shake, visible);
+    return g_origAddExplosion(victim, creator, type, pos, lifetime, sound, shake, visible);
 }
 
+struct PendingBlast {uint8_t from,kind;uint16_t id;int type;CVector pos;uint32_t lifetime;uint8_t sound;float shake;uint8_t visible;uint64_t received;uint32_t projectile=0;std::vector<EntityRef> refs;};
+std::deque<PendingBlast> g_pendingBlasts;
+void ReplayBlast(const PendingBlast&b){
+    // A missing/deleted thrower cannot suppress damage to locally owned entities.
+    // Null is an ordinary native world explosion, with the same origin and type.
+    RetireProjectile(b.from,b.projectile);
+    auto*creator=SourceValid(b.kind,b.id,b.refs)?Resolve(b.kind,b.id):nullptr;
+    g_settingOff=true;g_origAddExplosion(nullptr,creator,b.type,b.pos,b.lifetime,b.sound,b.shake,b.visible);g_settingOff=false;
+    LOGD("Explosion replay from %u creator %04X wait %llu",b.from,b.id,(unsigned long long)(NowMs()-b.received));
+}
 void HandleExplosion(uint8_t from, Reader& r) {
+    uint32_t sequence=r.U32();
     uint8_t kind = r.U8();
     uint16_t id = r.U16();
     int type = r.U8();
@@ -254,14 +334,14 @@ void HandleExplosion(uint8_t from, Reader& r) {
     uint32_t lifetime = r.U32();
     uint8_t sound = r.U8();
     float shake = r.F32();
-    uint8_t visible = r.U8();
-    if (!r.Ok() || !core::IsPlayerReady() || !IsBlast(type)) return;
-    CEntity* creator = Resolve(kind, id);
-    if (kind != ON_SPOT && !creator) return;  // its creator is not here: far away, in another interior
-    g_settingOff = true;
-    g_origAddExplosion(nullptr, creator, type, CVector{p.x, p.y, p.z}, lifetime, sound, shake, visible);
-    g_settingOff = false;
-    LOGD("Explosion of player %d set off (type %d, by %d %04X)", from, type, kind, id);
+    uint8_t visible = r.U8();uint32_t projectile=r.U32();
+    if (!r.Ok() || from>=3 || !core::IsPlayerReady() || !IsBlast(type) || kind>ON_PLAYER ||
+        lifetime>600000 || sound>1 || visible>1 || std::fabs(shake)>100 || !g_explosionsSeen[from].Accept(sequence)) return;
+    PendingBlast blast{from,kind,id,type,{p.x,p.y,p.z},lifetime,sound,shake,visible,NowMs(),projectile,Net().EntityContext()};
+    if(kind!=ON_SPOT&&!Resolve(kind,id)){
+        if(g_pendingBlasts.size()>=64){ReplayBlast(g_pendingBlasts.front());g_pendingBlasts.pop_front();}
+        g_pendingBlasts.push_back(blast);
+    }else ReplayBlast(blast);
 }
 
 // ---------------------------------------------------------------- projectiles
@@ -272,7 +352,7 @@ void HandleExplosion(uint8_t from, Reader& r) {
 // stay in the game that planted them, the other one gets their blasts.
 constexpr uintptr_t kProjectileInfos = 0xC891A8;  // gaProjectileInfo[32], 0x24 bytes each, m_bActive at +0x10
 constexpr uintptr_t kProjectiles = 0xC89110;      // CProjectileInfo::ms_apProjectile[32]
-bool Thrown(int weapon) { return (weapon >= 16 && weapon <= 21) || weapon == 58; }  // GRENADE..FREEFALL_BOMB, FLARE
+bool Thrown(int weapon) { return (weapon >= 16 && weapon <= 21) || weapon == 39 || weapon == 58; }  // GRENADE..FREEFALL_BOMB, FLARE
 
 uint32_t ActiveProjectiles() {
     uint32_t mask = 0;
@@ -317,48 +397,111 @@ bool __cdecl HookAddProjectile(CEntity* creator, int weapon, CVector pos, float 
     if (!DescribeAny(target, targetKind, targetId)) targetKind = ON_SPOT, targetId = 0;
     CVector at = obj->GetPosition(), speed = obj->MoveSpeed();
     Writer w(proto::G_PROJECTILE);
+    if(++g_blastSequence==0)++g_blastSequence;w.U32(g_blastSequence);
     w.U8(kind);
-    w.U16(id);
+    WriteSource(w,kind,id,true);
     w.U8((uint8_t)weapon);
     w.F32(force);
     w.Vec({at.x, at.y, at.z});
     w.Vec({speed.x, speed.y, speed.z});
     w.U8(targetKind);
-    w.U16(targetId);
+    WriteSource(w,targetKind,targetId,true);
+    w.U32((uint32_t)NowMs());
+    for(auto i=g_flights.begin();i!=g_flights.end();)i=i->object==obj?g_flights.erase(i):std::next(i);
+    g_flights.push_back({obj,creator,kind,id,true,g_blastSequence,NowMs(),at,GetObjectRef((CObject*)obj),Net().MyId(),Net().EntityGeneration(SourceKind(kind),id)});
+    g_flights.back().weapon=weapon;
+    while(g_flights.size()>64)g_flights.pop_front();
     Net().Send(proto::CH_RELIABLE, w);
     return ok;
 }
 
-void HandleProjectile(uint8_t from, Reader& r) {
-    uint8_t kind = r.U8();
-    uint16_t id = r.U16();
-    int weapon = r.U8();
-    float force = r.F32();
-    Vec3 p = r.Vec(), v = r.Vec();
-    uint8_t targetKind = r.U8();
-    uint16_t targetId = r.U16();
-    if (!r.Ok() || !core::IsPlayerReady() || !Thrown(weapon)) return;
-    CEntity* creator = Resolve(kind, id);
-    if (kind == ON_SPOT) {  // a SAM site's: in the sender's name, so that it goes off here without harm
-        RemotePlayer* rp = Players::Instance().Get(from);
-        creator = rp ? (CEntity*)rp->ped : nullptr;
+struct PendingProjectile {
+    uint8_t from=0,kind=0,targetKind=0;uint16_t id=0,targetId=0;
+    uint32_t sequence=0,tick=0;int weapon=0;float force=0;CVector pos,speed;uint64_t received=0;std::vector<EntityRef> refs;
+};
+std::deque<PendingProjectile> g_pendingProjectiles;
+void RemoveFlightCopy(Flight&f){
+    if(f.authority)return;
+    for(int i=0;i<32;++i)if(Ref<CPhysical*>(kProjectiles+i*4)==f.object&&Ref<uint8_t>(kProjectileInfos+i*0x24+0x10)){
+        Call<0x7388F0>((void*)(kProjectileInfos+i*0x24),f.object);break;
     }
-    if (!creator) return;  // far away, in another interior
-    CEntity* target = targetKind == ON_PLAYER && targetId == Net().MyId() ? (CEntity*)FindPlayerPed(0)
-                      : targetKind == ON_SPOT                             ? nullptr
-                                                                          : Resolve(targetKind, targetId);
-    CVector at{p.x, p.y, p.z}, speed{v.x, v.y, v.z}, dir = speed;
-    float len = std::sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
-    if (len > 0.001f) dir = {dir.x / len, dir.y / len, dir.z / len};
-    uint32_t before = ActiveProjectiles();
-    g_throwing = true;
-    bool ok = g_origAddProjectile(creator, weapon, at, force, &dir, target);
-    g_throwing = false;
-    CPhysical* obj = ok ? NewProjectile(before) : nullptr;
-    if (!obj) return;
-    obj->SetPositionRaw(at);  // where and how fast it left the other game, whatever the copy's aim here
-    obj->MoveSpeed() = speed;
-    LOGD("Projectile of player %d thrown (weapon %d, by %d %04X)", from, weapon, kind, id);
+}
+void RetireProjectile(uint8_t from,uint32_t token){
+    if(!token)return;
+    for(auto i=g_pendingProjectiles.begin();i!=g_pendingProjectiles.end();)i=i->from==from&&i->sequence==token?g_pendingProjectiles.erase(i):std::next(i);
+    for(auto i=g_flights.begin();i!=g_flights.end();)if(i->from==from&&i->token==token){RemoveFlightCopy(*i);i=g_flights.erase(i);}else ++i;
+}
+void ClearReplicaProjectiles(uint8_t from){
+    for(auto i=g_flights.begin();i!=g_flights.end();)if(i->from==from&&!i->authority){RemoveFlightCopy(*i);i=g_flights.erase(i);}else ++i;
+}
+bool ReplayProjectile(const PendingProjectile&p){
+    auto*creator=SourceValid(p.kind,p.id,p.refs)?Resolve(p.kind,p.id):nullptr;
+    if(p.kind==ON_SPOT){auto*rp=Players::Instance().Get(p.from);creator=rp?rp->ped:nullptr;}
+    if(!creator)return false;
+    auto*target=p.targetKind==ON_PLAYER&&p.targetId==Net().MyId()?(CEntity*)FindPlayerPed(0):p.targetKind==ON_SPOT?nullptr:SourceValid(p.targetKind,p.targetId,p.refs)?Resolve(p.targetKind,p.targetId):nullptr;
+    if(p.targetKind!=ON_SPOT&&!target&&NowMs()-p.received<300)return false;
+    auto at=p.pos,speed=p.speed,dir=speed.Normalized();
+    uint32_t before=ActiveProjectiles();g_throwing=true;
+    bool ok=g_origAddProjectile(creator,p.weapon,at,p.force,&dir,target);g_throwing=false;
+    auto*obj=ok?NewProjectile(before):nullptr;if(!obj)return true;
+    // Keep the fuse age. Do not launch an old grenade with a new full lifetime.
+    const auto*sourcePeer=Net().Peer(p.from);
+    uint64_t estimatedTransit=(Net().Rtt()+(sourcePeer?sourcePeer->ping:0))/2;
+    uint32_t age=(uint32_t)std::min<uint64_t>(1500,NowMs()-p.received+estimatedTransit);
+    auto*rp=Players::Instance().Get(p.from);
+    // Sender-clock progress already includes time spent waiting for a creator.
+    // Adding it to the local wait counted the same 450ms dependency twice.
+    if(rp&&rp->hasState){int32_t progress=(int32_t)(rp->state.time-p.tick);if(progress>0&&progress<1500)age=std::max(age,(uint32_t)progress);}
+    float seconds=age/1000.f;
+    // GTA speed is distance per 50 Hz step. Avoid advancing through walls:
+    // visual position starts at the transmitted point; the fuse stays correct.
+    (void)seconds;obj->SetPositionRaw(at);obj->MoveSpeed()=speed;
+    for(int i=0;i<32;++i)if(Ref<CPhysical*>(kProjectiles+i*4)==obj){
+        auto&expires=Ref<uint32_t>(kProjectileInfos+i*0x24+0xC);
+        uint32_t gameNow=Ref<uint32_t>(0xB7CB84);int32_t left=(int32_t)(expires-gameNow);
+        if(left>0)expires=gameNow+(uint32_t)std::max(1,left-(int)age);
+    }
+    for(auto i=g_flights.begin();i!=g_flights.end();)i=i->object==obj?g_flights.erase(i):std::next(i);
+    g_flights.push_back({obj,creator,p.kind,p.id,false,p.sequence,NowMs(),at,GetObjectRef((CObject*)obj),p.from});
+    g_flights.back().weapon=p.weapon;
+    while(g_flights.size()>64)g_flights.pop_front();
+    LOGI("Projectile replay from %u token %u wait %u creator %04X",p.from,p.sequence,age,p.id);
+    return true;
+}
+void HandleProjectile(uint8_t from, Reader&r){
+    PendingProjectile p;p.from=from;p.sequence=r.U32();p.kind=r.U8();p.id=r.U16();p.weapon=r.U8();p.force=r.F32();
+    auto v=r.Vec(),speed=r.Vec();p.pos={v.x,v.y,v.z};p.speed={speed.x,speed.y,speed.z};p.targetKind=r.U8();p.targetId=r.U16();p.tick=r.U32();p.received=NowMs();p.refs=Net().EntityContext();
+    if(!r.Ok()||from>=3||!core::IsPlayerReady()||!Thrown(p.weapon)||p.kind>ON_PLAYER||p.targetKind>ON_PLAYER||
+       std::fabs(p.force)>100||p.speed.Length()>150||!g_projectilesSeen[from].Accept(p.sequence))return;
+    if(!ReplayProjectile(p)){
+        if(g_pendingProjectiles.size()>=64)g_pendingProjectiles.pop_front();
+        g_pendingProjectiles.push_back(p);LOGD("Projectile queued dependency from %u token %u creator %04X",from,p.sequence,p.id);
+    }
+}
+void ReannounceCharges(){
+    for(auto&f:g_flights)if(f.authority&&f.weapon==39&&f.handle>=0&&GetObject(f.handle)==f.object){
+        auto position=f.object->GetPosition(),speed=f.object->MoveSpeed();Writer w(proto::G_PROJECTILE);w.U32(f.token);w.U8(f.kind);WriteSource(w,f.kind,f.id,true,f.creatorGeneration);
+        w.U8(39);w.F32(0);w.Vec({position.x,position.y,position.z});w.Vec({speed.x,speed.y,speed.z});w.U8(ON_SPOT);w.U16(0);w.U32((uint32_t)NowMs());Net().Send(proto::CH_RELIABLE,w);
+    }
+}
+void RetryCombat(){
+    for(auto i=g_pendingBlasts.begin();i!=g_pendingBlasts.end();){
+        if(Resolve(i->kind,i->id)||NowMs()-i->received>=300){ReplayBlast(*i);i=g_pendingBlasts.erase(i);}else ++i;
+    }
+    for(auto i=g_pendingProjectiles.begin();i!=g_pendingProjectiles.end();){
+        if(NowMs()-i->received>1500){LOGD("Projectile dependency expired token %u",i->sequence);i=g_pendingProjectiles.erase(i);}
+        else if(ReplayProjectile(*i))i=g_pendingProjectiles.erase(i);else ++i;
+    }
+    // A creator reference can legitimately become null while its grenade is
+    // still flying. The projectile handle identifies this flight; the creator
+    // pointer must not cancel its authority when that NPC is deleted.
+    // Native pool addresses are reused. Retire a record before a new projectile
+    // can be associated with its old creator/authority.
+    for(auto i=g_flights.begin();i!=g_flights.end();){
+        bool active=false;
+        for(int n=0;n<32;++n)if(Ref<CPhysical*>(kProjectiles+n*4)==i->object&&Ref<uint8_t>(kProjectileInfos+n*0x24+0x10)&&i->handle>=0&&GetObject(i->handle)==i->object)active=true;
+        if(!active||(i->weapon!=39&&NowMs()-i->created>30000))i=g_flights.erase(i);else {i->lastPos=i->object->GetPosition();++i;}
+    }
 }
 
 // ---------------------------------------------------------------- water cannons
@@ -381,7 +524,7 @@ void __cdecl HookWaterCannon(uint32_t vehicle, CVector* start, CVector* speed) {
     g_jetSent[nv->netId] = NowMs();
     CVector at = *start - nv->veh->GetPosition();
     Writer w(proto::G_WATER_CANNON);
-    w.U16(nv->netId);
+    w.Entity(ENTITY_VEHICLE,nv->netId);
     w.Vec({at.x, at.y, at.z});
     w.Vec({speed->x, speed->y, speed->z});
     Net().Send(proto::CH_STATE, w);
@@ -401,19 +544,39 @@ void ShootJets() {
 }
 
 class Fires : public Module {
+    void OnEntityReplaced(uint8_t kind,uint8_t,uint16_t id)override{if(kind!=ENTITY_FIRE)return;g_pendingFires.erase(id);PutOut(id);}
+
 public:
     const char* Name() const override { return "Fires"; }
+    void CollectSyncAudit(std::vector<SyncAuditEntry>&out)override{
+        for(auto&[f,s]:g_sent)if(Active(f)&&Ref<int16_t>(f+2)==s.generation){
+            SyncAuditEntry e;e.kind=AUDIT_FIRE;e.id=s.id;e.owner=Net().MyId();e.area=s.area;
+            e.pos=Ref<CVector>(f+4);e.alive=true;out.push_back(e);
+        }
+        for(auto&[id,c]:g_copies){SyncAuditEntry e;e.kind=AUDIT_FIRE;e.id=id;e.owner=c.from;e.area=c.area;e.pos=c.position;
+            e.alive=Active(c.fire)&&Ref<int16_t>(c.fire+2)==c.generation;out.push_back(e);}
+        for(auto&[id,c]:g_pendingFires)if(!g_copies.count(id)){SyncAuditEntry e;e.kind=AUDIT_FIRE;e.id=id;e.owner=c.from;e.area=c.area;e.pos=c.position;out.push_back(e);}
+    }
+    bool RepairSyncEntity(uint8_t kind,uint16_t id)override{
+        if(kind!=AUDIT_FIRE||(id>>12)!=Net().MyId()+1)return false;
+        for(auto&[f,s]:g_sent)if(s.id==id&&SendCurrentFire(f,s))return true;
+        SendStop(id);return true;
+    }
 
     void OnInstallHooks() override {
+        mem::HookFn(0x738860,&HookDetonate,&originalDetonate,"CProjectileInfo::RemoveDetonatorProjectiles (local authority)");
+        mem::HookFn(0x7388F0,&HookRemoveProjectile,&g_origRemoveProjectile,"CProjectileInfo::RemoveProjectile");
         mem::HookFn(0x736A50, &HookAddExplosion, &g_origAddExplosion, "CExplosion::AddExplosion");
         Net().SetHandler(proto::G_EXPLOSION, &HandleExplosion);
         mem::HookFn(0x737C80, &HookAddProjectile, &g_origAddProjectile, "CProjectileInfo::AddProjectile");
         Net().SetHandler(proto::G_PROJECTILE, &HandleProjectile);
         mem::HookFn(0x728CB0, &HookWaterCannon, &g_origWaterCannon, "CWaterCannons::UpdateOne");
-        Net().SetHandler(proto::G_WATER_CANNON, [](uint8_t, Reader& r) {
+        Net().SetHandler(proto::G_WATER_CANNON, [](uint8_t from, Reader& r) {
             uint16_t id = r.U16();
             Vec3 at = r.Vec(), v = r.Vec();
             if (!r.Ok() || !core::IsPlayerReady()) return;
+            auto*nv=Vehicles::Instance().Find(id);
+            if(!nv||!Vehicles::Alive(*nv)||nv->owner!=from||CVector{at.x,at.y,at.z}.Length()>20||CVector{v.x,v.y,v.z}.Length()>100)return;
             if (!g_jets.count(id)) LOGD("Water cannon of vehicle %04X shoots here", id);
             g_jets[id] = {{at.x, at.y, at.z}, {v.x, v.y, v.z}, NowMs()};
         });
@@ -421,45 +584,96 @@ public:
             uint8_t op = r.U8();
             uint16_t id = r.U16();
             if (!r.Ok() || !core::IsPlayerReady()) return;
-            if (op == FIRE_STOP) return PutOut(id);
-            if (op == FIRE_OUT) return PutOutOwn(id);
+            if (op == FIRE_STOP) {
+                if(auto p=g_pendingFires.find(id);p!=g_pendingFires.end()&&p->second.from==from)g_pendingFires.erase(p);
+                auto c=g_copies.find(id);if(c!=g_copies.end()&&c->second.from==from)PutOut(id);return;
+            }
+            if (op == FIRE_OUT || op==FIRE_DOUSE) {
+                float amount=op==FIRE_DOUSE?r.F32():0;
+                if(!r.Ok()||!std::isfinite(amount)||amount<0||amount>100)return;
+                if((id>>12)!=Net().MyId()+1)return;
+                auto*rp=Players::Instance().Get(from);
+                if(!rp||!rp->hasState||NowMs()-rp->stateRecvMs>1500)return;
+                for(auto&[f,sent]:g_sent)if(sent.id==id){
+                    if(!Active(f)||Ref<int16_t>(f+2)!=sent.generation||Target(f)!=sent.target)break;
+                    CVector pos=Ref<CVector>(f+4);
+                    if((!Target(f)||rp->state.area==Target(f)->AreaCode())&&(rp->state.pos-pos).Length()<35){
+                        if(op==FIRE_OUT||amount>=Ref<float>(f+0x1C))PutOutOwn(id);
+                        else {Ref<float>(f+0x1C)-=amount;CallMethod<0x539360>((void*)f,&pos,(void*)nullptr);}
+                    }
+                    break;
+                }
+                return;
+            }
+            if(op==FIRE_STATE){
+                float strength=r.F32();
+                if(!r.Ok()||!std::isfinite(strength)||strength<0||strength>100)return;
+                if(auto p=g_pendingFires.find(id);p!=g_pendingFires.end()&&p->second.from==from)p->second.strength=strength;
+                auto it=g_copies.find(id);
+                if(!r.Ok()||!std::isfinite(strength)||strength<0||strength>100||it==g_copies.end()||it->second.from!=from)return;
+                auto&c=it->second;
+                if(Active(c.fire)&&Ref<int16_t>(c.fire+2)==c.generation){
+                    float previous=Ref<float>(c.fire+0x1C);strength=std::min(previous,strength);Ref<float>(c.fire+0x1C)=strength;
+                    if((int)previous!=(int)strength){auto pos=Ref<CVector>(c.fire+4);CallMethod<0x539360>((void*)c.fire,&pos,(void*)nullptr);}
+                }
+                c.strength=strength;return;
+            }
+            if(op!=FIRE_START||(id>>12)!=from+1)return;
             uint8_t kind = r.U8();
             uint16_t entityId = r.U16();
             Vec3 p = r.Vec();
-            float strength = r.F32();
-            if (!r.Ok()) return;
+            float strength = r.F32();int8_t area=r.I8();
+            if (!r.Ok()||!std::isfinite(strength)||strength<0||strength>100||kind>ON_PLAYER) return;
+            if(auto it=g_copies.find(id);it!=g_copies.end()){
+                auto&c=it->second;
+                if(c.from==from&&c.kind==kind&&c.entity==entityId&&c.area==area&&
+                   Active(c.fire)&&Ref<int16_t>(c.fire+2)==c.generation){
+                    c.position={p.x,p.y,p.z};c.strength=std::min(c.strength,strength);return;
+                }
+            }
             PutOut(id);
-            Light(from, id, kind, entityId, {p.x, p.y, p.z}, strength);
+            Light(from, id, kind, entityId, {p.x, p.y, p.z}, strength,area);
         });
     }
-    void OnSessionEnd() override { Forget(); }
+    void OnSessionEnd() override { while(!g_copies.empty())PutOut(g_copies.begin()->first);Forget(); }
+    void OnPeerLeave(uint8_t peer)override{
+        if(peer<3){g_explosionsSeen[peer]={};g_projectilesSeen[peer]={};ClearReplicaProjectiles(peer);}
+        for(auto i=g_pendingBlasts.begin();i!=g_pendingBlasts.end();)i=i->from==peer?g_pendingBlasts.erase(i):std::next(i);
+        for(auto i=g_pendingProjectiles.begin();i!=g_pendingProjectiles.end();)i=i->from==peer?g_pendingProjectiles.erase(i):std::next(i);
+        for(auto it=g_pendingFires.begin();it!=g_pendingFires.end();)it=it->second.from==peer?g_pendingFires.erase(it):std::next(it);
+        for(auto it=g_copies.begin();it!=g_copies.end();){auto id=it->first;++it;if(g_copies[id].from==peer)PutOut(id);}
+    }
     void OnGameStarted() override { Forget(); }
     void OnPreProcess() override {
-        if (Net().Online() && core::IsPlayerReady()) ShootJets();
+        if (Net().Online() && core::IsPlayerReady()){RetryCombat();ShootJets();}
     }
-    void OnPeerResync(uint8_t id) override {
-        g_sent.clear();  // sent again by the next scan
-        PutOutCopiesOf(id);
-    }
-    void OnPeerLeave(uint8_t id) override { PutOutCopiesOf(id); }
+    void OnPeerResync(uint8_t id) override { OnPeerLeave(id);ReannounceCharges();for(auto&[f,s]:g_sent)SendCurrentFire(f,s); }
 
     void OnPostProcess() override {
         if (!Net().Online() || !core::IsPlayerReady() || NowMs() - g_scanMs < 200) return;
         g_scanMs = NowMs();
+        int budget=4;for(auto it=g_pendingFires.begin();it!=g_pendingFires.end()&&budget-->0;){auto id=it->first;auto c=it->second;++it;Light(c.from,id,c.kind,c.entity,c.position,c.strength,c.area);}
         // copies whose fire went out here by itself (water, the entity died) stay out; put out by this player, the
         // owner's goes out too
         for (auto it = g_copies.begin(); it != g_copies.end();) {
-            if (Burns(it->second)) {
+            if (Active(it->second.fire)&&Ref<int16_t>(it->second.fire+2)==it->second.generation) {
+                auto&c=it->second;float strength=Ref<float>(c.fire+0x1C);
+                if(strength<c.strength-.005f&&PlayerFighting(c.position)){
+                    Writer w(proto::G_FIRE);w.U8(FIRE_DOUSE);w.Entity(ENTITY_FIRE,it->first,ENTITY_USE,it->second.from);w.F32(c.strength-strength);
+                    Net().Send(proto::CH_RELIABLE,w);
+                }
+                c.strength=strength;
                 ++it;
                 continue;
             }
-            if (PlayerFighting(Ref<CVector>(it->second.fire + 0x04))) {
+            if (Ref<int16_t>(it->second.fire+2)==it->second.generation && PlayerFighting(it->second.position)) {
                 Writer w(proto::G_FIRE);
                 w.U8(FIRE_OUT);
-                w.U16(it->first);
+                w.Entity(ENTITY_FIRE,it->first,ENTITY_USE,it->second.from);
                 Net().Send(proto::CH_RELIABLE, w);
                 LOGI("Fire %04X of player %d put out here", it->first, it->second.from);
             }
+            if(Ref<int16_t>(it->second.fire+2)==it->second.generation)Ref<uint8_t>(it->second.fire)&=~2u;
             it = g_copies.erase(it);
         }
         Scan();
@@ -472,8 +686,10 @@ public:
 
 private:
     static void Forget() {
+        g_blastSequence=0;for(auto&w:g_explosionsSeen)w={};for(auto&w:g_projectilesSeen)w={};
+        g_pendingBlasts.clear();g_pendingProjectiles.clear();g_flights.clear();
         g_sent.clear();
-        g_copies.clear();
+        g_copies.clear();g_pendingFires.clear();
         g_jets.clear();
         g_jetSent.clear();
     }

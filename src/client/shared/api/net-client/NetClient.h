@@ -19,6 +19,7 @@ public:
     struct Packet {
         uint8_t channel;
         std::vector<uint8_t> data;
+        uint64_t received=0;
     };
 
     ~NetClient() { Stop(); }
@@ -38,6 +39,8 @@ public:
     bool TakeConnectEvent() { return m_connectEvent.exchange(false); }
     uint64_t BytesIn() const { return m_bytesIn.load(); }
     uint64_t BytesOut() const { return m_bytesOut.load(); }
+    uint64_t QueuedInBytes()const{return m_inBytes.load();}
+    uint64_t QueuedOutBytes()const{return m_outBytes.load()+m_reliableBytes.load();}
 
 private:
     void ThreadMain(std::string host, uint16_t port);
@@ -49,6 +52,7 @@ private:
     std::atomic<bool> m_disconnectEvent{false};
     std::atomic<bool> m_connectEvent{false};
     std::atomic<uint64_t> m_bytesIn{0}, m_bytesOut{0};
+    std::atomic<uint64_t> m_inBytes{0},m_outBytes{0},m_reliableBytes{0};
 
     std::mutex m_outMutex;
     std::vector<Packet> m_out;

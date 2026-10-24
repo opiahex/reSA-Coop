@@ -8,6 +8,8 @@
 #include "common/api/protocol/Protocol.h"
 #include "common/lib/buffer/Buffer.h"
 #include "shared/api/net-client/NetClient.h"
+#include "shared/lib/sync/EpochFence.h"
+#include "shared/lib/sync/EntityGenerations.h"
 
 namespace coop {
 
@@ -16,6 +18,7 @@ struct PeerInfo {
     std::string name;
     bool isHost = false;
     uint16_t ping = 0;
+    uint32_t incarnation=0;
 };
 
 // Network session of the local client: connection lifecycle, handshake, player list and
@@ -44,7 +47,21 @@ public:
     uint32_t Rtt() const { return m_net.Rtt(); }
     NetClient& Net() { return m_net; }
 
-    void Send(uint8_t channel, const Writer& w) { m_net.Send(channel, w); }
+    void Send(uint8_t channel, const Writer& w);
+    uint64_t BeginEntity(uint8_t kind,uint16_t id,uint8_t scope=255){return m_entities.Begin(kind,id,kind>ENTITY_OBJECT&&scope==255?m_myId:scope);}
+    bool EntityLive(uint8_t kind,uint16_t id,uint8_t scope=255)const{return m_entities.Live(kind,id,scope);}
+    uint64_t ExpectedEntityGeneration(uint8_t kind,uint16_t id)const{for(auto&ref:m_entityContext)if(ref.kind==kind&&ref.id==id)return ref.generation;return m_entities.Current(kind,id);}
+    uint64_t EntityGeneration(uint8_t kind,uint16_t id,uint8_t scope=255)const{return m_entities.Current(kind,id,scope);}
+    bool EntityLink(uint8_t root,uint16_t id,uint8_t target,uint16_t other,uint8_t scope=255)const{return m_entities.Link(root,id,target,other,scope);}
+    void RememberEntityLinks(uint8_t kind,uint16_t id){auto refs=m_entityContext;for(auto&ref:refs)if(ref.kind==kind&&ref.id==id)ref.flags|=ENTITY_SNAPSHOT;m_entities.Commit(refs,[](uint8_t,uint8_t,uint16_t){});}
+    const std::vector<EntityRef>& EntityContext()const{return m_entityContext;}
+    bool EntityContextValid(const std::vector<EntityRef>&refs)const{return m_entities.Match(refs);}
+    uint64_t EntityPacketsDiscarded()const{return m_entities.discarded;}
+    size_t EntityPacketsWaiting()const{return m_entityWaiting.size();}
+    void AdvanceWorldEpoch(){if(++m_worldEpoch==0)++m_worldEpoch;}
+    uint32_t WorldEpoch()const{return m_worldEpoch;}
+    uint64_t StalePacketsDiscarded()const{return m_epochs.discarded;}
+    uint64_t QueuedPacketsDiscarded()const{return m_expiredPackets;}
     void SendChat(const std::string& text);
 
     void SetHandler(uint8_t msgId, Handler h) { m_handlers[msgId] = h; }
@@ -58,6 +75,7 @@ public:
     std::function<void()> onWorldWait;                      // the host plays a new game's prologue: wait
     std::function<void()> onWorldWanted;                    // host: a partner needs a fresh snapshot
     std::function<void(const std::vector<uint8_t>&)> onProfile;
+    std::function<void(uint32_t)> onProfileSaved;
     std::function<void(uint8_t id)> onPeerJoin;
     std::function<void(uint8_t id)> onPeerLeave;
     std::function<void(uint8_t newHost)> onHostChanged;
@@ -69,6 +87,11 @@ public:
 
 private:
     void HandleService(uint8_t id, Reader& r);
+    bool DispatchGame(uint8_t from,uint8_t id,uint8_t channel,uint32_t epoch,uint32_t connection,const std::vector<EntityRef>&refs,const uint8_t*data,size_t size,bool queue);
+    struct DeferredEntityPacket{uint8_t from=0,id=0,channel=0;uint32_t epoch=0,connection=0;uint64_t received=0;std::vector<EntityRef> refs;std::vector<uint8_t> data;};
+    EntityGenerations m_entities;
+    std::vector<EntityRef> m_entityContext;
+    std::vector<DeferredEntityPacket> m_entityWaiting;
 
     NetClient m_net;
     State m_state = State::Offline;
@@ -82,6 +105,9 @@ private:
     std::map<uint8_t, PeerInfo> m_peers;
     Handler m_handlers[256] = {};
     std::vector<NetClient::Packet> m_inbox;
+    uint32_t m_worldEpoch=1;
+    EpochFence m_epochs;
+    uint64_t m_expiredPackets=0;
     // world download
     std::vector<uint8_t> m_world;
     uint32_t m_worldExpected = 0, m_worldRecv = 0, m_worldCrc = 0;

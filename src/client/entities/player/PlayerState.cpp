@@ -86,6 +86,7 @@ void CameraState::Write(Writer& w) const {
     w.U8((uint8_t)std::clamp(fov, 0.0f, 255.0f));
     w.VecQ(V(front), 1.0f);
     w.VecQ(V(sourceOffset), 64.0f);
+    w.Vec(V(aimOffset));
     w.VecQ(V(up), 1.0f);
     w.Angle(orientation);
     w.Angle(alpha);
@@ -102,6 +103,7 @@ void CameraState::Read(Reader& r) {
     fov = (float)r.U8();
     front = G(r.VecQ(1.0f));
     sourceOffset = G(r.VecQ(64.0f));
+    aimOffset = G(r.Vec());
     up = G(r.VecQ(1.0f));
     orientation = game::WrapAngle(r.Angle());
     alpha = game::WrapAngle(r.Angle());
@@ -126,8 +128,11 @@ void OnFootState::Write(Writer& w) const {
     w.I8(area);
     w.U8(moveState);
     w.U8(wanted);
+    w.U8(fightingStyle);
+    w.U8(attackMoves);
     pad.Write(w);
     cam.Write(w);
+    motion.Write(w);
 }
 
 bool OnFootState::Read(Reader& r) {
@@ -144,9 +149,12 @@ bool OnFootState::Read(Reader& r) {
     area = r.I8();
     moveState = r.U8();
     wanted = r.U8();
+    fightingStyle = r.U8();
+    attackMoves = r.U8();
+    if (fightingStyle < 4 || fightingStyle > 16) return false;
     pad.Read(r);
     cam.Read(r);
-    return r.Ok();
+    return motion.Read(r);
 }
 
 }  // namespace coop

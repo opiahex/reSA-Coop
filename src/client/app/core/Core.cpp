@@ -64,15 +64,25 @@ void __fastcall HookGenerateGameFilename(void* self, void* edx, int slot, char* 
 
 void CommonFrame();
 
+
 void __cdecl HookGameProcess() {
+    uint64_t started=NowMs(),slowest=0;const char*slowName="-";
+    auto measure=[&](Module*m,bool pre){auto at=NowMs();if(pre)m->OnPreProcess();else m->OnPostProcess();auto elapsed=NowMs()-at;if(elapsed>slowest){slowest=elapsed;slowName=m->Name();}};
     ++g_frameNo;
     CommonFrame();
-    for (auto* m : Modules()) m->OnPreProcess();
+    auto commonMs=NowMs()-started;
+    for (auto* m : Modules()) measure(m,true);
+    auto nativeAt=NowMs();
     g_origGameProcess();
+    auto nativeMs=NowMs()-nativeAt;
     // The frame a new game's player is made in (MAIN's CREATE_PLAYER): the game starts for the modules next frame
     // (OnGameStarted, G_RESYNC), and what they announced in this one was forgotten here and made twice there.
     if (!g_gameStarted && IsPlayerReady()) return;
-    for (auto* m : Modules()) m->OnPostProcess();
+    for (auto* m : Modules()) measure(m,false);
+    static uint64_t logged=0;
+    if(IsPlayerReady()&&NowMs()-started>=80&&NowMs()-logged>2000){
+        logged=NowMs();LOGI("Slow game frame: total %llu ms, network/flow %llu ms, native %llu ms, module %s %llu ms",(unsigned long long)(NowMs()-started),(unsigned long long)commonMs,(unsigned long long)nativeMs,slowName,(unsigned long long)slowest);
+    }
 }
 
 void __fastcall HookMenuProcess(void* self, void* edx) {
@@ -402,7 +412,7 @@ static std::string ToAnsiPath(const std::wstring& w) {
     std::string s(n, '\0');
     WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, w.c_str(), -1, s.data(), n, nullptr, &bad);
     s.resize(strlen(s.c_str()));
-    if (bad) {
+    if (bad || s.size() >= 104) {
         // fall back to the 8.3 short name which is always ASCII
         wchar_t shortPath[MAX_PATH];
         if (GetShortPathNameW(w.c_str(), shortPath, MAX_PATH)) {
@@ -421,13 +431,16 @@ bool LoadSaveFile(const std::wstring& path) {
         return false;
     }
     g_redirectPath = ToAnsiPath(path);
-    if (g_redirectPath.size() >= 250) {
+    if (g_redirectPath.size() >= 104) {
         LOGE("Save path too long");
         g_redirectPath.clear();
         return false;
     }
     const uintptr_t mm = game::addr::MenuManager;
     // CGenericGameStorage::CheckSlotDataValid(slot) — reads the file through GenerateGameFilename
+    // The menu clears C_PcSave::error before a load. Our asynchronous load must do the same:
+    // scanning an empty save slot leaves SLOT_INVALID, which makes even a correct checksum fail.
+    game::Ref<int32_t>(0xC17034) = 0;
     bool valid = game::Call<0x5D1380, bool>(flow::kRedirectSlot);
     if (!valid) {
         LOGE("Save file is not valid: %s", g_redirectPath.c_str());

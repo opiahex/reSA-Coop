@@ -102,6 +102,7 @@ bool StartServerProcess(const std::wstring& worldPath, bool newGame) {
     if (!g_password.empty()) cmd += L" --password \"" + Utf8ToWide(g_password) + L"\"";
     if (!worldPath.empty()) cmd += L" --world \"" + worldPath + L"\"";
     if (newGame) cmd += L" --new-game";
+    cmd += L" --max " + std::to_wstring(proto::kMaxPlayers);  // also upgrades an existing two-player server.ini
     cmd += cfg.friendlyFire ? L" --friendly-fire 1" : L" --friendly-fire 0";  // the checkbox wins over server.ini
 
     if (!g_serverJob) {
@@ -369,9 +370,12 @@ void SaveSpot() {
     NetVehicle* nv = car ? Vehicles::Instance().Find(car) : nullptr;
     bool empty = car && !car->Driver() && car->NumPassengers() == 0;
     if (empty && car->Status() != 5 && car->Health() >= 250.0f && !(nv && Vehicles::Instance().IsMirror(*nv)) &&
-        (car->GetPosition() - p).Length() < 60.0f) {
+        ((car->GetPosition() - p).Length() < 60.0f || (me->AreaCode() != 0 && car->AreaCode() == 0))) {
         game::CVector c = car->GetPosition();
         game::CMatrix* m = car->Matrix();
+        if (!nv) nv = Vehicles::Instance().EnsureNetworked(car);
+        g_spot.carNetId = nv ? nv->netId : 0;
+        g_spot.carArea = car->AreaCode();
         g_spot.carModel = car->ModelIndex();
         g_spot.carX = c.x, g_spot.carY = c.y, g_spot.carZ = c.z;
         g_spot.carHeading = m ? std::atan2(-m->forward.x, m->forward.y) : 0.0f;

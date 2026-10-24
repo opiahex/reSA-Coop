@@ -12,6 +12,9 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <atomic>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #include "common/api/protocol/Protocol.h"
@@ -65,9 +68,56 @@ struct Stream {
     }
 };
 
+// WinMM drivers can block for a full second even while returning a capture
+// buffer. No device API or device destruction runs on the simulation thread.
+// The detached worker owns its context until all queued device cleanup ends.
+struct VoiceIo : std::enable_shared_from_this<VoiceIo> {
+    std::atomic<bool> quit{false},talk{false};
+    std::atomic<int> micStatus{0};
+    std::atomic<unsigned> slowMs{0};
+    int mic=-1,speaker=-1;bool capture=true;
+    std::mutex mutex;
+    std::deque<std::vector<int16_t>> recorded;
+    std::map<uint8_t,std::deque<std::vector<int16_t>>> outgoing;
+    unsigned dropMask=0;
+    void Start(){auto self=shared_from_this();std::thread([self]{self->Run();}).detach();}
+    void Drop(uint8_t id){std::lock_guard<std::mutex> lock(mutex);if(id<3)dropMask|=1u<<id;outgoing.erase(id);}
+    void Run(){
+        HWAVEIN in=nullptr;WAVEHDR headers[kInBuffers]{};int16_t samples[kInBuffers][kFrame]{};int next=0;
+        std::map<uint8_t,std::unique_ptr<Stream>> streams;uint64_t retry=0;
+        while(!quit){auto began=GetTickCount64();
+            if(capture&&!in&&began>=retry){retry=began+10000;auto format=Format16k();
+                if(waveInOpen(&in,mic<0?WAVE_MAPPER:(UINT)mic,&format,0,0,CALLBACK_NULL)==MMSYSERR_NOERROR){
+                    for(int i=0;i<kInBuffers;++i){headers[i]={};headers[i].lpData=(LPSTR)samples[i];headers[i].dwBufferLength=sizeof(samples[i]);waveInPrepareHeader(in,&headers[i],sizeof(WAVEHDR));waveInAddBuffer(in,&headers[i],sizeof(WAVEHDR));}
+                    auto result=waveInStart(in);micStatus=result==MMSYSERR_NOERROR?1:-1;
+                    if(result!=MMSYSERR_NOERROR){waveInReset(in);for(auto&h:headers)if(h.dwFlags&WHDR_PREPARED)waveInUnprepareHeader(in,&h,sizeof(h));waveInClose(in);in=nullptr;}
+                }else{in=nullptr;micStatus=-1;}
+            }
+            if(in)for(int n=0;n<kInBuffers;++n){auto&h=headers[next];if(!(h.dwFlags&WHDR_DONE))break;
+                if(talk&&h.dwBytesRecorded==sizeof(samples[next])){std::lock_guard<std::mutex> lock(mutex);recorded.emplace_back(samples[next],samples[next]+kFrame);while(recorded.size()>kMaxQueue)recorded.pop_front();}
+                h.dwFlags&=~WHDR_DONE;h.dwBytesRecorded=0;waveInAddBuffer(in,&h,sizeof(h));next=(next+1)%kInBuffers;
+            }
+            std::map<uint8_t,std::deque<std::vector<int16_t>>> pending;unsigned drops;
+            {std::lock_guard<std::mutex> lock(mutex);pending.swap(outgoing);drops=dropMask;dropMask=0;}
+            for(int id=0;id<3;++id)if(drops&(1u<<id))streams.erase((uint8_t)id);
+            for(auto&[id,frames]:pending){auto&slot=streams[id];if(!slot)slot=std::make_unique<Stream>();for(auto&pcm:frames)slot->queue.push_back(std::move(pcm));while(slot->queue.size()>kMaxQueue)slot->queue.pop_front();}
+            for(auto&[id,slot]:streams){auto&s=*slot;if(!s.out){if(s.queue.empty())continue;auto format=Format16k();if(waveOutOpen(&s.out,speaker<0?WAVE_MAPPER:(UINT)speaker,&format,0,0,CALLBACK_NULL)!=MMSYSERR_NOERROR){s.out=nullptr;s.queue.clear();continue;}for(auto&h:s.hdr)h.dwFlags=WHDR_DONE;}
+                if(!s.playing&&s.queue.size()<kStartQueue)continue;bool active=false;
+                for(int i=0;i<kOutBuffers;++i){auto&h=s.hdr[i];if(!(h.dwFlags&WHDR_DONE)){active=true;continue;}if(s.queue.empty())continue;
+                    if(h.dwFlags&WHDR_PREPARED)waveOutUnprepareHeader(s.out,&h,sizeof(h));memcpy(s.buf[i],s.queue.front().data(),sizeof(s.buf[i]));s.queue.pop_front();h={};h.lpData=(LPSTR)s.buf[i];h.dwBufferLength=sizeof(s.buf[i]);waveOutPrepareHeader(s.out,&h,sizeof(h));waveOutWrite(s.out,&h,sizeof(h));active=true;
+                }s.playing=active||!s.queue.empty();
+            }
+            auto elapsed=(unsigned)(GetTickCount64()-began);if(elapsed>slowMs.load())slowMs=elapsed;Sleep(5);
+        }
+        if(in){waveInReset(in);for(auto&h:headers)if(h.dwFlags&WHDR_PREPARED)waveInUnprepareHeader(in,&h,sizeof(h));waveInClose(in);}
+        streams.clear();
+    }
+};
+
 class Voice : public Module {
 public:
     const char* Name() const override { return "Voice"; }
+    ~Voice(){if(m_io)m_io->quit=true;}
 
     void OnInstallHooks() override {
         Net().SetHandler(proto::G_VOICE, [](uint8_t from, Reader& r) { Instance().Handle(from, r); });
@@ -78,18 +128,26 @@ public:
 
     void OnSessionStart() override {
         m_micWarned = m_silenceWarned = false;
-        if (Cfg().voiceEnabled && !m_testTone) OpenMic();
+        if(Cfg().voiceEnabled){m_io=std::make_shared<VoiceIo>();m_io->mic=Cfg().micDevice;m_io->speaker=Cfg().speakerDevice;m_io->capture=!m_testTone;m_io->Start();}
     }
     void OnSessionEnd() override {
-        CloseMic();
+        if(m_io){m_io->quit=true;m_io.reset();}m_transmitting=false;
         m_streams.clear();
     }
-    void OnPeerLeave(uint8_t id) override { m_streams.erase(id); }
+    void OnPeerLeave(uint8_t id) override { m_streams.erase(id);if(m_io)m_io->Drop(id); }
 
     void OnPostProcess() override {
         if (!Net().Online()) return;
-        PumpCapture();
-        for (auto& [id, s] : m_streams) PumpPlayback(*s);
+        m_transmitting=Cfg().voiceEnabled&&PushToTalk();if(!m_transmitting)m_enc={};
+        if(m_testTone)PumpCapture();
+        if(m_io){
+            m_io->talk=m_transmitting;std::deque<std::vector<int16_t>> input;
+            {std::lock_guard<std::mutex> lock(m_io->mutex);input.swap(m_io->recorded);for(auto&[id,s]:m_streams){auto&q=m_io->outgoing[id];while(!s->queue.empty()){q.push_back(std::move(s->queue.front()));s->queue.pop_front();}while(q.size()>kMaxQueue)q.pop_front();}}
+            for(auto&pcm:input)if(m_transmitting)Send(pcm.data());else m_enc={};
+            if(m_io->micStatus==-1&&!m_micWarned){m_micWarned=true;LOGW("Voice: microphone unavailable; device retries run off the game thread");}
+            auto slow=m_io->slowMs.exchange(0);if(slow>=80)LOGW("Voice device worker took %u ms; simulation did not wait",slow);
+            LogSent();
+        }
         if (m_rxFrames && NowMs() - m_rxLogMs > 5000) {
             m_rxLogMs = NowMs();
             LOGI("Voice: %d frames received, rms %.0f", m_rxFrames, std::sqrt(m_rxEnergy / (m_rxFrames * (double)kFrame)));
@@ -125,42 +183,6 @@ public:
     }
 
 private:
-    bool OpenMic() {
-        WAVEFORMATEX f = Format16k();
-        UINT dev = Cfg().micDevice < 0 ? WAVE_MAPPER : (UINT)Cfg().micDevice;
-        MMRESULT r = waveInOpen(&m_in, dev, &f, 0, 0, CALLBACK_NULL);
-        if (r != MMSYSERR_NOERROR) {
-            m_in = nullptr;
-            LOGW("Voice: no microphone available (waveInOpen failed: %u)", r);
-            return false;
-        }
-        for (int i = 0; i < kInBuffers; ++i) {
-            m_inHdr[i] = {};
-            m_inHdr[i].lpData = (LPSTR)m_inBuf[i];
-            m_inHdr[i].dwBufferLength = sizeof(m_inBuf[i]);
-            waveInPrepareHeader(m_in, &m_inHdr[i], sizeof(WAVEHDR));
-            waveInAddBuffer(m_in, &m_inHdr[i], sizeof(WAVEHDR));
-        }
-        m_nextIn = 0;
-        if ((r = waveInStart(m_in)) != MMSYSERR_NOERROR) {
-            LOGW("Voice: the microphone does not start (waveInStart failed: %u)", r);
-            CloseMic();
-            return false;
-        }
-        LOGI("Voice: microphone open (push to talk: key %02X%s)", Cfg().voiceKey, Cfg().voiceAlwaysOn ? ", always on" : "");
-        return true;
-    }
-
-    void CloseMic() {
-        if (!m_in) return;
-        waveInReset(m_in);
-        for (WAVEHDR& h : m_inHdr)
-            if (h.dwFlags & WHDR_PREPARED) waveInUnprepareHeader(m_in, &h, sizeof(h));
-        waveInClose(m_in);
-        m_in = nullptr;
-        m_transmitting = false;
-    }
-
     bool PushToTalk() const {
         if (Cfg().voiceAlwaysOn || m_testTone) return true;
         // only while our window is active and nobody types in the chat
@@ -180,28 +202,6 @@ private:
             LogSent();
             return;
         }
-        if (!m_in) {
-            // the microphone may be plugged in or allowed later: tried again while the key is held
-            if (!m_transmitting || NowMs() - m_micTriedMs < 3000) return;
-            m_micTriedMs = NowMs();
-            if (OpenMic() || m_micWarned) return;
-            m_micWarned = true;
-            ui::TheChat().AddError(TR("Не удалось открыть микрофон. Проверьте, что он подключён, а в Windows разрешён доступ к микрофону для классических приложений.",
-                                      "Could not open the microphone. Check that it is plugged in and that Windows lets desktop apps use the microphone."));
-            return;
-        }
-        // in the order they were queued: by index, a wrap-around would swap 20 ms pieces
-        for (int n = 0; n < kInBuffers; ++n) {
-            WAVEHDR& h = m_inHdr[m_nextIn];
-            if (!(h.dwFlags & WHDR_DONE)) break;
-            if (m_transmitting && h.dwBytesRecorded == sizeof(m_inBuf[m_nextIn])) Send(m_inBuf[m_nextIn]);
-            else m_enc = {};  // a new talk spurt starts from silence
-            h.dwFlags &= ~WHDR_DONE;
-            h.dwBytesRecorded = 0;
-            waveInAddBuffer(m_in, &h, sizeof(WAVEHDR));
-            m_nextIn = (m_nextIn + 1) % kInBuffers;
-        }
-        LogSent();
     }
 
     void Send(int16_t* pcm) {
@@ -265,45 +265,8 @@ private:
         return std::clamp(1.0f - (d - 15.0f) / 65.0f, 0.35f, 1.0f);
     }
 
-    void PumpPlayback(Stream& s) {
-        if (!s.out) {
-            if (s.queue.empty()) return;
-            WAVEFORMATEX f = Format16k();
-            UINT dev = Cfg().speakerDevice < 0 ? WAVE_MAPPER : (UINT)Cfg().speakerDevice;
-            if (waveOutOpen(&s.out, dev, &f, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) {
-                s.out = nullptr;
-                s.queue.clear();
-                return;
-            }
-            for (WAVEHDR& h : s.hdr) h.dwFlags = WHDR_DONE;  // all free
-        }
-        if (!s.playing && s.queue.size() < kStartQueue) return;
-        bool any = false;
-        for (int i = 0; i < kOutBuffers && !s.queue.empty(); ++i) {
-            WAVEHDR& h = s.hdr[i];
-            if (!(h.dwFlags & WHDR_DONE)) {
-                any = true;
-                continue;
-            }
-            if (h.dwFlags & WHDR_PREPARED) waveOutUnprepareHeader(s.out, &h, sizeof(h));
-            memcpy(s.buf[i], s.queue.front().data(), sizeof(s.buf[i]));
-            s.queue.pop_front();
-            h = {};
-            h.lpData = (LPSTR)s.buf[i];
-            h.dwBufferLength = sizeof(s.buf[i]);
-            waveOutPrepareHeader(s.out, &h, sizeof(h));
-            waveOutWrite(s.out, &h, sizeof(h));
-            any = true;
-        }
-        s.playing = any || !s.queue.empty();  // re-buffer after a gap
-    }
-
-    HWAVEIN m_in = nullptr;
-    int m_nextIn = 0;  // the capture buffer the device fills first
-    uint64_t m_micTriedMs = 0;
-    bool m_micWarned = false, m_silenceWarned = false;
-    WAVEHDR m_inHdr[kInBuffers] = {};
-    int16_t m_inBuf[kInBuffers][kFrame] = {};
+    std::shared_ptr<VoiceIo> m_io;
+    bool m_micWarned=false,m_silenceWarned=false;
     adpcm::State m_enc;
     uint16_t m_seq = 0;
     bool m_transmitting = false;

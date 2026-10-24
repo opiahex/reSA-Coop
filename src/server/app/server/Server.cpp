@@ -36,7 +36,7 @@ bool Server::Start(const Config& cfg) {
     addr.host = ENET_HOST_ANY;
     addr.port = m_cfg.port;
     // a couple of spare peers so that "server full" can be reported politely
-    m_host = enet_host_create(&addr, (size_t)m_cfg.maxPlayers + 2, CH_COUNT, 0, 0);
+    m_host = enet_host_create(&addr, m_players.size(), CH_COUNT, 0, 0);
     if (!m_host) {
         LOGE("Не удалось открыть UDP-порт %u (занят другим процессом?)", m_cfg.port);
         return false;
@@ -55,7 +55,7 @@ bool Server::Start(const Config& cfg) {
         LoadWorld(WorldPath(), "world.b");
     }
 
-    for (int i = 0; i < kMaxPlayers; ++i) m_players[i].id = (uint8_t)i;
+    for(auto& p:m_players)p.id=kServerId;
     LOGI("Сервер \"%s\" запущен на порту %u, мест: %d%s", m_cfg.name.c_str(), m_cfg.port, m_cfg.maxPlayers,
          m_cfg.password.empty() ? "" : ", с паролем");
     m_running = true;
@@ -143,7 +143,7 @@ void Server::OnConnect(ENetPeer* peer) {
     Player* slot = nullptr;
     // every slot: a player coming back after a crash finds its old connection still holding one (it times out in 10 to
     // 20 s); the number of players is checked at the hello, where that old one is let go
-    for (int i = 0; i < kMaxPlayers; ++i)
+    for (size_t i = 0; i < m_players.size(); ++i)
         if (!m_players[i].used) {
             slot = &m_players[i];
             break;
@@ -157,7 +157,7 @@ void Server::OnConnect(ENetPeer* peer) {
         enet_peer_disconnect_later(peer, 0);
         return;
     }
-    uint8_t id = slot->id;
+    uint8_t id = kServerId;
     *slot = Player{};
     slot->id = id;
     slot->used = true;
@@ -165,6 +165,11 @@ void Server::OnConnect(ENetPeer* peer) {
     slot->connectTime = NowMs();
     peer->data = slot;
     enet_peer_timeout(peer, 0, 10000, 20000);
+    // Bulk-save acknowledgements can raise RTT briefly. ENet's default throttle then drops movement/voice,
+    // and with two sources one stream can lose most of its updates. Game state is already rate limited;
+    // keep sending it during RTT spikes. ENet still respects configured bandwidth limits and UDP loss.
+    // This control packet applies the same policy to the client's outgoing peer as well.
+    enet_peer_throttle_configure(peer, ENET_PEER_PACKET_THROTTLE_INTERVAL, ENET_PEER_PACKET_THROTTLE_ACCELERATION, 0);
     LOGI("Подключение от %s (слот %d)", ip, id);
 }
 
@@ -294,6 +299,7 @@ void Server::HandleHello(Player& p, Reader& r) {
                       "a nickname needs 2 to 20 characters (letters, digits, _-.[])");
     if (ReservedFileName(name))  // the profile is a file named after it: profiles\con.bin is a device on Windows 10
         return reject("такой ник занят системой Windows, выберите другой", "this nickname is reserved by Windows, pick another one");
+    if (!m_cfg.password.empty() && h.password != m_cfg.password) return reject("неверный пароль", "wrong password");
     if (Player* old = FindByName(name)) {
         // the same player again while its old connection has not timed out (its game crashed, the line dropped): the
         // old one goes when it has been silent for 3 s (ENet pings a live game twice a second)
@@ -306,8 +312,10 @@ void Server::HandleHello(Player& p, Reader& r) {
         enet_peer_reset(ghost);
     }
     if (JoinedCount() >= m_cfg.maxPlayers) return reject("на сервере нет свободных мест", "the server is full");
-    if (!m_cfg.password.empty() && h.password != m_cfg.password) return reject("неверный пароль", "wrong password");
 
+
+    for(uint8_t id=0;id<kMaxPlayers;++id)if(!FindById(id)){p.id=id;break;}
+    if(p.id==kServerId)return reject("на сервере нет свободных мест", "the server is full");
     p.name = name;
     p.joined = true;
     bool hostExists = false;
@@ -325,7 +333,7 @@ void Server::HandleHello(Player& p, Reader& r) {
     for (auto& o : m_players) {
         if (!o.joined) continue;
         if (o.isHost) wel.hostId = o.id;
-        if (&o != &p) wel.players.push_back({o.id, o.name, o.isHost});
+        if (&o != &p) wel.players.push_back({o.id, o.name, o.isHost,o.peer->connectID});
     }
     wel.serverName = m_cfg.name;
     wel.motd = m_cfg.motd;
@@ -341,6 +349,7 @@ void Server::HandleHello(Player& p, Reader& r) {
     j.U8(p.id);
     j.Str(p.name, 64);
     j.Bool(p.isHost);
+    j.U32(p.peer->connectID);
     Broadcast(CH_RELIABLE, j, p.id);
 
     SendProfile(p);
@@ -390,8 +399,8 @@ void Server::HandleCommand(Player* p, const std::string& text) {
         if (admin)
             reply(kColorServer, "Для хоста: /kick <ник или номер> [причина], /say <текст>",
                   "For the host: /kick <nickname or number> [reason], /say <text>");
-        reply(kColorServer, "В игре: /tp (переместиться к напарнику), /tphere (позвать напарника к себе)",
-              "In the game: /tp (go to your partner), /tphere (bring your partner to you)");
+        reply(kColorServer, "В игре: /tp [ник или номер], /tphere [ник или номер] — переместиться к игроку или позвать его к себе",
+              "In the game: /tp [nickname or id], /tphere [nickname or id] — go to a player or bring them to you");
     } else if (cmd == "players" || cmd == "status") {
         for (auto& o : m_players) {
             if (!o.joined) continue;
@@ -655,21 +664,26 @@ void Server::SaveProfile(Player& p, const std::vector<uint8_t>& data) {
     EnsureDirectory(m_cfg.dataDir + L"profiles");
     if (!WriteFileBytes(ProfilePath(p.name), data.data(), data.size()))
         LOGW("Не удалось записать профиль %s", p.name.c_str());
+    else {Writer ack(S_PROFILE_SAVED);ack.U32(Crc32(data.data(),data.size()));net::Send(p.peer,CH_RELIABLE,ack);}
 }
 
 void Server::Relay(Player& from, uint8_t channel, const uint8_t* data, size_t size, uint32_t flags) {
     if (channel >= CH_COUNT) return;
-    // [id][sender][payload]
-    ENetPacket* pkt = enet_packet_create(nullptr, size + 1, flags & (ENET_PACKET_FLAG_RELIABLE | ENET_PACKET_FLAG_UNSEQUENCED));
+    bool stateChannel=channel==CH_STATE;
+    channel = RelayedChannel(channel, from.id);
+    // [id][sender][connection incarnation][opaque payload]
+    ENetPacket* pkt = enet_packet_create(nullptr, size + 5, flags & (ENET_PACKET_FLAG_RELIABLE | ENET_PACKET_FLAG_UNSEQUENCED));
+    if(!pkt)return;
     pkt->data[0] = data[0];
     pkt->data[1] = from.id;
-    memcpy(pkt->data + 2, data + 1, size - 1);
+    memcpy(pkt->data+2,&from.peer->connectID,4);
+    memcpy(pkt->data+6,data+1,size-1);
     bool sent = false;
     for (auto& o : m_players) {
         if (!o.joined || &o == &from) continue;
         // states for a player still loading or in the menu piled up there and came stale all at once (voice goes on:
         // players talk while one of them loads)
-        if (channel == CH_STATE && o.status != STATUS_INGAME) continue;
+        if (stateChannel && o.status != STATUS_INGAME) continue;
         sent = enet_peer_send(o.peer, channel, pkt) == 0 || sent;  // a peer going away takes nothing
     }
     if (!sent) enet_packet_destroy(pkt);
@@ -743,8 +757,9 @@ Player* Server::FindByPeer(ENetPeer* peer) {
 }
 
 Player* Server::FindById(int id) {
-    if (id < 0 || id >= kMaxPlayers || !m_players[id].used) return nullptr;
-    return &m_players[id];
+    if(id<0||id>=kMaxPlayers)return nullptr;
+    for(auto&p:m_players)if(p.used&&p.joined&&p.id==id)return &p;
+    return nullptr;
 }
 
 Player* Server::FindByName(const std::string& name) {

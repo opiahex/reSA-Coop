@@ -1,0 +1,15 @@
+reSA-Coop — GTA San Andreas 1.0 US, three players
+
+1. Extract this archive beside gta_sa.exe. Keep coop.asi and the entire coop folder together.
+2. If the game has no ASI loader, run install.bat. The original game library is preserved as vorbisHooked.dll.
+3. Launch the game and open F9. The host creates a session and shares the code; guests enter that code under Connect.
+4. All clients and the server must use the same mod version. Preserve your settings and coop/server-data when updating.
+
+coop.asi is the game module. An additional coop.dll is not required.
+The game itself is not included. Definitive Edition is unsupported.
+
+Русская инструкция и полный список исправлений:
+https://github.com/opiahex/reSA-Coop
+https://github.com/opiahex/reSA-Coop/blob/main/CHANGELOG.md
+
+MIT license; original SA:COOP copyright and ENet/MinHook notices are included in coop/licenses.

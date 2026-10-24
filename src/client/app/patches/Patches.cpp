@@ -23,6 +23,18 @@ namespace coop::patches {
 
 namespace {
 
+// RpAnimBlendClumpUpdateAnimations can fade/remove its last association in
+// UpdateBlend. Vanilla still enters frame callbacks with a null first node
+// (004D1750). Keep native blend/time cleanup, skipping only the empty pose pass.
+__attribute__((naked)) void EmptyAnimNodesStub(){
+    __asm__ volatile(
+        "movl $0, 0x1c(%esp,%ebx,4)\n"
+        "testl %ebx,%ebx\n"
+        "jz 1f\n"
+        "pushl $0x4D3616\nret\n"
+        "1: pushl $0x4D3715\nret\n");
+}
+
 // ---------------------------------------------------------------- mouse / focus
 using MenuFn = void(__fastcall*)(void*, void*);
 MenuFn g_origCentreMouse = nullptr;
@@ -610,6 +622,9 @@ void Apply() {
     mem::HookFn(0x710310, &HookStencilForObject, &g_origStencilForObject, "CStencilShadows::RenderForObject");
     mem::HookFn(0x431F80, &HookCreateCarForScript, &g_origCreateCarForScript, "CCarCtrl::CreateCarForScript");
     mem::HookFn(0x486B00, &HookClearSpace, &g_origClearSpace, "CTheScripts::ClearSpaceForMissionEntity");
+    if(!memcmp((void*)0x4D360E,"\xC7\x44\x9C\x1C\0\0\0\0",8)){
+        mem::Jump(0x4D360E,(void*)&EmptyAnimNodesStub);mem::Nop(0x4D3613,3);
+    }else LOGW("Empty animation-node guard skipped: unexpected bytes at 0x4D360E");
     if (!memcmp((void*)0x4F145C, "\x8B\xC8\x8B\x44\x24\x1C\x33\xD2\xF7\xF1", 10)) {  // CAEStreamThread::Service
         mem::Jump(0x4F145C, (void*)&StreamCursorStub);
         mem::Nop(0x4F1461, 5);

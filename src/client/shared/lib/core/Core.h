@@ -1,14 +1,20 @@
 #pragma once
 #include <cstdint>
+#include <algorithm>
 #include <string>
 #include <vector>
+#include "shared/lib/sync/SyncAudit.h"
 
 namespace coop {
+
+class Module;
+inline std::vector<Module*>&SyncAuditModules(){static std::vector<Module*>modules;return modules;}
 
 // Base class for sync subsystems. All callbacks run on the game thread.
 class Module {
 public:
-    virtual ~Module() = default;
+    Module(){SyncAuditModules().push_back(this);}
+    virtual ~Module(){auto&modules=SyncAuditModules();modules.erase(std::remove(modules.begin(),modules.end(),this),modules.end());}
     virtual const char* Name() const = 0;
     virtual void OnInstallHooks() {}            // once at startup (before the game initialises)
     virtual void OnSessionStart() {}            // handshake completed
@@ -22,6 +28,9 @@ public:
     virtual void OnPreProcess() {}              // before CGame::Process
     virtual void OnPostProcess() {}             // after CGame::Process
     virtual void OnRender() {}                  // HUD overlay (renderer is active)
+    virtual void CollectSyncAudit(std::vector<SyncAuditEntry>&) {}
+    virtual bool RepairSyncEntity(uint8_t kind, uint16_t id) { return false; }
+    virtual void OnEntityReplaced(uint8_t kind,uint8_t scope,uint16_t id) {}
     // Local chat command (without the leading '/'). Return true if handled.
     virtual bool OnCommand(const std::string& cmd, const std::vector<std::string>& args) { return false; }
 };
@@ -31,6 +40,8 @@ namespace core {
 void Init(void* hModule);
 void RegisterModule(Module* m);
 void PeerResynced(uint8_t id);  // dispatches Module::OnPeerResync
+void CollectSyncAudit(std::vector<SyncAuditEntry>& out);
+bool RepairSyncEntity(uint8_t kind, uint16_t id);
 
 // Hotkey routing from the window procedure. Returns true if the key must not reach the game.
 bool OnKeyDown(int vk, bool repeat);

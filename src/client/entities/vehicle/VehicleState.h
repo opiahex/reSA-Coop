@@ -3,18 +3,10 @@
 
 #include "common/lib/buffer/Buffer.h"
 #include "shared/game/Game.h"
+#include "entities/vehicle/WheelState.h"
+#include "shared/lib/sync/Quat.h"
 
 namespace coop {
-
-// Orientation as a quaternion (compressed to 4 x int16 on the wire).
-struct Quat {
-    float x = 0, y = 0, z = 0, w = 1;
-    static Quat FromMatrix(const game::CMatrix& m);
-    void ToMatrix(game::CMatrix& m) const;  // writes right/forward/up, keeps pos
-    static Quat Slerp(const Quat& a, const Quat& b, float t);
-    void Write(Writer& w) const;
-    void Read(Reader& r);
-};
 
 struct VehicleState {
     uint32_t time = 0;
@@ -27,6 +19,8 @@ struct VehicleState {
     float brake = 0;     // 0..1
     float health = 1000;
     uint8_t flags = 0;   // F_*
+    uint8_t lock = 0;
+    int8_t area=0;
 
     enum : uint8_t { F_ENGINE = 1, F_LIGHTS = 2, F_SIREN = 4, F_HORN = 8, F_HANDBRAKE = 16, F_WRECKED = 32 };
     // parts the driver moves; X_* says which this vehicle has
@@ -34,10 +28,12 @@ struct VehicleState {
     uint16_t misc = 0;  // X_MISC, CAutomobile::m_wMiscComponentAngle: Hydra nozzles, raised hydraulics, tow hoist, forks
     float gear = 0;     // X_GEAR, CPlane::m_fLandingGearStatus: 0 down, 1 up, negative while going down
     float turretYaw = 0, turretPitch = 0;  // X_TURRET: Rhino, SWAT van, fire truck
-    game::CVector lightTarget;             // X_LIGHT: a helicopter's searchlight, CHeli::m_vecSearchLightTarget
-    float lightPower = 0;                  // and CHeli::m_fSearchLightIntensity (0..1)
-    uint16_t tower = 0;                    // X_TOW: net id of the vehicle towing this one (CVehicle::m_pTowingVehicle)
-    enum : uint8_t { X_MISC = 1, X_GEAR = 2, X_TURRET = 4, X_LIGHT = 8, X_TOW = 16 };
+    enum : uint8_t { X_MISC = 1, X_GEAR = 2, X_TURRET = 4, X_SEARCHLIGHT = 8, X_ROTOR = 16, X_WHEELS = 32 };
+    WheelState wheels;
+    game::CVector searchTarget;
+    float searchIntensity = 0;
+    float rotorSpeed = 0; // CHeli: native rotor spool, separate from engine-on bit
+    uint16_t towChild=0,towParent=0;
 
     static VehicleState Capture(game::CVehicle* v);
     void Write(Writer& w) const;
@@ -52,9 +48,11 @@ struct VehicleSpawn {
     game::CVector pos;
     Quat rot;
     uint8_t colors[4] = {};
+    int8_t components[2] = {-1,-1}; // optional model extras (cargo, roof, spare wheel)
     float health = 1000;
     int8_t area = 0;
     uint8_t lockState = 0;
+    bool playerUsed = false;  // stable identity while parked, including across interior/world transitions
     bool script = false;  // a script's car in its owner's game (a mission car): never an ordinary car elsewhere
 
     void Write(Writer& w) const;

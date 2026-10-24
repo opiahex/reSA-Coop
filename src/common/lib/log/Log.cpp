@@ -1,4 +1,5 @@
 #include "common/lib/log/Log.h"
+#include "common/lib/profile/Profile.h"
 
 #include <windows.h>
 
@@ -48,11 +49,13 @@ void Write(Level lvl, const char* fmt, ...) {
     // a fault in here with the lock held, reported by the crash handler on the same thread, waited for itself
     static thread_local bool writing = false;
     if (writing) return;
+    profile::Scope timing(profile::LOG_IO);
     writing = true;
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_file) {
         fputs(line, g_file);
-        fflush(g_file);
+        static ULONGLONG lastFlush=0;auto now=GetTickCount64();
+        if(lvl>=Level::Warn||now-lastFlush>=250){fflush(g_file);lastFlush=now;}
     }
     if (g_console) {
         // Console output in UTF-8 (the server sets the console code page to UTF-8).

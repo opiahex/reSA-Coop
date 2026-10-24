@@ -21,6 +21,7 @@
 #include "entities/ped/Peds.h"
 #include "entities/player/Players.h"
 #include "entities/profile/Profile.h"
+#include "shared/api/story-coop/StoryCoop.h"
 #include "entities/session/Flow.h"
 #include "shared/api/net-session/Session.h"
 #include "shared/config/Config.h"
@@ -37,7 +38,7 @@ using namespace game;
 using game::script::Cmd;
 
 constexpr uint32_t kProfileMagic = 0x46504353;  // "SCPF"
-constexpr uint16_t kProfileVersion = 3;  // 2: the rewards of side missions (CPlayerInfo +0x14C..+0x152); 3: whose look
+constexpr uint16_t kProfileVersion = 4;  // 2: the rewards of side missions (CPlayerInfo +0x14C..+0x152); 3: whose look
 constexpr uintptr_t kStatsBlock = 0xB79000;  // CStats::StatTypesInt + StatTypesFloat
 constexpr size_t kStatsSize = 0x4C8;
 // stats the world owns, not the player (CStats::StatTypesInt, id - 120): the profile keeps the values of the world it was
@@ -138,6 +139,7 @@ std::vector<uint8_t> CaptureProfile() {
     w.U8(perks[5]);  // m_bGetOutOfJailFree
     w.U8(perks[6]);  // m_bFreeHealthCare
     w.U8(LookIsOwn());
+    WriteStoryRewardHistory(w);
     return w.Buffer();
 }
 
@@ -160,6 +162,7 @@ bool ApplyProfile(const std::vector<uint8_t>& blob, bool& lookOwn) {
     if (version >= 2)
         for (uint8_t& b : perks) b = r.U8();
     uint8_t own = version >= 3 ? r.U8() : 0;
+    if(version>=4&&!ReadStoryRewardHistory(r))return false;
     if (!r.Ok() || stats.size() != kStatsSize || clothes.size() != kClothesSize) return false;
     lookOwn = own != 0;
 
@@ -256,12 +259,16 @@ bool __cdecl HookMenuSave(int file) {
 }
 
 class Progress : public Module {
+    uint16_t m_sentModel=0xFFFF;
+    std::string m_sentSpecial;
 public:
     const char* Name() const override { return "Progress"; }
 
     void OnInstallHooks() override {
         mem::RedirectCallFn(0x619081, &HookMenuSave, &g_origMenuSave);  // C_PcSave::SaveSlot -> GenericSave
+        Net().onProfileSaved=[](uint32_t crc){if(Instance().m_applied&&crc==Instance().m_pendingCrc)StoryRewardProfileSaved();};
         Net().onProfile = [](const std::vector<uint8_t>& blob) {
+            StoryProfileReady(false);
             Progress& p = Instance();
             // an empty profile after a real one, or during a prologue, in the same session (the first one of a session
             // is the newcomer's): the host began a new game, which this game is not in yet
@@ -285,8 +292,16 @@ public:
         m_profile.clear();
         g_looks.clear();
     }
+    void OnPeerJoin(uint8_t) override { ResendAppearance(); }
+    void OnPeerResync(uint8_t) override { ResendAppearance(); }
+    void OnPeerLeave(uint8_t id) override { g_looks.erase(id); }
+    void ResendAppearance() {
+        m_sentLook.clear();
+        m_sentStats.clear();
+        m_lookSentMs = m_statsSentMs = m_lastLookMs = 0;
+    }
     void OnGameStarted() override {  // a new world: the partner's profile goes on top again
-        m_applied = false;
+        m_applied = false;StoryProfileReady(false);
         g_foreignGame = Net().Online() && !Net().IsHost();
         if (m_resetPending && flow::InHostWorld()) m_reset = true, m_resetPending = false;  // the new game's world
     }
@@ -322,6 +337,7 @@ public:
             }
             g_lookOwn = own || WearOwnLook(m_profile.empty());
             if (!g_lookOwn) memcpy(g_givenKeys, me->ClothesDesc(), sizeof g_givenKeys);
+            StoryProfileReady(true);
             m_saved = m_profile;
             m_lastSaveMs = now;
         }
@@ -337,15 +353,15 @@ public:
         if (now - m_lastLookMs >= 1000) {
             m_lastLookMs = now;
             std::vector<uint8_t> desc((uint8_t*)me->ClothesDesc(), (uint8_t*)me->ClothesDesc() + kClothesSize);
-            uint16_t model = me->ModelIndex();
-            if (desc != m_sentLook || model != m_sentModel || now - m_lookSentMs > 10000) {
+            uint16_t model=me->ModelIndex();
+            std::string special=model>=290&&model<=299?Peds::Instance().SpecialName(model):std::string();
+            if (desc != m_sentLook || model!=m_sentModel || special!=m_sentSpecial || now - m_lookSentMs > 10000) {
                 Writer w(proto::G_PLAYER_LOOK);
                 w.Bytes(desc.data(), desc.size());
-                w.U16(model);
-                w.Str(model >= 290 && model <= 299 ? Peds::Instance().SpecialName(model) : std::string(), 16);
+                w.U16(model);w.Str(special,16);
                 Net().Send(proto::CH_RELIABLE, w);
                 m_sentLook = std::move(desc);
-                m_sentModel = model;
+                m_sentModel=model;m_sentSpecial=special;
                 m_lookSentMs = now;
             }
             std::vector<uint8_t> stats((uint8_t*)kStatsBlock, (uint8_t*)kStatsBlock + kStatsSize);
@@ -393,6 +409,7 @@ public:
         m_lastSaveMs = NowMs();
         std::vector<uint8_t> blob = CaptureProfile();
         if (blob == m_saved && !always) return;
+        m_pendingCrc=Crc32(blob.data(),blob.size());
         Writer w(proto::C_PROFILE_SAVE);
         w.Bytes(blob.data(), blob.size());
         Net().Send(proto::CH_RELIABLE, w);
@@ -408,7 +425,7 @@ public:
 
 private:
     std::vector<uint8_t> m_profile, m_saved, m_sentLook, m_sentStats;
-    uint16_t m_sentModel = 0;
+    uint32_t m_pendingCrc=0;
     bool m_profileReceived = false, m_applied = false;
     bool m_resetPending = false, m_reset = false;  // a new game emptied the profile: applied in the next world
     uint64_t m_lastSaveMs = 0, m_lastLookMs = 0, m_lookSentMs = 0, m_statsSentMs = 0, m_quietUntil = 0;
@@ -426,6 +443,6 @@ struct Reg {
 } g_reg;
 }  // namespace
 
-void SaveProfileNow() { Progress::Instance().SaveNow(); }
+void SaveProfileNow(bool always) { Progress::Instance().SaveNow(always); }
 
 }  // namespace coop

@@ -53,6 +53,8 @@ struct SavedSpot {
     int activeWeapon = 0;
     int weapons[13] = {}, ammo[13] = {};
     // the car the partner drove last, when it stands close by: it is in the new world too
+    uint16_t carNetId = 0;
+    int8_t carArea = 0;
     int carModel = 0;
     float carX = 0, carY = 0, carZ = 0, carHeading = 0, carHealth = 1000;
     uint8_t carColors[4] = {};

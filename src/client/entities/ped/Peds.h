@@ -1,11 +1,14 @@
 #pragma once
 #include <cstdint>
+#include "shared/lib/sync/IdAllocator.h"
 #include <map>
 #include <string>
 
 #include "common/lib/buffer/Buffer.h"
 #include "shared/game/Game.h"
 #include "shared/lib/core/Core.h"
+#include "shared/lib/sync/AnimationState.h"
+#include "shared/lib/sync/PedInteraction.h"
 
 namespace coop {
 
@@ -14,18 +17,26 @@ struct PedSyncState {
     game::CVector pos, vel;
     float heading = 0;
     uint8_t moveState = 1;
-    uint8_t health = 100, armour = 0, weapon = 0;
+    float health=100,armour=0;
+    uint8_t weapon=0;
     uint8_t flags = 0;  // F_*
+    uint8_t entityFlags = 3; // visible=1, collision=2, script-frozen position=4, killed-by-stealth=8
     uint16_t vehNetId = 0;
     int8_t seat = -1;  // F_IN_VEHICLE: current seat, F_ENTERING: target seat (-1 driver)
     int8_t area = 0;
     game::CVector aim;  // F_AIMING: gun target relative to pos
     uint8_t aimKind = 0;  // F_AIMING: 0 the point above, 1 player aimId, 2 ped netId aimId
     uint16_t aimId = 0;
+    uint8_t drivebyStyle = 8, drivebyFrequency = 50;
     // action animation (anything but locomotion): IFP block + index inside it, 0xFFFF = none
     uint16_t animBlock = 0xFFFF, animIdx = 0, animFlags = 0;
     float animTime = 0;
+    float animSpeed = 1;
+    AnimationState motion;  // the owner's actual gait and playback rate
+    PedInteraction interaction;
 
+    void Write(Writer& w)const;
+    bool Read(Reader& r);
     enum : uint8_t {
         F_DEAD = 1,
         F_DUCKING = 2,
@@ -34,6 +45,7 @@ struct PedSyncState {
         F_FIRING = 16,
         F_ENTERING = 32,  // walking to / opening vehicle vehNetId
         F_LEAVING = 64,
+        F_DRIVEBY = 128,
     };
 };
 
@@ -47,36 +59,51 @@ struct NetPed {
     uint8_t pedType = 4;
     std::string special;  // model name for special character slots 290-299
     // owner side
+    uint64_t firstAnnouncedMs = 0;
     uint64_t lastSendMs = 0;
+    uint64_t handoverUntil = 0; // let authority/area snapshots catch up after takeover
     int lastClip = -1;  // shots are detected by the clip emptying
     uint8_t lastWeapon = 0;
     uint64_t lastShotMs = 0;
     // mirror side
     bool hasState = false;
+    bool pendingAdoption=false;
+    bool awayHeld=false,awayGravity=false;
+    uint32_t awayPhysicsMask=0;
     PedSyncState state;
-    uint64_t recvMs = 0;
+    uint64_t recvMs = 0,lastRelevantMs=0;
     uint64_t lastTaskMs = 0;
     game::CVector lastTaskTarget;
     uint8_t lastTaskMove = 0;
     bool deadApplied = false;
+    uint16_t deathBlock=0xFFFF,deathIndex=0;
     uint64_t lastHitMs = 0;  // our player hit it (sent to the owner): its loot falls here if it dies of it
     uint64_t lastRamMs = 0;  // our player's car hit it (sent once per contact)
     uint8_t gunMode = 0;  // 0 none, 1 aiming, 2 shooting
     int gunTargetHandle = -1;  // ped aimed at, -1: gunTarget point
     game::CVector gunTarget;
     uint64_t gunTaskMs = 0;
-    uint64_t weaponMs = 0;     // the last weapon change: its own timer, the walk tasks' held a walking mirror's gun back
+    uint64_t duckMs=0;
+    uint64_t weaponMs = 0; // weapon streaming must not share the walking task's timer
     uint16_t enterVeh = 0;
     uint64_t enterTaskMs = 0, leaveTaskMs = 0;
     uint16_t animBlock = 0xFFFF, animIdx = 0;  // action animation replayed on the mirror
     uint16_t baseBlock = 0xFFFF, baseIdx = 0;  // the full-body one under it (a fight stance under punches)
     float animTime = 0;                         // owner's time of it in the latest state (restarts go back)
     bool animFull = false;                      // it is not partial: locomotion tasks must wait
+    bool extraFull=false,interactionAttached=false,interactionPending=false,pairedAction=false;
+    AnimationState extraLayers[PedInteraction::LayerCount];
+    bool actionSentActive=false;
+    uint32_t actionRevision=0,actionSignature=0,actionSentRevision=0;
+    uintptr_t actionLeaf=0;float actionTime=0;
+    uint16_t actionBlock=0xFFFF,actionIndex=0;
 };
 
 class Peds : public Module {
 public:
+    NetPed* EnsureNetworked(game::CPed* ped);
     const char* Name() const override { return "Peds"; }
+    void OnEntityReplaced(uint8_t kind,uint8_t scope,uint16_t id) override;
     void OnInstallHooks() override;
     void OnSessionEnd() override;
     void OnPeerLeave(uint8_t id) override;
@@ -86,21 +113,21 @@ public:
     void OnPostProcess() override;
 
     static Peds& Instance();
+    const std::map<uint16_t,NetPed>& All() const { return m_byId; }
     NetPed* Find(game::CPed* ped);
     game::CPed* FindOwned(uint16_t netId);  // our live ped announced under netId
+    bool Known(uint16_t id)const{return m_byId.count(id)!=0;}
     int HandleOf(uint16_t netId);            // script handle of the live ped (ours or a mirror), -1 if none
     // special character slots (models 290-299) are filled by name at run time
     void RememberSpecialModel(int model, const char* name);
-    std::string SpecialName(int model) const;  // what the slot was filled with here, "" if nothing
-    // the model here of the special character `name`: its slot, or a free one asked for it, from the top (scripts and
-    // cutscenes fill them from 290); -1 while it loads or with no slot free
+    std::string SpecialName(int model) const;
     int SpecialModelFor(const std::string& name);
-    // a script here fills that slot with another character: the copies wearing it are made again elsewhere (the game
-    // drops the model from under script people, and a copy is one)
     void RespawnCopiesOf(int model);
     // a partner (re)started its game: announce our peds again
     void Reannounce();
-    // our ped goes to player `to` (it takes the mirror over as its own) and ours is deleted
+    void ReannounceOne(uint16_t id);
+    int RemoveSharedAmbient(const game::CVector& centre,int8_t area,int budget=4);
+    // Transfer simulation while retaining the old simulator's physical mirror.
     void GiveAway(uint16_t netId, uint8_t to);
     // this game would drop the ped, the other player is nearer: it goes to that player's game (false: not ours to give)
     bool QueueGiveAway(game::CPed* ped, uint8_t to);
@@ -114,6 +141,7 @@ private:
     void HandleCreate(uint8_t from, Reader& r);
     void HandleRemove(uint8_t from, Reader& r);
     void HandleSync(uint8_t from, Reader& r);
+    void HandleAction(uint8_t from,Reader&r);
     void HandleOwner(uint8_t from, Reader& r);
     void ApplyMirror(NetPed& np);
     game::CPed* SpawnMirror(NetPed& np);
@@ -124,12 +152,13 @@ private:
 
     std::map<uint16_t, NetPed> m_byId;
     std::map<game::CPed*, uint16_t> m_byPtr;
-    uint16_t m_nextId = 1;
+    IdAllocator<4096> m_ids;
     std::map<int, std::string> m_specialNames;
     std::map<game::CPed*, uint8_t> m_giveAway;  // to hand over after the population code (ped -> player)
     uint64_t m_lastScan = 0, m_lastStatsMs = 0;
     bool m_wasReady = false;
     int m_mirrorShots = 0;  // diagnostics: shots fired by mirrors since the last stats line
+    int m_spawnBudget = 2;
 };
 
 // the interior a ped is in, by its area or, for the interiors' own people (they keep area 0), by a player near it

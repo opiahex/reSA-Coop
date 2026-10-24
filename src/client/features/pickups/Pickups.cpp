@@ -12,6 +12,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <set>
+#include <map>
 
 #include "common/api/protocol/Protocol.h"
 #include "common/lib/log/Log.h"
@@ -20,6 +22,7 @@
 #include "entities/mission/Mission.h"
 #include "shared/api/net-session/Session.h"
 #include "shared/game/Game.h"
+#include "shared/game/Script.h"
 #include "shared/lib/core/Core.h"
 #include "shared/lib/memory/Memory.h"
 
@@ -36,7 +39,7 @@ constexpr uintptr_t kTags = 0xA9A8C0;     // CTagManager::ms_tagDesc: {CEntity*,
 constexpr uintptr_t kNumTags = 0xA9AD70;  // CTagManager::ms_numTags
 enum : uint8_t {
     PU_ON_STREET = 2, PU_ONCE = 3, PU_ONCE_TIMEOUT = 4, PU_ONCE_TIMEOUT_SLOW = 5, PU_MONEY = 8, PU_ON_STREET_SLOW = 15,
-    PU_ASSET_REVENUE = 16, PU_MONEY_DOESNTDISAPPEAR = 19, PU_SNAPSHOT = 20, PU_ONCE_FOR_MISSION = 22,
+    PU_FLOATINGPACKAGE = 13, PU_FLOATINGPACKAGE_FLOATING = 14, PU_ASSET_REVENUE = 16, PU_MONEY_DOESNTDISAPPEAR = 19, PU_SNAPSHOT = 20, PU_ONCE_FOR_MISSION = 22,
 };
 enum : uint8_t { EV_TAKEN = 1, EV_TAKINGS = 2, EV_PHOTOGRAPHED = 3, EV_TAG = 4 };
 constexpr int kModelInfo = 1239, kModelSave = 1277;  // info icon, save disk
@@ -48,15 +51,24 @@ int16_t* Pos(uintptr_t p) { return &Ref<int16_t>(p + 0x10); }
 int16_t ModelIndexVar(uintptr_t a) { return Ref<int16_t>(a); }  // CModelInfo MI_* variables
 
 bool g_applying = false;               // this module creates or takes a pickup itself
+std::set<int> g_story;
 std::vector<int> g_announced;          // handles of pickups announced from here (for a restarted partner)
 
 bool Shared(uint8_t type, int model) {
     switch (type) {
     case PU_ON_STREET: case PU_ONCE: case PU_ONCE_TIMEOUT: case PU_ONCE_TIMEOUT_SLOW: case PU_MONEY:
     case PU_ON_STREET_SLOW: case PU_ASSET_REVENUE: case PU_MONEY_DOESNTDISAPPEAR: case PU_ONCE_FOR_MISSION:
+    case PU_FLOATINGPACKAGE: case PU_FLOATINGPACKAGE_FLOATING:
         return model != kModelInfo && model != kModelSave;
     }
     return false;
+}
+
+bool OrdinarySupply(int model) {
+    // Use the game's model classification, including modded weapon models.
+    // WeaponForModel also recognizes health, armour and adrenaline pickups.
+    return Call<0x454AE0, int>(model) != 0 || model == ModelIndexVar(0x8CD59C) ||
+           model == ModelIndexVar(0x8CD5D0);  // money, police bribe
 }
 
 // the local pickup matching one of the other game (same model, within 1.5 m), or -1
@@ -70,6 +82,53 @@ int Find(int model, const int16_t* pos, uint8_t type) {
         if (d < bestDist) best = i, bestDist = d;
     }
     return best;
+}
+
+struct StoryPickup {
+    uint32_t source=0;uint16_t model=0;int16_t pos[3]{};uint8_t type=0;uint32_t ammo=0;uint16_t perDay=0;uint8_t flags=0;int8_t area=0;
+};
+std::map<uint32_t,StoryPickup> g_wantedStory;
+std::map<uint32_t,int> g_storyCopies;
+uint64_t g_storySentMs=0;
+bool PickupAlive(int h){int i=h&0xffff;return h>=0&&i<kNumPickups&&Type(Pickup(i))&&Ref<uint16_t>(Pickup(i)+0x1A)==(uint16_t)(h>>16);}
+void SendStoryPickups(bool force=false){
+    if(!Net().IsHost()||!flow::InSharedWorld()||!core::IsPlayerReady()||(!force&&NowMs()-g_storySentMs<500))return;
+    g_storySentMs=NowMs();
+    if(!HostReplicating()&&!core::IsOnMission())g_story.clear();
+    std::vector<int> live;
+    for(auto it=g_story.begin();it!=g_story.end();)if(!PickupAlive(*it))it=g_story.erase(it);else{live.push_back(*it);++it;}
+    Writer w(proto::G_STORY_PICKUPS);w.U8((uint8_t)std::min<size_t>(live.size(),64));
+    for(size_t n=0;n<live.size()&&n<64;++n){auto p=Pickup(live[n]&0xffff);w.U32(live[n]);w.U16(Model(p));for(int k=0;k<3;++k)w.I16(Pos(p)[k]);w.U8(Type(p));w.U32(Ref<uint32_t>(p+8));w.U16(Ref<uint16_t>(p+0x16));w.U8(Ref<uint8_t>(p+0x1D)&3);auto*object=Ref<CObject*>(p+4);w.I8(object?object->AreaCode():FindPlayerPed(0)->AreaCode());}
+    Net().Send(proto::CH_RELIABLE,w);
+}
+void HandleStoryPickups(uint8_t from,Reader&r){
+    auto n=r.U8();if(from!=Net().HostId()||Net().IsHost()||n>64)return;
+    std::map<uint32_t,StoryPickup> wanted;
+    for(int i=0;i<n&&r.Ok();++i){StoryPickup p;p.source=r.U32();p.model=r.U16();for(auto&v:p.pos)v=r.I16();p.type=r.U8();p.ammo=r.U32();p.perDay=r.U16();p.flags=r.U8();p.area=r.I8();if(Shared(p.type,p.model)&&p.model>0&&p.model<20000)wanted[p.source]=p;}
+    if(r.Ok())g_wantedStory=std::move(wanted);
+}
+void ApplyStoryPickups(){
+    if(!flow::InHostWorld()||Net().IsHost()||!core::IsPlayerReady())return;
+    for(auto it=g_storyCopies.begin();it!=g_storyCopies.end();)if(!g_wantedStory.count(it->first)){
+        if(PickupAlive(it->second))CallMethod<0x4556C0>((void*)Pickup(it->second&0xffff));
+        g_story.erase(it->second);it=g_storyCopies.erase(it);
+    }else ++it;
+    int made=0;
+    for(const auto&[source,p]:g_wantedStory){
+        int h=g_storyCopies.count(source)?g_storyCopies[source]:-1;
+        if(!PickupAlive(h)){
+            if(made>=2)continue;
+            if(!IsModelLoaded(p.model)){RequestModel(p.model);continue;}
+            int existing=Find(p.model,p.pos,p.type);
+            if(existing>=0)h=existing|(int)(Ref<uint16_t>(Pickup(existing)+0x1A)<<16);
+            else{g_applying=true;h=Call<0x456F20,int>(p.pos[0]/8.0f,p.pos[1]/8.0f,p.pos[2]/8.0f,(uint32_t)p.model,(int)p.type,p.ammo,(uint32_t)p.perDay,(int)((p.flags&2)!=0),(char*)nullptr);g_applying=false;++made;}
+            if(h<0)continue;
+            g_storyCopies[source]=h;g_story.insert(h);
+            LOGI("Quest pickup %08X (model %u) copied",source,p.model);
+        }
+        auto pickup=Pickup(h&0xffff);Ref<uint8_t>(pickup+0x1D)=(Ref<uint8_t>(pickup+0x1D)&~3u)|(p.flags&3u);
+        if(auto*object=Ref<CObject*>(pickup+4))object->AreaCode()=p.area;
+    }
 }
 
 void SendEvent(uint8_t what, uintptr_t p, uint8_t type) {
@@ -87,6 +146,22 @@ PickupUpdateFn g_origPickupUpdate = nullptr;
 bool __fastcall HookPickupUpdate(void* pickup, void* edx, CPlayerPed* player, CVehicle* veh, int playerId) {
     auto p = (uintptr_t)pickup;
     uint8_t type = Type(p);
+    int handle = (int)((p - kPickups) / 0x20) | (int)(Ref<uint16_t>(p + 0x1A) << 16);
+    if (Net().Online() && !g_applying && player == FindPlayerPed(0) && g_story.count(handle)) {
+        const auto& pos = player->GetPosition();
+        float x = Pos(p)[0] / 8.0f, y = Pos(p)[1] / 8.0f, z = Pos(p)[2] / 8.0f;
+        if (std::hypot(pos.x-x, pos.y-y) < 6.0f && std::fabs(pos.z-z) < 4.0f &&
+            (!Net().IsHost() || !StoryGroupReady(x,y,z,player->AreaCode()))) {
+            // Collection is gated, rendering is not. Returning before native
+            // Update also skipped creation of its object when spawning nearby.
+            auto*&object=Ref<CObject*>(p+4);
+            if(!object&&!(Ref<uint8_t>(p+0x1D)&1)&&IsModelLoaded(Model(p))&&HasRoom(ObjectPool(),kKeepObjects,"object")){
+                CallMethod<0x4567E0>((void*)p,&object,-1);
+                if(object)WorldAdd(object);
+            }
+            return false;
+        }
+    }
     float takings = Ref<float>(p);
     uint8_t before[0x20];
     memcpy(before, pickup, sizeof(before));  // Remove() clears the type and the object
@@ -155,12 +230,19 @@ void SendCreate(uintptr_t p) {
     w.U32(Ref<uint32_t>(p + 0x08));  // ammo, money
     w.U16(Ref<uint16_t>(p + 0x16));  // money per day
     w.U8(Ref<uint8_t>(p + 0x1D) & 2);  // empty
+    int handle = (int)((p - kPickups) / 0x20) | (int)(Ref<uint16_t>(p + 0x1A) << 16);
+    w.Bool(g_story.count(handle) != 0);
     Net().Send(proto::CH_RELIABLE, w);
 }
 int __cdecl HookGenerateNewOne(float x, float y, float z, uint32_t model, int type, uint32_t ammo, uint32_t moneyPerDay,
                                int isEmpty, char* message) {
     int handle = g_origGenerate(x, y, z, model, type, ammo, moneyPerDay, isEmpty, message);
-    if (handle >= 0 && Announced(type & 0xFF, (int)model)) {
+    if (handle >= 0 && !g_applying && Net().Online() && Net().IsHost() && HostReplicating() &&
+        Shared((uint8_t)type, (int)model) && !OrdinarySupply((int)model) &&
+        ((type & 0xFF) == PU_ONCE_FOR_MISSION || (type & 0xFF) == PU_ONCE || (type&0xFF)==PU_FLOATINGPACKAGE || (type&0xFF)==PU_FLOATINGPACKAGE_FLOATING)) {
+        if (void* script = CurrentScript(); script && !game::script::Running()) g_story.insert(handle);
+    }
+    if (handle >= 0 && !g_story.count(handle) && Announced(type & 0xFF, (int)model)) {
         SendCreate(Pickup(handle & 0xFFFF));
         g_announced.push_back(handle);
     }
@@ -216,6 +298,11 @@ void HandleEvent(uint8_t from, Reader& r) {
     int16_t pos[3];
     for (auto& c : pos) c = r.I16();
     uint8_t type = r.U8();
+    if(r.Ok()&&from==Net().HostId()&&what==EV_TAKEN)
+        for(auto it=g_wantedStory.begin();it!=g_wantedStory.end();) {
+            const auto&p=it->second;
+            it=p.model==model&&p.type==type&&std::equal(pos,pos+3,p.pos)?g_wantedStory.erase(it):std::next(it);
+        }
     if (!r.Ok() || !core::IsPlayerReady() || !flow::InSharedWorld()) return;
     int i = Find(model, pos, type);
     if (i < 0) return;
@@ -241,13 +328,16 @@ void HandleCreate(uint8_t from, Reader& r) {
     uint32_t ammo = r.U32();
     uint16_t perDay = r.U16();
     bool empty = r.U8() != 0;
-    // a model of a mod this game lacks crashes the streamer, then CPickup::GiveUsAPickUpObject (0x456809)
-    if (!r.Ok() || !core::IsPlayerReady() || !flow::InSharedWorld() || !Shared(type, model) || !IsObjectModel(model) ||
-        Find(model, pos, type) >= 0)
+    bool story = r.Bool();
+    if (!r.Ok() || !core::IsPlayerReady() || !Shared(type, model)) return;
+    if (int existing = Find(model, pos, type); existing >= 0) {
+        if (story && from == Net().HostId()) g_story.insert(existing | (int)(Ref<uint16_t>(Pickup(existing) + 0x1A) << 16));
         return;
+    }
     if (!IsModelLoaded(model)) RequestModel(model);
     g_applying = true;
-    g_origGenerate(pos[0] / 8.0f, pos[1] / 8.0f, pos[2] / 8.0f, (uint32_t)model, type, ammo, perDay, empty, nullptr);
+    int handle = g_origGenerate(pos[0] / 8.0f, pos[1] / 8.0f, pos[2] / 8.0f, (uint32_t)model, type, ammo, perDay, empty, nullptr);
+    if (handle >= 0 && story && from == Net().HostId()) g_story.insert(handle);
     g_applying = false;
     LOGD("Pickup (model %d, type %d) from player %d", model, type, from);
 }
@@ -255,6 +345,21 @@ void HandleCreate(uint8_t from, Reader& r) {
 class Pickups : public Module {
 public:
     const char* Name() const override { return "Pickups"; }
+    void CollectSyncAudit(std::vector<SyncAuditEntry>& out) override {
+        SyncAuditEntry e;e.kind=AUDIT_PICKUPS;e.id=1;e.area=13;e.owner=Net().HostId();e.alive=true;e.look=2166136261u;
+        if(Net().IsHost()){
+            for(int h:g_story)if(PickupAlive(h)){e.look=AuditHash(e.look,(uint32_t)h);++e.relation;}
+        }else for(auto&[id,p]:g_wantedStory){
+            auto it=g_storyCopies.find(id);
+            if(it!=g_storyCopies.end()&&PickupAlive(it->second)){e.look=AuditHash(e.look,id);++e.relation;}
+            else e.alive=false;
+        }
+        out.push_back(e);
+    }
+    bool RepairSyncEntity(uint8_t kind,uint16_t id) override {
+        if(kind!=AUDIT_PICKUPS||id!=1||!Net().IsHost())return false;
+        SendStoryPickups(true);return true;
+    }
 
     void OnInstallHooks() override {
         mem::HookFn(0x457410, &HookPickupUpdate, &g_origPickupUpdate, "CPickup::Update");
@@ -263,10 +368,14 @@ public:
         mem::RedirectCallFn(0x565C5E, &HookSprayTag, &g_origSetAlpha);  // CWorld::SprayPaintWorld -> CTagManager::SetAlpha
         Net().SetHandler(proto::G_PICKUP_EVENT, &HandleEvent);
         Net().SetHandler(proto::G_PICKUP_CREATE, &HandleCreate);
+        Net().SetHandler(proto::G_STORY_PICKUPS,&HandleStoryPickups);
     }
-    void OnSessionEnd() override { g_announced.clear(); }
-    void OnGameStarted() override { g_announced.clear(); }
+    void OnSessionEnd() override { g_announced.clear(); g_story.clear();g_wantedStory.clear();g_storyCopies.clear();g_storySentMs=0; }
+    void OnGameStarted() override { g_announced.clear(); g_story.clear();g_storyCopies.clear();g_storySentMs=0; }
+    void OnGameShutdown()override{g_wantedStory.clear();g_storyCopies.clear();g_story.clear();}
+    void OnPostProcess()override{if(!Net().Online()||!core::IsPlayerReady())return;if(Net().IsHost())SendStoryPickups();else ApplyStoryPickups();}
     void OnPeerResync(uint8_t) override {
+        if(Net().IsHost())SendStoryPickups(true);
         // a restarted game lost what was announced to it: what is still here goes again
         std::vector<int> alive;
         for (int h : g_announced) {

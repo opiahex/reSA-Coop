@@ -1,57 +1,75 @@
-# Builds SA:COOP on every push and pull request and keeps the archive as an artifact.
-# A tag like v0.2.0 also publishes the archive as a GitHub release, with the text of .github/release-notes.md.
-name: build
+name: Build and release reSA-Coop
 
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-
-      - name: Cache the compiler
-        uses: actions/cache@v4
+          python-version: '3.12'
+      - uses: actions/cache@v4
         with:
           path: toolchain/llvm-mingw
           key: llvm-mingw-20261006-ucrt-x86_64
-
-      - name: Get the compiler
+      - name: Get compiler
         shell: pwsh
         run: ./tools/get-toolchain.ps1
-
-      - name: Check the layers (Feature-Sliced Design)
-        run: python tools/fsd_check.py
-
-      - name: Check that every text of the game has its English one
-        run: python tools/i18n_check.py
+      - name: Check source layers and translations
+        run: |
+          python tools/fsd_check.py
+          python tools/i18n_check.py
         env:
-          PYTHONIOENCODING: utf-8  # it prints the Russian texts it finds
-
-      - name: Build the archive
+          PYTHONIOENCODING: utf-8
+      - name: Compile installable package
         run: python tools/build.py dist
-
+      - name: Name archive and calculate checksum
+        shell: pwsh
+        run: |
+          $version = '${{ github.ref_name }}'
+          if ('${{ github.ref_type }}' -ne 'tag') { $version = 'main-${{ github.run_number }}' }
+          $name = "reSA-Coop-$version-win32.zip"
+          Copy-Item -LiteralPath dist/SA-COOP.zip -Destination "dist/$name"
+          $hash = (Get-FileHash -LiteralPath "dist/$name" -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("$pwd/dist/SHA256SUMS.txt", "$hash  $name`n", [Text.UTF8Encoding]::new($false))
       - uses: actions/upload-artifact@v4
         with:
-          name: SA-COOP
-          path: dist/SA-COOP.zip
+          name: reSA-Coop-win32
+          if-no-files-found: error
+          path: |
+            dist/reSA-Coop-*-win32.zip
+            dist/SHA256SUMS.txt
 
-      - name: Publish the release
-        if: startsWith(github.ref, 'refs/tags/v')
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: reSA-Coop-win32
+          path: release
+      - name: Publish compiled release
         uses: softprops/action-gh-release@v2
         with:
-          name: SA:COOP ${{ github.ref_name }}
-          files: dist/SA-COOP.zip
+          name: reSA-Coop ${{ github.ref_name }}
+          prerelease: true
+          fail_on_unmatched_files: true
           body_path: .github/release-notes.md
+          files: |
+            release/reSA-Coop-*-win32.zip
+            release/SHA256SUMS.txt

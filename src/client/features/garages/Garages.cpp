@@ -6,16 +6,15 @@
 // When a garage opens for the partner, the host's game hands over what it keeps there and the partner's brings the
 // cars out (where the partner is, the ground is loaded). The host's snapshots of its world for the partners are saves too: they no longer slam an open garage
 // shut on the cars in it.
-// The doors of the shops (Pay 'n' Spray, bomb shops, mod shops) move in both games as in the game of the player who
-// uses the garage (see HookGarageUpdate).
-#include <algorithm>
-#include <cmath>
+#include <array>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
 #include "common/api/protocol/Protocol.h"
 #include "common/lib/log/Log.h"
+#include "common/lib/util/Util.h"
 #include "entities/player/Players.h"
 #include "entities/session/Flow.h"
 #include "entities/vehicle/Vehicles.h"
@@ -24,6 +23,7 @@
 #include "shared/game/Script.h"
 #include "shared/lib/core/Core.h"
 #include "shared/lib/memory/Memory.h"
+#include "shared/lib/sync/GarageDoor.h"
 
 namespace coop {
 
@@ -52,6 +52,9 @@ bool Inside(void* g, const CVector& p) { return CallMethod<0x448740, bool>(g, p)
 // the partner's game in the host's world: its garages keep nothing of their own
 bool Partner() { return Net().Online() && !Net().IsHost() && flow::InHostWorld(); }
 
+struct StoredReceipt {uint8_t owner=255,index=0;int handle=-1;};
+std::map<uint16_t,StoredReceipt>g_storedReceipts;
+
 bool Occupied(CVehicle* v) {
     if (v->Driver()) return true;
     for (int i = 0; i < 8; ++i)
@@ -75,8 +78,9 @@ void AskToKeep(void* garage) {
     Writer w(proto::G_GARAGE);
     w.U8(GARAGE_STORE);
     w.U8(IndexOf(garage));
+    w.U32(Net().WorldEpoch());
     w.U8((uint8_t)ids.size());
-    for (uint16_t id : ids) w.U16(id);
+    for (uint16_t id : ids) w.Entity(ENTITY_VEHICLE,id);
     Net().Send(proto::CH_RELIABLE, w);
     LOGI("Garage %s: %zu car(s) of ours go to the host's store", NameOf(garage).c_str(), ids.size());
 }
@@ -100,7 +104,7 @@ bool __fastcall HookRestore(void* garage, void* edx, void* stored) {  // CGarage
     if (core::IsPlayerReady()) {
         Writer w(proto::G_GARAGE);
         w.U8(GARAGE_BRING_OUT);
-        w.U8(IndexOf(garage));
+        w.U8(IndexOf(garage));w.U32(Net().WorldEpoch());
         Net().Send(proto::CH_RELIABLE, w);
     }
     return true;  // nothing to wait for here: the door opens (CGarage::Update asks until all cars are out)
@@ -130,35 +134,41 @@ void Handle(uint8_t from, Reader& r) {
     void* g = GarageAt(index);
     if (!r.Ok() || from == Net().MyId() || !g || !IsHideout(TypeOf(g)) || !core::IsPlayerReady()) return;
     if (op == GARAGE_STORE && Net().IsHost()) {
-        uint8_t n = r.U8();
+        uint32_t requesterEpoch=r.U32();uint8_t n=r.U8();if(n>4||!requesterEpoch)return;
+        std::vector<uint16_t>ids;for(int i=0;i<n;++i)ids.push_back(r.U16());
+        if(!r.Ok())return; // validate the complete request before mutating garage storage
         uint8_t* store = StoreOf(g);
         std::vector<uint16_t> kept;
-        for (int i = 0; i < n && i < 4; ++i) {
-            uint16_t id = r.U16();
+        for (auto id:ids) {
             NetVehicle* nv = Vehicles::Instance().Find(id);
             if (!r.Ok() || !nv || nv->owner != from || !nv->veh || !IsVehicleValid(nv->veh) || Occupied(nv->veh) ||
                 !Inside(g, nv->veh->GetPosition()))
                 continue;
+            if(auto receipt=g_storedReceipts.find(id);receipt!=g_storedReceipts.end()&&
+               receipt->second.owner==from&&receipt->second.index==index&&receipt->second.handle==nv->handle){kept.push_back(id);continue;}
             uint8_t* slot = nullptr;
             for (int k = 0; k < 4 && !slot; ++k)
                 if (!Ref<uint16_t>((uintptr_t)store + (uintptr_t)k * 0x40 + 0x12)) slot = store + k * 0x40;  // CStoredCar::m_wModelIndex
             if (!slot) break;  // all four places taken: the car stays where it is
             CallMethod<0x449760>(slot, nv->veh);  // CStoredCar::StoreCar
-            kept.push_back(id);
+            if(g_storedReceipts.size()>=512)g_storedReceipts.erase(g_storedReceipts.begin());
+            g_storedReceipts[id]={from,index,nv->handle};kept.push_back(id);
         }
         if (kept.empty()) return;
         Writer w(proto::G_GARAGE);
         w.U8(GARAGE_KEPT);
-        w.U8(index);
+        w.U8(index);w.U8(from);w.U32(requesterEpoch);
         w.U8((uint8_t)kept.size());
-        for (uint16_t id : kept) w.U16(id);
+        for (uint16_t id : kept) w.Entity(ENTITY_VEHICLE,id);
         Net().Send(proto::CH_RELIABLE, w);
         LOGI("Garage %s keeps %zu car(s) of player %d", NameOf(g).c_str(), kept.size(), from);
     } else if (op == GARAGE_KEPT && from == Net().HostId() && !Net().IsHost()) {
-        uint8_t n = r.U8();
+        auto to=r.U8();auto epoch=r.U32();if(to!=Net().MyId()||epoch!=Net().WorldEpoch())return;
+        uint8_t n = r.U8();if(n>4)return;
+        std::vector<uint16_t>ids;for(int i=0;i<n;++i)ids.push_back(r.U16());if(!r.Ok())return;
         int gone = 0;
-        for (int i = 0; i < n && i < 4; ++i) {
-            NetVehicle* nv = Vehicles::Instance().Find(r.U16());
+        for (auto id:ids) {
+            NetVehicle* nv = Vehicles::Instance().Find(id);
             if (!r.Ok() || !nv || Vehicles::Instance().IsMirror(*nv) || !nv->veh || !IsVehicleValid(nv->veh) || Occupied(nv->veh)) continue;
             StopEntering(nv->veh);
             Cmd(0x00A6).I(GetVehicleRef(nv->veh)).Run();  // DELETE_CAR: the vehicle sync tells the host's game it is gone
@@ -166,10 +176,12 @@ void Handle(uint8_t from, Reader& r) {
         }
         LOGI("Garage %s: the host keeps %d car(s) of ours now", NameOf(g).c_str(), gone);
     } else if (op == GARAGE_BRING_OUT && Net().IsHost()) {  // the cars it keeps go to the partner's game: out of our store
+        auto epoch=r.U32();if(!r.Ok()||!epoch)return;
         uint8_t* store = StoreOf(g);
         Writer w(proto::G_GARAGE);
         w.U8(GARAGE_CARS);
         w.U8(index);
+        w.U8(from);w.U32(epoch);  // only this world of the requesting guest restores the cars
         std::vector<uint8_t*> cars;
         for (int k = 0; k < 4; ++k)
             if (Ref<uint16_t>((uintptr_t)store + (uintptr_t)k * kStoredCarSize + 0x12)) cars.push_back(store + k * kStoredCarSize);
@@ -182,12 +194,20 @@ void Handle(uint8_t from, Reader& r) {
         Net().Send(proto::CH_RELIABLE, w);
         LOGI("Garage %s opened for player %d: its %zu car(s) go out there", NameOf(g).c_str(), from, cars.size());
     } else if (op == GARAGE_CARS && from == Net().HostId() && !Net().IsHost()) {
-        uint8_t n = r.U8(), cars[4 * kStoredCarSize] = {};
+        uint8_t to = r.U8();auto epoch=r.U32();
+        if (!r.Ok() || to != Net().MyId()) return;
+        uint8_t n = r.U8(), cars[4 * kStoredCarSize] = {};if(n>4)return;
         for (int k = 0; k < n && k < 4; ++k) {
             std::vector<uint8_t> c = r.Bytes(kStoredCarSize);
             if (c.size() == kStoredCarSize) memcpy(cars + k * kStoredCarSize, c.data(), kStoredCarSize);
         }
         if (!r.Ok()) return;
+        if(epoch!=Net().WorldEpoch()){
+            // The requester loaded a new world while the garage was opening.
+            // Return the drained store rather than spawning obsolete cars or losing them.
+            Writer back(proto::G_GARAGE);back.U8(GARAGE_BACK);back.U8(index);back.U8(n);
+            back.Bytes(cars,(size_t)n*kStoredCarSize);Net().Send(proto::CH_RELIABLE,back);return;
+        }
         uint8_t kept[4 * kStoredCarSize] = {};  // cars this game cannot make: they stay the host's as they are
         for (int k = 0; k < 4; ++k) {
             uint8_t* c = cars + k * kStoredCarSize;
@@ -226,86 +246,75 @@ void Handle(uint8_t from, Reader& r) {
     }
 }
 
-// ---------------------------------------------------------------- doors of the shops
-// CGarage::Update moves a shop's door for this game's player only: the other game's Pay 'n' Spray stood open while the
-// player inside had it shut, and a mod shop stayed shut in front of the other player's car. The game whose player uses
-// a garage drives its door in both games; the other one slides its door as a script's garage (type 19) does, with the
-// door's sound and collision but no respray, bomb, money, wanted level or frozen controls there.
-constexpr int kMaxGarages = 50;
-enum : uint8_t { DOOR_SHUT = 0, DOOR_OPEN = 1, DOOR_NONE = 2 };  // NONE: the sender's door follows ours
-enum : uint8_t { STATE_CLOSED = 0, STATE_OPEN = 1, STATE_CLOSING = 2, STATE_OPENING = 3, STATE_OPEN_WAITING = 4 };
+// Shop doors follow one common authority, while respray/money/wanted/control
+// effects remain in the driver's own game. Each peer keeps both other peers'
+// announcements; a third sender cannot overwrite the selected driver's door.
+enum : uint8_t { DOOR_SHUT=0, DOOR_OPEN=1, DOOR_NONE=2 };
+enum : uint8_t { STATE_CLOSED=0, STATE_OPEN=1, STATE_CLOSING=2, STATE_OPENING=3, STATE_OPEN_WAITING=4 };
 struct Door {
-    uint8_t remote = DOOR_NONE, from = 0;  // the other game's door
-    uint8_t sent = 0xFF;                   // ours, as last sent
-    bool mirroring = false;                // ours follows the other game's
+    std::map<uint8_t,uint8_t> remote;
+    uint8_t sent=0xFF;
+    bool mirroring=false;
 };
-Door g_doors[kMaxGarages];
+Door g_doors[50];
+bool DoorShared(uint8_t type) { return (type>=2&&type<=5)||(type>=36&&type<=38); }
 
-bool DoorShared(uint8_t t) { return (t >= 2 && t <= 5) || (t >= 36 && t <= 38); }  // bomb shops, Pay 'n' Spray, mod shops
-
-// whose game drives the door: the player's whose car is in the garage, else of the players within 30 m (a mod shop
-// keeps its door open that near) one in a car before one on foot, the nearer of two alike (the host's when they are
-// about as near); nobody near: each game its own. Both games come to the same answer.
-bool Theirs(void* g, uint8_t from) {
-    const RemotePlayer* rp = Players::Instance().Get(from);
-    CPlayerPed* me = FindPlayerPed(0);
-    if (!rp || !rp->hasState || !me) return false;
-    CVehicle* car = FindPlayerVehicle();
-    bool theyRide = rp->mode != RemotePlayer::Mode::OnFoot, theyOut = rp->state.area != 0;  // the garages are outdoors
-    if (car && Inside(g, car->GetPosition())) return false;
-    if (theyRide && !theyOut && Inside(g, rp->state.pos)) return true;
-    CVector c{(Field<float>(g, 0x28) + Field<float>(g, 0x2C)) / 2, (Field<float>(g, 0x30) + Field<float>(g, 0x34)) / 2,
-              Field<float>(g, 0x08)};  // the middle of its box (m_fLeftCoord..m_fBackCoord), on the floor
-    float mine = me->AreaCode() ? 1e9f : (me->GetPosition() - c).Length();
-    float theirs = theyOut ? 1e9f : (rp->state.pos - c).Length();
-    if (mine > 30.0f || theirs > 30.0f) return theirs <= 30.0f;
-    if ((car != nullptr) != theyRide) return theyRide;
-    return theirs + 5.0f < mine || (std::fabs(mine - theirs) <= 5.0f && from == Net().HostId());
+uint8_t DoorOwner(void* garage) {
+    auto* me=FindPlayerPed(0);
+    if(!me)return 255;
+    CVector centre{(Field<float>(garage,0x28)+Field<float>(garage,0x2C))/2,
+        (Field<float>(garage,0x30)+Field<float>(garage,0x34))/2,Field<float>(garage,8)};
+    std::array<sync::GarageDoorCandidate,proto::kMaxPlayers> candidates{};
+    size_t count=0;
+    auto* car=FindPlayerVehicle();
+    bool driver=car&&car->Driver()==me;
+    if(me->AreaCode()==0)candidates[count++]={Net().MyId(),driver&&Inside(garage,car->GetPosition()),driver,(me->GetPosition()-centre).Length()};
+    for(auto&[id,rp]:Players::Instance().All()) {
+        if(count>=candidates.size()||!rp.hasState||NowMs()-rp.stateRecvMs>=1500||rp.state.area!=0)continue;
+        bool drives=rp.mode==RemotePlayer::Mode::Driver;
+        candidates[count++]={id,drives&&Inside(garage,rp.state.pos),drives,(rp.state.pos-centre).Length()};
+    }
+    return sync::GarageDoorOwner(candidates.data(),count,Net().HostId());
 }
 
-using GarageUpdateFn = void(__fastcall*)(void*, void*, int);
-GarageUpdateFn g_origGarageUpdate = nullptr;
-void __fastcall HookGarageUpdate(void* g, void* edx, int id) {  // CGarages::Update -> CGarage::Update, every garage
-    if (id < 0 || id >= kMaxGarages || !DoorShared(TypeOf(g))) return g_origGarageUpdate(g, edx, id);
-    Door& d = g_doors[id];
-    uint8_t& state = Field<uint8_t>(g, 0x4D);  // CGarage::m_nDoorState
-    bool on = Net().Online() && core::IsPlayerReady();
-    bool theirs = on && d.remote != DOOR_NONE && Theirs(g, d.from);
-    if (theirs) {
-        if (d.remote == DOOR_OPEN ? state != STATE_OPEN : state != STATE_CLOSED)
-            state = d.remote == DOOR_OPEN ? STATE_OPENING : STATE_CLOSING;
-        uint8_t& type = Field<uint8_t>(g, 0x4C);
-        uint8_t own = type;
-        type = 19;  // GARAGE_SCRIPT_CONTROLLED: its Update only slides the door
-        g_origGarageUpdate(g, edx, id);
-        type = own;
+using GarageUpdateFn=void(__fastcall*)(void*,void*,int);
+GarageUpdateFn g_origGarageUpdate=nullptr;
+void __fastcall HookGarageUpdate(void* garage,void* edx,int id) {
+    if(id<0||id>=50||!DoorShared(TypeOf(garage)))return g_origGarageUpdate(garage,edx,id);
+    auto& d=g_doors[id];
+    auto& state=Field<uint8_t>(garage,0x4D);
+    bool online=Net().Online()&&core::IsPlayerReady();
+    uint8_t owner=online?DoorOwner(garage):255;
+    auto remote=d.remote.find(owner);
+    // The selected driver's first door announcement may trail its player state.
+    // During that gap this game must not run a shop transaction against the
+    // previous driver's closed door. Hold script-door control until it arrives.
+    bool theirs=online&&owner!=255&&owner!=Net().MyId();
+    if(theirs) {
+        if(remote!=d.remote.end()&&remote->second!=DOOR_NONE) {
+            bool open=remote->second==DOOR_OPEN;
+            if(open?state!=STATE_OPEN:state!=STATE_CLOSED)state=open?STATE_OPENING:STATE_CLOSING;
+        }
+        auto& type=Field<uint8_t>(garage,0x4C);uint8_t saved=type;
+        type=19; // GARAGE_SCRIPT_CONTROLLED moves/sounds the door, without a shop transaction.
+        g_origGarageUpdate(garage,edx,id);type=saved;
     } else {
-        // ours again: left shut, a Pay 'n' Spray or a bomb shop would respray or arm our car wherever it is, take our
-        // money and clear our wanted level
-        if (d.mirroring && TypeOf(g) <= 5 && state != STATE_OPEN && state != STATE_OPENING && state != STATE_OPEN_WAITING)
-            state = STATE_OPENING;
-        g_origGarageUpdate(g, edx, id);
+        if(d.mirroring&&TypeOf(garage)<=5&&state!=STATE_OPEN&&state!=STATE_OPENING&&state!=STATE_OPEN_WAITING)
+            state=STATE_OPENING;
+        g_origGarageUpdate(garage,edx,id);
     }
-    if (theirs != d.mirroring) LOGI("Garage %s: its door %s", NameOf(g).c_str(), theirs ? "follows the other game" : "is ours again");
-    d.mirroring = theirs;
-    uint8_t v = theirs ? DOOR_NONE : (state == STATE_OPEN || state == STATE_OPENING || state == STATE_OPEN_WAITING) ? DOOR_OPEN : DOOR_SHUT;
-    if (on && v != d.sent) {
-        Writer w(proto::G_GARAGE_DOOR);
-        w.U8((uint8_t)id);
-        w.U8(v);
-        Net().Send(proto::CH_RELIABLE, w);
-        if (d.sent != 0xFF) LOGD("Garage %s: our door %s", NameOf(g).c_str(), v == DOOR_OPEN ? "open" : v == DOOR_SHUT ? "shut" : "follows");
-        d.sent = v;
+    if(d.mirroring!=theirs)LOGI("Garage %s door authority %u",NameOf(garage).c_str(),owner);
+    d.mirroring=theirs;
+    uint8_t value=theirs?DOOR_NONE:(state==STATE_OPEN||state==STATE_OPENING||state==STATE_OPEN_WAITING)?DOOR_OPEN:DOOR_SHUT;
+    if(online&&value!=d.sent) {
+        Writer w(proto::G_GARAGE_DOOR);w.U8((uint8_t)id);w.U8(value);
+        Net().Send(proto::CH_RELIABLE,w);d.sent=value;
     }
 }
-
-void HandleDoor(uint8_t from, Reader& r) {
-    uint8_t id = r.U8(), v = r.U8();
-    if (!r.Ok() || from == Net().MyId() || id >= kMaxGarages || v > DOOR_NONE) return;
-    if (g_doors[id].remote != v && g_doors[id].mirroring)
-        LOGD("Garage %d: the other game's door %s", id, v == DOOR_OPEN ? "open" : v == DOOR_SHUT ? "shut" : "follows ours");
-    g_doors[id].remote = v;
-    g_doors[id].from = from;
+void HandleDoor(uint8_t from,Reader& r) {
+    uint8_t id=r.U8(),value=r.U8();
+    if(!r.Ok()||from==Net().MyId()||!Net().Peers().count(from)||id>=50||value>DOOR_NONE)return;
+    g_doors[id].remote[from]=value;
 }
 
 class Garages : public Module {
@@ -316,20 +325,14 @@ public:
         mem::RedirectCallFn(0x44A1EA, &HookStoreBeforeSave, &g_origStoreBeforeSave);  // CGarages::CloseHideOutGaragesBeforeSave
         mem::RedirectCallFn(0x44C1E1, &HookRestore, &g_origRestore);                  // CGarage::Update
         mem::RedirectCallFn(0x5D3165, &HookCloseBeforeSave, &g_origCloseBeforeSave);  // CGarages::Save
-        mem::RedirectCallFn(0x44C910, &HookGarageUpdate, &g_origGarageUpdate);        // CGarages::Update
         Net().SetHandler(proto::G_GARAGE, &Handle);
-        Net().SetHandler(proto::G_GARAGE_DOOR, &HandleDoor);
+        mem::RedirectCallFn(0x44C910,&HookGarageUpdate,&g_origGarageUpdate);
+        Net().SetHandler(proto::G_GARAGE_DOOR,&HandleDoor);
     }
-    void OnPeerResync(uint8_t) override {  // its world is new: the next update sends every door again
-        for (Door& d : g_doors) d.sent = 0xFF;
-    }
-    void OnPeerLeave(uint8_t id) override {
-        for (Door& d : g_doors)
-            if (d.from == id) d.remote = DOOR_NONE;
-    }
-    void OnSessionEnd() override {  // a door that followed the other game is handed back by the next update
-        for (Door& d : g_doors) d.remote = DOOR_NONE, d.sent = 0xFF;
-    }
+    void OnPeerResync(uint8_t) override { for(auto& d:g_doors)d.sent=0xFF; }
+    void OnPeerLeave(uint8_t id) override { for(auto& d:g_doors)d.remote.erase(id); }
+    void OnSessionEnd() override { g_storedReceipts.clear();for(auto& d:g_doors){d.remote.clear();d.sent=0xFF;} }
+    void OnGameStarted() override { g_storedReceipts.clear();for(auto& d:g_doors)d=Door{}; }
 };
 
 Garages g_garages;

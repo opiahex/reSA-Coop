@@ -6,6 +6,7 @@
 #include "common/api/net/Net.h"
 #include "common/api/protocol/Protocol.h"
 #include "common/lib/log/Log.h"
+#include "common/lib/util/Util.h"
 #include "shared/config/Config.h"
 
 namespace coop {
@@ -122,10 +123,12 @@ void NetClient::Stop() {
     m_state = State::Idle;
     std::lock_guard<std::mutex> a(m_outMutex);
     m_out.clear();
+    m_outBytes=0;
     // what came after the last poll (a refusal's reason, a world chunk) belonged to that connection: it was handled
     // in the next one ("the world arrived damaged")
     std::lock_guard<std::mutex> b(m_inMutex);
     m_in.clear();
+    m_inBytes=0;
 }
 
 void NetClient::Send(uint8_t channel, const Writer& w) { Send(channel, w.Data(), w.Size()); }
@@ -133,11 +136,16 @@ void NetClient::Send(uint8_t channel, const Writer& w) { Send(channel, w.Data(),
 void NetClient::Send(uint8_t channel, const uint8_t* data, size_t size) {
     if (m_state != State::Connected || size == 0) return;
     std::lock_guard<std::mutex> lock(m_outMutex);
+    if(size>32*1024*1024||m_outBytes+size>32*1024*1024||m_out.size()>=32768){
+        LOGW("Network outgoing queue limit reached; terminating the stalled connection");m_quit=true;m_state=State::Disconnected;m_disconnectEvent=true;return;
+    }
     m_out.push_back(Packet{channel, std::vector<uint8_t>(data, data + size)});
+    m_outBytes+=size;
 }
 
 void NetClient::Poll(std::vector<Packet>& out) {
     std::lock_guard<std::mutex> lock(m_inMutex);
+    m_inBytes=0;
     if (m_in.empty()) return;
     if (out.empty()) {
         out.swap(m_in);
@@ -148,6 +156,17 @@ void NetClient::Poll(std::vector<Packet>& out) {
 }
 
 void NetClient::ThreadMain(std::string host, uint16_t port) {
+    auto makePacket=[&](const Packet&p)->ENetPacket*{
+        auto*pkt=net::MakePacket(p.data.data(),p.data.size(),p.channel);
+        if(pkt&&(pkt->flags&ENET_PACKET_FLAG_RELIABLE)){
+            if(m_reliableBytes+pkt->dataLength>32*1024*1024){
+                enet_packet_destroy(pkt);LOGW("ENet reliable queue limit reached");m_quit=true;m_state=State::Disconnected;m_disconnectEvent=true;return nullptr;
+            }
+            m_reliableBytes+=pkt->dataLength;pkt->userData=&m_reliableBytes;
+            pkt->freeCallback=[](ENetPacket*p){((std::atomic<uint64_t>*)p->userData)->fetch_sub(p->dataLength);};
+        }
+        return pkt;
+    };
     ENetHost* client = enet_host_create(nullptr, 1, proto::CH_COUNT, 0, 0);
     if (!client) {
         LOGE("enet_host_create failed");
@@ -194,11 +213,11 @@ void NetClient::ThreadMain(std::string host, uint16_t port) {
         // flush outgoing
         {
             std::lock_guard<std::mutex> lock(m_outMutex);
-            outLocal.swap(m_out);
+            outLocal.swap(m_out);m_outBytes=0;
         }
         if (connected) {
             for (auto& p : outLocal) {
-                ENetPacket* pkt = net::MakePacket(p.data.data(), p.data.size(), p.channel);
+                ENetPacket* pkt = makePacket(p);if(!pkt)continue;
                 if (enet_peer_send(peer, p.channel, pkt) != 0) enet_packet_destroy(pkt);
                 m_bytesOut += p.data.size();
             }
@@ -241,12 +260,16 @@ void NetClient::ThreadMain(std::string host, uint16_t port) {
                     break;
                 case ENET_EVENT_TYPE_RECEIVE: {
                     m_bytesIn += ev.packet->dataLength;
-                    Packet p{ev.channelID, std::vector<uint8_t>(ev.packet->data, ev.packet->data + ev.packet->dataLength)};
+                    Packet p{ev.channelID, std::vector<uint8_t>(ev.packet->data, ev.packet->data + ev.packet->dataLength),NowMs()};
                     enet_packet_destroy(ev.packet);
                     std::lock_guard<std::mutex> lock(m_inMutex);
                     // a game that stands (a long load, a hang, alt-tab without run_in_background) piled up every state
                     // and applied them all at once, stale: past a few thousand only the reliable ones are kept
-                    if (m_in.size() > 4000 && (p.channel == proto::CH_STATE || p.channel == proto::CH_VOICE)) break;
+                    if (m_in.size() > 4000 && (p.channel == proto::CH_STATE || p.channel == proto::CH_STATE_PLAYER1 || p.channel == proto::CH_STATE_PLAYER2 || p.channel == proto::CH_VOICE)) break;
+                    if(m_inBytes+p.data.size()>32*1024*1024||m_in.size()>=32768){
+                        LOGW("Network incoming queue limit reached; terminating the stalled connection");m_quit=true;m_state=State::Disconnected;m_disconnectEvent=true;break;
+                    }
+                    m_inBytes+=p.data.size();
                     m_in.push_back(std::move(p));
                     break;
                 }
@@ -269,10 +292,10 @@ void NetClient::ThreadMain(std::string host, uint16_t port) {
         // queues, enet_peer_disconnect_later sends them and then disconnects
         {
             std::lock_guard<std::mutex> lock(m_outMutex);
-            outLocal.swap(m_out);
+            outLocal.swap(m_out);m_outBytes=0;
         }
         for (auto& p : outLocal) {
-            ENetPacket* pkt = net::MakePacket(p.data.data(), p.data.size(), p.channel);
+            ENetPacket* pkt = makePacket(p);if(!pkt)continue;
             if (enet_peer_send(peer, p.channel, pkt) != 0) enet_packet_destroy(pkt);
         }
         outLocal.clear();

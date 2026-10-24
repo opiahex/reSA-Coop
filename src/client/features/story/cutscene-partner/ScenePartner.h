@@ -31,10 +31,14 @@ void Analyse();
 // host: the spot just chosen and the moment (the camera's clock, ms) its shot begins, once per shot
 bool TakeDecision(Spot& s, float& at);
 // partner: the host's choices; Follow (instead of Analyse) takes each on when this game's cutscene gets there
-void FollowSpot(const Spot& s, float at);
+void FollowSpot(const Spot& s, float at, uint8_t player);
 void Follow();
 // The spot for the current shot. False: no cutscene with CJ (yet) to place the partner in.
 bool CurrentSpot(Spot& out);
+// Separate, host-selected places for both partners. The second place uses the same scene/floor checks.
+Spot CompanionSpot(const Spot& primary, int index);
+void SetPlayerSpot(uint8_t player, const Spot& s);
+bool PlayerSpot(uint8_t player, Spot& out);
 int ShotNumber();                     // grows with every new shot
 float ShotLeftMs();                   // until the current shot's cut, by the camera's spline; -1 unknown
 const char* Describe(const Spot& s);  // "lean GANGS/leanIDLE", for logs

@@ -5,6 +5,7 @@
 // very line on its copy of the ped or of the player. The copies say nothing of their own: what makes the real one
 // talk happens in its owner's game.
 #include <algorithm>
+#include <cmath>
 
 #include "common/api/protocol/Protocol.h"
 #include "common/lib/log/Log.h"
@@ -70,7 +71,7 @@ void __fastcall HookLoadAndPlaySpeech(void* s, void* edx, uint32_t delay) {
     }
     Writer w(proto::G_PED_SPEECH);
     w.U8(by);
-    w.U16(id);
+    if(by==BY_PED)w.Entity(ENTITY_PED,id);else w.U16(id);
     w.I16(Field<int16_t>(s, 0xB0));  // m_LastGCtx
     w.I16(Field<int16_t>(s, 0xA6));  // m_BankID
     w.I16(Field<int16_t>(s, 0xA4));  // m_SoundID
@@ -101,7 +102,8 @@ bool Say(CPed* ped, int16_t ctx, int16_t bank, int16_t sound, uint32_t delay, fl
     if (Field<uint8_t>(s, 0x98)) CallMethod<0x4E3FB0>(s);  // m_IsPlayingSpeech: StopCurrentSpeech, its owner's moved on
     int16_t slot = FreeSlot();
     if (slot < 0) return false;
-    CallMethod<0x4E4A20>(s, ctx);  // SetNextPlayTime: our peds pause after it as after a line of their own
+    // Scripted speech uses context -1 and has no global context timer.
+    if(ctx>=0)CallMethod<0x4E4A20>(s, ctx);
     CVehicle* v = ped->VehicleIfIn();
     Field<uint8_t>(s, 0x9C) = forced;                                      // m_IsForcedAudible
     Field<uint8_t>(s, 0x9B) = v && v == FindPlayerVehicle(0);              // m_IsFrontend: in our car, as the game does
@@ -124,7 +126,7 @@ void Handle(uint8_t from, Reader& r) {
     uint32_t delay = r.U32();
     float volume = r.F32();
     bool forced = r.U8() != 0;
-    if (!r.Ok() || !core::IsPlayerReady() || bank < 0 || sound < 0) return;
+    if (!r.Ok() || !core::IsPlayerReady() || bank < 0 || sound < 0 || !std::isfinite(volume) || ctx < -1 || ctx >= 360 || delay > 10000) return;
     // CAEMP3BankLoader::LoadSound (0x4E07A0) lets a bank one past its lookup table through (it compares with >) and
     // reads that garbage: what the banks here do not have (other audio files) is not played
     auto* loader = Ref<uint8_t*>(0xB5F8B8 + 0xD98);  // AEAudioHardware.m_pMP3BankLoader
@@ -133,9 +135,11 @@ void Handle(uint8_t from, Reader& r) {
     if (by == BY_PLAYER) {
         RemotePlayer* rp = Players::Instance().Get(from);
         ped = rp ? rp->ped : nullptr;
-    } else {
+    } else if(by==BY_PED) {
         int h = Peds::Instance().HandleOf(id);
         ped = h >= 0 ? GetPed(h) : nullptr;
+        auto*np=ped?Peds::Instance().Find(ped):nullptr;
+        if(!np||np->owner!=from)return;
     }
     if (!ped || !IsCopy(ped)) return;
     bool said = Say(ped, ctx, bank, sound, std::min<uint32_t>(delay, 2000), volume, forced);

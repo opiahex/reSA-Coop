@@ -4,17 +4,10 @@
 // "playidles" animation after 20 s of inactivity, judged by the *local* pad touch timer. For the
 // remote player ped this would use the wrong timer and a different random choice, so the function is
 // skipped for it; instead the owner reports the idle animation it plays and the other side blends the
-// same animation on the remote ped. A phone call's (phone_in, phone_talk, phone_out of the ped group, from
-// CTaskComplexUseMobilePhone) go the same way; the phone in the hand goes with the player's state (Players).
+// same animation on the remote ped.
 //
-// What a player does at a place (a barber's chair, a tattoo, a meal, a drink machine, the gym, a dance, a parachute):
-// a script or an attractor plays these on the player, never its pad. The owner reports the one it plays (IFP block and
-// index, as for the mirrored peds) and the other game plays it on its copy of the player.
-//
-// The same channel (G_PLAYER_ANIM) carries both.
+// The same channel (G_PLAYER_ANIM) is used for other one-shot animations (see kReplicatedGroups).
 #include <algorithm>
-#include <cmath>
-#include <cstring>
 #include <map>
 
 #include "common/api/protocol/Protocol.h"
@@ -35,55 +28,19 @@ using namespace game;
 constexpr int ANIM_GROUP_PLAYIDLES = 49;
 constexpr uint16_t ANIMATION_IDLE_FLAG = 0x200;  // set by PlayIdleAnimations on its animations
 
-enum : uint8_t { OP_PLAY = 1, OP_STOP_IDLE = 2, OP_ACTIVITY = 3, OP_ACTIVITY_END = 4 };
+enum : uint8_t { OP_PLAY = 1, OP_STOP_IDLE = 2, OP_SCRIPT = 3 };
 
 // groups whose animations are replicated as events (they are not produced by the pad replay)
 constexpr int kReplicatedGroups[] = {ANIM_GROUP_PLAYIDLES};
-constexpr int ANIM_GROUP_DEFAULT = 0, ANIM_ID_PHONE_IN = 145, ANIM_ID_PHONE_TALK = 147;
 
-// IFP blocks of what a player does at a place
-constexpr const char* kActivityBlocks[] = {
-    "HAIRCUTS", "TATTOOS",  "FOOD",     "VENDING", "GYMNASIUM", "BENCHPRESS", "FREEWEIGHTS", "DANCING", "CASINO",
-    "BAR",      "CLOTHES",  "SHOP",     "BSKTBALL", "POOL",     "KISSING",    "STRIP",       "LAPDAN1", "LAPDAN2",
-    "LAPDAN3",  "BOMBER",   "CARRY",    "PARACHUTE", "INT_HOUSE", "INT_OFFICE", "INT_SHOP"};
-
-bool IsReplicated(int g, int id) {
-    if (g == ANIM_GROUP_DEFAULT) return id >= ANIM_ID_PHONE_IN && id <= ANIM_ID_PHONE_TALK;  // phone_in, phone_out, phone_talk
+bool IsReplicatedGroup(int g) {
     for (int r : kReplicatedGroups)
         if (r == g) return true;
     return false;
 }
 
-bool IsActivityBlock(int block) {
-    const char* name = (const char*)anim::Block(block);  // CAnimBlock::name
-    for (const char* b : kActivityBlocks)
-        if (!_stricmp(name, b)) return true;
-    return false;
-}
-
-struct Activity {
-    int16_t block = -1, idx = -1;
-    uint16_t flags = 0;
-    float time = 0.0f;
-};
-
-// the activity animation the player plays now: the strongest one of those blocks
-bool CurrentActivity(CPed* ped, Activity& out) {
-    void* best = nullptr;
-    for (void* a = anim::First(ped->RwObject()); a; a = anim::Next(a)) {
-        int block, idx;
-        if (anim::BlendDelta(a) < 0.0f || anim::BlendAmount(a) < 0.3f || !anim::Locate(anim::Hierarchy(a), block, idx) ||
-            !IsActivityBlock(block))
-            continue;
-        if (best && anim::BlendAmount(a) <= anim::BlendAmount(best)) continue;
-        best = a;
-        out.block = (int16_t)block;
-        out.idx = (int16_t)idx;
-    }
-    if (!best) return false;
-    out.flags = anim::Flags(best);
-    out.time = anim::CurrentTime(best);
-    return true;
+bool IsReplicated(int group,int id) {
+    return IsReplicatedGroup(group)||(group==0&&id>=145&&id<=147);
 }
 
 bool EnsureBlockLoaded(const char* block) {
@@ -91,11 +48,14 @@ bool EnsureBlockLoaded(const char* block) {
     if (idx < 0) return false;
     if (anim::BlockLoaded(idx)) return true;
     RequestModel(anim::kIfpBase + idx, 2);
-    LoadAllRequestedModels(false);
-    return anim::BlockLoaded(idx);
+    return false;
 }
 
-const char* BlockForGroup(int group) { return group == ANIM_GROUP_PLAYIDLES ? "playidles" : nullptr; }
+const char* BlockForGroup(int group) { return group == ANIM_GROUP_PLAYIDLES ? "playidles" : group==0 ? "ped" : nullptr; }
+
+bool HoldsMovement(const AnimationState&s){
+    return s.Present()&&(!(s.flags&anim::F_PARTIAL)||(s.group==87&&s.id>=348&&s.id<=350));
+}
 
 using PlayIdleFn = void(__fastcall*)(void*, void*, CPlayerPed*);
 PlayIdleFn g_origPlayIdle = nullptr;
@@ -117,75 +77,53 @@ public:
         // in a cutscene both games animate the partner themselves (ScenePartner), idle variations included
         if (!Net().Online() || !core::IsPlayerReady() || Ref<uint8_t>(0xB5F851)) return;  // CCutsceneMgr::ms_running
         CPlayerPed* me = FindPlayerPed(0);
-        SendIdle(me);
-        SendActivity(me);
-        ApplyActivities();
-    }
-
-    void Handle(uint8_t from, Reader& r) {
-        uint8_t op = r.U8();
-        if (op == OP_ACTIVITY || op == OP_ACTIVITY_END) {
-            Wanted& w = m_remote[from];
-            w.a = Activity{};
-            if (op == OP_ACTIVITY) {
-                w.a.block = r.I16();
-                w.a.idx = r.I16();
-                w.a.flags = r.U16();
-                w.a.time = r.F32();
-                if (!r.Ok() || w.a.block < 0 || w.a.idx < 0) w.a = Activity{};
+        const uint64_t now = NowMs();
+        AnimationState scripted = anim::Capture(anim::ActionAssociation(me));
+        bool changed = !scripted.Same(m_scripted) ||
+            (scripted.Present() && scripted.time + 0.25f < m_scripted.time && !(scripted.flags & anim::F_LOOPED));
+        if (changed || (scripted.Present() && now - m_scriptSent >= 100)) {
+            Writer action(proto::G_PLAYER_ANIM);
+            action.U32((uint32_t)now);
+            action.U32(Players::Instance().MotionEpoch());
+            action.U8(OP_SCRIPT);
+            action.U8(me->InVehicle()?1:0);action.Bool(me->Health()<=0);
+            scripted.Write(action);
+            Net().Send(proto::CH_RELIABLE, action);
+            m_scriptSent = now;
+        }
+        m_scripted = scripted;
+        for(auto it=m_pendingIdle.begin();it!=m_pendingIdle.end();){
+            auto*rp=Players::Instance().Get(it->first);auto idle=it->second;
+            if(!rp||!rp->ped||now-idle.recv>1500){it=m_pendingIdle.erase(it);continue;}
+            if(!rp->ped->RwObject()){++it;continue;}
+            if(!EnsureBlockLoaded(BlockForGroup(idle.group))){++it;continue;}
+            uintptr_t group=Ref<uintptr_t>(0xB4EA34)+(uintptr_t)idle.group*0x14;
+            int first=(int)Ref<uint32_t>(group+0x0C),count=(int)Ref<uint32_t>(group+0x08);
+            if(idle.id>=first&&idle.id<first+count)
+                if(auto*a=Call<0x4D4610,void*>(rp->ped->RwObject(),idle.group,idle.id,std::clamp(idle.delta,1.0f,50.0f)))anim::Flags(a)|=ANIMATION_IDLE_FLAG;
+            it=m_pendingIdle.erase(it);
+        }
+        for (auto& [id, state] : m_remoteScripted) {
+            RemotePlayer* rp = Players::Instance().Get(id);
+            if (!rp || !rp->ped) continue;
+            if(rp->hasState&&state.epoch!=rp->state.motion.epoch){
+                if((int32_t)(state.epoch-rp->state.motion.epoch)>0)continue;
+                if(void*a=anim::Find(rp->ped->RwObject(),state.animation))anim::FadeOut(a);
+                state.animation={};rp->scriptAnimFull=false;anim::RestoreMovement(rp->ped);continue;
             }
-            w.recvMs = NowMs();
-            ++w.seq;
-            return;
+            if (now - state.recv > 1500) {
+                if (void* a = anim::Find(rp->ped->RwObject(), state.animation)) anim::FadeOut(a);
+                state.animation = {};
+                rp->scriptAnimFull = false;
+                anim::RestoreMovement(rp->ped);
+            }
+            rp->scriptAnimFull = HoldsMovement(state.animation);
+            if (state.animation.Present()) {
+                const auto* peer = Net().Peer(id);
+                float age = std::min(0.25f, (now - state.recv) / 1000.0f + 0.0005f * (Net().Rtt() + (peer ? peer->ping : 0)));
+                anim::Replay(rp->ped->RwObject(), state.animation, age);
+            }
         }
-        RemotePlayer* rp = Players::Instance().Get(from);
-        if (!rp || !rp->ped || !core::IsPlayerReady()) return;
-        void* clump = rp->ped->RwObject();
-        if (!clump) return;
-        if (op == OP_PLAY) {
-            int group = r.I16();
-            int id = r.I16();
-            float delta = r.F32();
-            if (!r.Ok() || !IsReplicated(group, id)) return;
-            const char* block = BlockForGroup(group);
-            if (block && !EnsureBlockLoaded(block)) return;
-            uintptr_t grp = Ref<uintptr_t>(0xB4EA34) + (uintptr_t)group * 0x14;  // CAnimManager::ms_aAnimAssocGroups
-            int first = (int)Ref<uint32_t>(grp + 0x0C), count = (int)Ref<uint32_t>(grp + 0x08);  // m_IdOffset, m_NumAnims
-            if (id < first || id >= first + count) return;  // from the network
-            void* a = Call<0x4D4610, void*>(clump, group, id, std::clamp(delta, 1.0f, 50.0f));  // CAnimManager::BlendAnimation
-            if (a) anim::Flags(a) |= ANIMATION_IDLE_FLAG;
-            LOGI("Remote player %d animation: group %d id %d (%s)", from, group, id, a ? "ok" : "failed");
-        } else if (op == OP_STOP_IDLE) {
-            for (void* a = anim::First(clump); a; a = anim::Next(a))
-                if ((anim::Flags(a) & ANIMATION_IDLE_FLAG) && IsReplicated(anim::Group(a), anim::Id(a))) {
-                    anim::BlendDelta(a) = -8.0f;
-                    anim::Flags(a) |= anim::F_AUTO_REMOVE;  // deleted once out
-                }
-        }
-    }
-
-    void OnGameStarted() override {
-        m_lastGroup = m_lastId = -1;
-        m_sent = Activity{};
-        m_remote.clear();
-    }
-    void OnSessionEnd() override { m_remote.clear(); }
-    void OnPeerLeave(uint8_t id) override { m_remote.erase(id); }
-
-    static Anims& Instance() {
-        static Anims a;
-        return a;
-    }
-
-private:
-    struct Wanted {
-        Activity a;
-        uint64_t recvMs = 0;
-        uint32_t seq = 0, appliedSeq = 0;
-        void* applied = nullptr;  // the hierarchy blended on the copy
-    };
-
-    void SendIdle(CPlayerPed* me) {
         // the replicated animation currently playing on the local player (blending in or full)
         int group = -1, id = -1;
         for (void* a = anim::First(me->RwObject()); a; a = anim::Next(a)) {
@@ -196,6 +134,8 @@ private:
         }
         if (group == m_lastGroup && id == m_lastId) return;
         Writer w(proto::G_PLAYER_ANIM);
+        w.U32((uint32_t)now);
+        w.U32(Players::Instance().MotionEpoch());
         if (id >= 0) {
             w.U8(OP_PLAY);
             w.I16((int16_t)group);
@@ -211,63 +151,94 @@ private:
         m_lastId = id;
     }
 
-    void SendActivity(CPlayerPed* me) {
-        Activity now;
-        bool on = !me->InVehicle() && CurrentActivity(me, now);
-        // the same one again shows up as its time going back (a looped one going back is its next lap)
-        bool same = on && now.block == m_sent.block && now.idx == m_sent.idx;
-        bool restarted = same && !(now.flags & anim::F_LOOPED) && now.time + 0.25f < m_lastTime;
-        m_lastTime = on ? now.time : 0.0f;
-        if (on ? same && !restarted : m_sent.block < 0) return;
-        Writer w(proto::G_PLAYER_ANIM);
-        if (on) {
-            w.U8(OP_ACTIVITY);
-            w.I16(now.block);
-            w.I16(now.idx);
-            w.U16(now.flags);
-            w.F32(now.time);
-            LOGI("Activity animation %s/%d (%s)", (const char*)anim::Block(now.block), now.idx, restarted ? "again" : "started");
-        } else {
-            w.U8(OP_ACTIVITY_END);
-            LOGI("Activity animation ended");
-        }
-        Net().Send(proto::CH_RELIABLE, w);
-        m_sent = on ? now : Activity{};
-    }
-
-    // the other players' activities on their copies, once each copy is on foot and the IFP is in memory
-    void ApplyActivities() {
-        for (auto& [id, w] : m_remote) {
-            if (w.seq == w.appliedSeq) continue;
-            RemotePlayer* rp = Players::Instance().Get(id);
-            if (!rp || !rp->ped || rp->mode != RemotePlayer::Mode::OnFoot || !rp->ped->RwObject()) continue;
-            void* clump = rp->ped->RwObject();
-            void* h = nullptr;
-            if (w.a.block >= 0 && !(h = anim::Resolve(w.a.block, w.a.idx))) continue;  // its IFP is being loaded
-            if (w.applied)
-                for (void* a = anim::First(clump); a; a = anim::Next(a))
-                    if (anim::Hierarchy(a) == w.applied && anim::BlendDelta(a) >= 0.0f) anim::FadeOut(a);
-            if (h) {
-                if (void* a = anim::Blend(clump, h, w.a.flags, 4.0f)) {
-                    float t = w.a.time + (float)(NowMs() - w.recvMs) / 1000.0f, total = anim::TotalTime(h);
-                    anim::SetCurrentTime(a, (w.a.flags & anim::F_LOOPED) && total > 0 ? std::fmod(t, total) : std::min(t, total));
+    void Handle(uint8_t from, Reader& r) {
+        uint32_t time=r.U32();
+        uint32_t epoch=r.U32();
+        uint8_t op = r.U8();
+        RemotePlayer* rp = Players::Instance().Get(from);
+        if (!rp || !core::IsPlayerReady()) return;
+        if(auto it=m_actionTime.find(from);it!=m_actionTime.end()&&(int32_t)(time-it->second)<0)return;
+        m_actionTime[from]=time;
+        if(!rp->ped)return;
+        if(rp->hasState&&(int32_t)(epoch-rp->state.motion.epoch)<0)return;
+        void* clump = rp->ped->RwObject();
+        if (!clump) return;
+        if (op == OP_SCRIPT) {
+            bool seated=r.U8()!=0,dead=r.Bool();
+            AnimationState s;
+            if (!s.Read(r)) return;
+            if(rp->hasState&&(int32_t)(time-rp->lastStateTime)<0&&
+               (seated!=(rp->mode!=RemotePlayer::Mode::OnFoot)||dead!=bool(rp->state.flags&OnFootState::F_DEAD)))return;
+            auto& previous = m_remoteScripted[from];
+            if (!previous.animation.Same(s))
+                if (void* a = anim::Find(clump, previous.animation)) anim::FadeOut(a);
+            previous = {s, NowMs(),epoch};
+            bool wasFull = rp->scriptAnimFull;
+            rp->scriptAnimFull = HoldsMovement(s);
+            if (wasFull && !rp->scriptAnimFull) anim::RestoreMovement(rp->ped);
+        } else if (op == OP_PLAY) {
+            int group = r.I16();
+            int id = r.I16();
+            float delta = r.F32();
+            if (!r.Ok() || !IsReplicated(group,id)) return;
+            const char* block = BlockForGroup(group);
+            if (block && !EnsureBlockLoaded(block)){m_pendingIdle[from]={group,id,delta,NowMs()};return;}
+            uintptr_t grp = Ref<uintptr_t>(0xB4EA34) + (uintptr_t)group * 0x14;  // CAnimManager::ms_aAnimAssocGroups
+            int first = (int)Ref<uint32_t>(grp + 0x0C), count = (int)Ref<uint32_t>(grp + 0x08);  // m_IdOffset, m_NumAnims
+            if (id < first || id >= first + count) return;  // from the network
+            void* a = Call<0x4D4610, void*>(clump, group, id, std::clamp(delta, 1.0f, 50.0f));  // CAnimManager::BlendAnimation
+            if (a) anim::Flags(a) |= ANIMATION_IDLE_FLAG;
+            LOGI("Remote player %d animation: group %d id %d (%s)", from, group, id, a ? "ok" : "failed");
+        } else if (op == OP_STOP_IDLE) {
+            m_pendingIdle.erase(from);
+            for (void* a = anim::First(clump); a; a = anim::Next(a))
+                if ((anim::Flags(a) & ANIMATION_IDLE_FLAG) && IsReplicated(anim::Group(a),anim::Id(a))) {
+                    anim::BlendDelta(a) = -8.0f;
+                    anim::Flags(a) |= anim::F_AUTO_REMOVE;  // deleted once out
                 }
-                LOGI("Remote player %d activity animation %s/%d", id, (const char*)anim::Block(w.a.block), w.a.idx);
-            } else if (w.applied) {
-                // its stance back: the player's task starts its walk set again only when its move state changes, and a
-                // ped left with no animation crashes the game (see Peds.cpp)
-                Call<0x4D4610, void*>(clump, Field<int32_t>(rp->ped, 0x4D4), 3 /* ANIM_ID_IDLE */, 4.0f);  // CAnimManager::BlendAnimation
-                LOGI("Remote player %d activity animation ended", id);
-            }
-            w.applied = h;
-            w.appliedSeq = w.seq;
         }
     }
 
+    void OnGameStarted() override { Reset(); }
+    void OnSessionEnd() override { Reset(); }
+    void OnPeerLeave(uint8_t id) override { ForgetRemote(id); }
+    void OnPeerResync(uint8_t id) override { m_scripted = {}; m_scriptSent = 0; ForgetRemote(id); }
+
+    static Anims& Instance() {
+        static Anims a;
+        return a;
+    }
+
+private:
+    void ForgetRemote(uint8_t id) {
+        auto previous = m_remoteScripted.find(id);
+        if (auto* rp = Players::Instance().Get(id)) {
+            if (rp->ped && previous != m_remoteScripted.end())
+                if (void* a = anim::Find(rp->ped->RwObject(), previous->second.animation)) anim::FadeOut(a);
+            rp->scriptAnimFull = false;
+            if (rp->ped) anim::RestoreMovement(rp->ped);
+        }
+        m_remoteScripted.erase(id);
+        m_actionTime.erase(id);m_pendingIdle.erase(id);
+    }
+    void Reset() {
+        for (auto& [id, state] : m_remoteScripted)
+            if (auto* rp = Players::Instance().Get(id)) {
+                if (rp->ped) if (void* a = anim::Find(rp->ped->RwObject(), state.animation)) anim::FadeOut(a);
+                rp->scriptAnimFull = false;
+            }
+        m_lastGroup = m_lastId = -1;
+        m_scripted = {}; m_scriptSent = 0; m_remoteScripted.clear();
+        m_actionTime.clear();m_pendingIdle.clear();
+    }
+    struct PendingIdle{int group,id;float delta;uint64_t recv;};
+    std::map<uint8_t,PendingIdle>m_pendingIdle;
+    struct RemoteAction { AnimationState animation; uint64_t recv = 0; uint32_t epoch=0; };
+    std::map<uint8_t, RemoteAction> m_remoteScripted;
+    std::map<uint8_t,uint32_t> m_actionTime;
+    AnimationState m_scripted;
+    uint64_t m_scriptSent = 0;
     int m_lastGroup = -1, m_lastId = -1;
-    Activity m_sent;
-    float m_lastTime = 0.0f;
-    std::map<uint8_t, Wanted> m_remote;
 };
 
 struct Reg {

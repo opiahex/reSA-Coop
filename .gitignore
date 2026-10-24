@@ -1,11 +1,13 @@
-# build output and the downloaded compiler
 /build/
 /dist/
 /toolchain/
 /compile_commands.json
 __pycache__/
 *.pyc
-
-# local data that is not part of the project: the game's own files and the reverse engineering notes
+/work/
+/tests/
+/outputs/
 /game_files/
 /re/
+*.log
+*.jsonl

@@ -5,6 +5,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include "common/lib/buffer/EntityRef.h"
 
 namespace coop {
 
@@ -25,6 +26,15 @@ public:
     void I8(int8_t v) { U8((uint8_t)v); }
     void Bool(bool v) { U8(v ? 1 : 0); }
     void U16(uint16_t v) { Raw(&v, 2); }
+    void Entity(uint8_t kind,uint16_t id,uint8_t flags=ENTITY_USE,uint8_t scope=255,uint64_t generation=0){
+        U16(id);Reference(kind,id,flags,scope,generation);
+    }
+    void Reference(uint8_t kind,uint16_t id,uint8_t flags=ENTITY_USE,uint8_t scope=255,uint64_t generation=0){
+        if(!id||(kind==ENTITY_VEHICLE&&id==0xFFFF))return;
+        for(auto&ref:m_entities)if(ref.kind==kind&&ref.id==id&&ref.scope==scope){ref.flags|=flags;return;}
+        m_entities.push_back({kind,scope,id,generation,flags});
+    }
+    const std::vector<EntityRef>& Entities()const{return m_entities;}
     void I16(int16_t v) { Raw(&v, 2); }
     void U32(uint32_t v) { Raw(&v, 4); }
     void I32(int32_t v) { Raw(&v, 4); }
@@ -84,6 +94,7 @@ public:
 
 private:
     std::vector<uint8_t> m_data;
+    std::vector<EntityRef> m_entities;
 };
 
 // Bounds-checked reader. On underflow it sets the error flag and returns zeros.
@@ -126,7 +137,7 @@ public:
     float F32() {
         float v = 0;
         Raw(&v, 4);
-        if (!std::isfinite(v)) v = 0.0f;  // never let NaN/Inf from the network into the game
+        if (!std::isfinite(v)) { m_error=true;v=0.0f; } // reject corrupt state instead of teleporting an axis to zero
         return v;
     }
     Vec3 Vec() {

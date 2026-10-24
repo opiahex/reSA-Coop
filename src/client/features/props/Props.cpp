@@ -6,6 +6,8 @@
 // stays where the owner's is until that one is gone.
 #include <algorithm>
 #include <cmath>
+#include "shared/lib/sync/IdAllocator.h"
+#include "shared/api/mission-objects/SharedObject.h"
 #include <map>
 #include <vector>
 
@@ -59,7 +61,7 @@ struct Prop {
 void Write(Writer& w, const Prop& p) {
     w.U16(p.model);
     w.U8(p.by);
-    w.U16(p.holder);
+    if(p.by==BY_PED)w.Entity(ENTITY_PED,p.holder);else w.U16(p.holder);
     w.U8(p.hang);
     w.Vec({p.offset.x, p.offset.y, p.offset.z});
     w.Vec({p.euler.x, p.euler.y, p.euler.z});
@@ -127,7 +129,7 @@ struct Owned {
     uint64_t looseMs = 0;  // let go at
 };
 std::map<uint16_t, Owned> g_owned;
-uint16_t g_nextId = 1;
+IdAllocator<65536> g_ids;
 uint64_t g_scanMs = 0;
 bool g_resend = false;  // a peer (re)started its game: everything again
 
@@ -179,7 +181,7 @@ bool ReadLook(CObject* o, Prop& p) {
 void SendState(uint16_t id, const Prop& p) {
     Writer w(proto::G_PROP);
     w.U8(OP_STATE);
-    w.U16(id);
+    w.Entity(ENTITY_PROP,id,ENTITY_BIRTH|ENTITY_SNAPSHOT);
     Write(w, p);
     Net().Send(proto::CH_RELIABLE, w);
 }
@@ -187,7 +189,7 @@ void SendState(uint16_t id, const Prop& p) {
 void SendGone(uint16_t id) {
     Writer w(proto::G_PROP);
     w.U8(OP_GONE);
-    w.U16(id);
+    w.Entity(ENTITY_PROP,id,ENTITY_REMOVE);
     Net().Send(proto::CH_RELIABLE, w);
 }
 
@@ -269,6 +271,7 @@ void Scan() {
     uint64_t now = NowMs();
     std::vector<uint16_t> gone;
     for (auto& [id, ow] : g_owned) {
+        if(IsSharedMissionObject(ow.obj)){gone.push_back(id);continue;}
         if (!Alive(ow.obj, ow.handle)) {
             gone.push_back(id);
             continue;
@@ -279,7 +282,8 @@ void Scan() {
             p = f->second;
             found.erase(f);
             ow.looseMs = 0;
-        } else {  // let go: where it is now
+        } else {  // let go: mission objects return to their world sync
+            if(MissionObject(ow.handle)){gone.push_back(id);continue;}
             if (!ow.looseMs) ow.looseMs = now;
             if (now - ow.looseMs > kLooseKeepMs) {
                 gone.push_back(id);
@@ -301,15 +305,15 @@ void Scan() {
     }
     for (uint16_t id : gone) {
         SendGone(id);
-        g_owned.erase(id);
+        g_ids.Retire(id,NowMs());g_owned.erase(id);
         LOGI("Prop %04X gone", id);
     }
     for (auto& [o, p] : found) {
+        if(IsSharedMissionObject(o))continue;
         int h = GetObjectRef(o);
-        if (h < 0 || MissionObject(h)) continue;
-        uint16_t id = g_nextId++;
-        if (!g_nextId) g_nextId = 1;
-        Owned& ow = g_owned[id];
+        if (h < 0) continue;
+        uint16_t id=g_ids.Take(0,NowMs(),[](uint16_t v){return g_owned.count(v)!=0;});if(!id)continue;
+        Net().BeginEntity(ENTITY_PROP,id);Owned& ow = g_owned[id];
         ow.obj = o;
         ow.handle = h;
         ReadLook(o, p);
@@ -326,6 +330,7 @@ void Scan() {
 
 // ---------------------------------------------------------------- the other game's
 struct Copy {
+    uint64_t holderGeneration=0;
     uint8_t from = 0;
     Prop p;
     uint64_t recvMs = 0;
@@ -347,10 +352,11 @@ CPed* HolderOf(const Copy& c) {
         RemotePlayer* rp = Players::Instance().Get(c.from);
         return rp ? rp->ped : nullptr;
     }
+    if(!Net().EntityContextValid({EntityRef{ENTITY_PED,255,c.p.holder,c.holderGeneration,0}}))return nullptr;
     int h = Peds::Instance().HandleOf(c.p.holder);
     CPed* ped = h >= 0 ? GetPed(h) : nullptr;
     NetPed* np = ped ? Peds::Instance().Find(ped) : nullptr;
-    return np && np->owner != Net().MyId() ? ped : nullptr;
+    return np && np->owner == c.from ? ped : nullptr;
 }
 
 void Detach(Copy& c) { Cmd(0x0682).I(c.handle).F(0.0f).F(0.0f).F(0.0f).I(0).Run(); }  // DETACH_OBJECT
@@ -519,11 +525,11 @@ void Handle(uint8_t from, Reader& r) {
     }
     Prop p;
     Read(r, p);
-    if (!r.Ok() || op != OP_STATE) return;
+    if (!r.Ok() || op != OP_STATE || p.by > BY_PED || p.hang > HANG_LOOSE || p.bone >= kPedNodes || !std::isfinite(p.scale) || p.scale <= 0 || p.scale > 100) return;
     Copy& c = g_copies[k];
     bool remake = c.obj && c.p.model != p.model;
     c.from = from;
-    c.p = p;
+    c.p = p;c.holderGeneration=p.by==BY_PED?Net().EntityGeneration(ENTITY_PED,p.holder):0;
     c.recvMs = NowMs();
     c.placed = false;
     if (remake) Delete(c);
@@ -543,6 +549,7 @@ void DeleteCopies(int from) {
 class Props : public Module {
 public:
     const char* Name() const override { return "Props"; }
+    void OnEntityReplaced(uint8_t kind,uint8_t scope,uint16_t id)override{if(kind!=ENTITY_PROP)return;auto key=(uint32_t(scope)<<16)|id;if(auto i=g_copies.find(key);i!=g_copies.end()){Delete(i->second);g_copies.erase(i);}}
 
     void OnInstallHooks() override {
         Net().SetHandler(proto::G_PROP, [](uint8_t from, Reader& r) { Handle(from, r); });

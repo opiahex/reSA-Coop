@@ -10,8 +10,13 @@ bool HostMissionRecent(uint64_t graceMs);
 
 // host: its mission (or the mission's trigger) runs and a partner is there to see it
 bool HostReplicating();
+bool LocalSchoolActivity();
 
 // the script (CRunningScript) whose commands run right now, or null
 void* CurrentScript();
+void ReleaseStoryScriptCamera();
+// Object referenced/created by the authoritative story interpreter.
+void ShareMissionObject(int handle);
+bool StoryGroupReady(float x, float y, float z, int8_t area, float radius = 4.0f, float vertical = 4.0f);
 
 }  // namespace coop

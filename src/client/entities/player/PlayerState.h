@@ -4,6 +4,7 @@
 
 #include "common/lib/buffer/Buffer.h"
 #include "shared/game/Game.h"
+#include "shared/lib/sync/MotionState.h"
 
 namespace coop {
 
@@ -47,6 +48,7 @@ struct CameraState {
     float fov = 70.0f;
     game::CVector front{0, 1, 0};
     game::CVector sourceOffset{0, -3, 1};  // camera position relative to the ped
+    game::CVector aimOffset{0, 20, 1};
     game::CVector up{0, 0, 1};
     float orientation = 0;
     float alpha = 0, beta = 0;
@@ -69,8 +71,10 @@ struct OnFootState {
     int8_t area = 0;
     uint8_t moveState = 0;
     uint8_t wanted = 0;  // stars, shown on the name tag
+    uint8_t fightingStyle = 4, attackMoves = 0;
     PadState pad;
     CameraState cam;
+    MotionState motion;
 
     enum : uint8_t { F_DUCKING = 1, F_IN_AIR = 2, F_DEAD = 4, F_SWIMMING = 8, F_JETPACK = 16, F_IN_TRAIN = 32, F_PHONE = 64 };
 

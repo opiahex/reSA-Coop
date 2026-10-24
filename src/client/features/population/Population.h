@@ -2,7 +2,7 @@
 
 namespace coop {
 
-// True while this game does not generate its own random population because the host does it.
+// True while this game shares the nearby authority's ordinary population.
 bool PopulationSuppressed();
 
 }  // namespace coop

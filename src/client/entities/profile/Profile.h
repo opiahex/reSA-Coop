@@ -5,6 +5,6 @@
 namespace coop {
 
 // partner: send the profile (money, skills, look) now and keep it for the next world load
-void SaveProfileNow();
+void SaveProfileNow(bool always = false);
 
 }  // namespace coop
