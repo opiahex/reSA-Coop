@@ -15,7 +15,7 @@ inline StoryActorQuery StoryContinuationQuery(int opcode){
     }
 }
 inline bool FreshStoryContinuation(uint64_t now,uint64_t action,uint64_t received){
-    return action&&now>=action&&now-action<=5000&&now>=received&&now-received<1500;
+    return action&&now>=action&&now>=received&&now-received<1500;
 }
 // A guest may leave a supplied ride. Only a new assignment can seat them again.
 inline bool SameStoryRole(uint8_t aMode,uint16_t aVehicle,uint64_t aGeneration,uint16_t aObject,

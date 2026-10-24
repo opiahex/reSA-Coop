@@ -20,6 +20,8 @@
 #include "entities/session/Flow.h"
 #include "common/lib/util/Util.h"
 #include "entities/mission/Mission.h"
+#include "shared/api/story-coop/StoryCoop.h"
+#include "shared/api/story-stage/StoryStage.h"
 #include "shared/api/net-session/Session.h"
 #include "shared/game/Game.h"
 #include "shared/game/Script.h"
@@ -52,6 +54,7 @@ int16_t ModelIndexVar(uintptr_t a) { return Ref<int16_t>(a); }  // CModelInfo MI
 
 bool g_applying = false;               // this module creates or takes a pickup itself
 std::set<int> g_story;
+std::set<int> g_personal;
 std::vector<int> g_announced;          // handles of pickups announced from here (for a restarted partner)
 
 bool Shared(uint8_t type, int model) {
@@ -76,7 +79,8 @@ int Find(int model, const int16_t* pos, uint8_t type) {
     int best = -1, bestDist = 13;
     for (int i = 0; i < kNumPickups; ++i) {
         uintptr_t p = Pickup(i);
-        if (!Type(p) || Model(p) != model || (Type(p) == PU_SNAPSHOT) != (type == PU_SNAPSHOT)) continue;
+        int handle=i|(int)(Ref<uint16_t>(p+0x1A)<<16);
+        if (g_personal.count(handle)||!Type(p) || Model(p) != model || (Type(p) == PU_SNAPSHOT) != (type == PU_SNAPSHOT)) continue;
         int16_t* q = Pos(p);
         int d = std::max({std::abs(q[0] - pos[0]), std::abs(q[1] - pos[1]), std::abs(q[2] - pos[2])});
         if (d < bestDist) best = i, bestDist = d;
@@ -91,6 +95,62 @@ std::map<uint32_t,StoryPickup> g_wantedStory;
 std::map<uint32_t,int> g_storyCopies;
 uint64_t g_storySentMs=0;
 bool PickupAlive(int h){int i=h&0xffff;return h>=0&&i<kNumPickups&&Type(Pickup(i))&&Ref<uint16_t>(Pickup(i)+0x1A)==(uint16_t)(h>>16);}
+struct EquipmentOffer{bool offered=false,taken=false;int handle=-1;CVector position;int8_t area=0;};
+std::array<EquipmentOffer,3> g_equipment;
+uint64_t g_equipmentRun=0,g_equipmentSent=0;uint32_t g_equipmentRevision=0,g_equipmentReceived=0;
+void ClearEquipment(bool remove){
+    if(remove)for(auto&e:g_equipment)if(PickupAlive(e.handle))CallMethod<0x4556C0>((void*)Pickup(e.handle&0xffff));
+    g_equipment={};g_personal.clear();g_equipmentRun=0;g_equipmentSent=0;g_equipmentRevision=g_equipmentReceived=0;
+}
+void SendEquipment(){
+    Writer w(proto::G_STORY_EQUIPMENT);w.U8(1);w.U64(g_equipmentRun);w.U32(++g_equipmentRevision);
+    for(auto&e:g_equipment){w.Bool(e.offered);w.Bool(e.taken);w.Vec({e.position.x,e.position.y,e.position.z});w.I8(e.area);}
+    Net().Send(proto::CH_RELIABLE,w);g_equipmentSent=NowMs();
+}
+void EquipmentTaken(int handle){
+    if(Net().IsHost()||Net().MyId()>=3||!g_personal.count(handle))return;
+    auto&e=g_equipment[Net().MyId()];e.taken=true;e.handle=-1;g_personal.erase(handle);
+    Writer w(proto::G_STORY_EQUIPMENT);w.U8(2);w.U64(g_equipmentRun);Net().Send(proto::CH_RELIABLE,w);
+    LOGI("Story jetpack collected run=%llu player=%u",(unsigned long long)g_equipmentRun,Net().MyId());
+}
+void HandleEquipment(uint8_t from,Reader&r){
+    auto op=r.U8();auto token=r.U64();
+    if(op==2){if(Net().IsHost()&&from<3&&r.Ok()&&token==g_equipmentRun&&g_equipment[from].offered){g_equipment[from].taken=true;SendEquipment();}return;}
+    if(op!=1||Net().IsHost()||from!=Net().HostId()||!token||token!=StoryRunId())return;
+    auto revision=r.U32();std::array<EquipmentOffer,3> incoming;
+    for(auto&e:incoming){e.offered=r.Bool();e.taken=r.Bool();auto p=r.Vec();e.position={p.x,p.y,p.z};e.area=r.I8();if(!std::isfinite(p.x)||!std::isfinite(p.y)||!std::isfinite(p.z)||e.position.Length()>10000)return;}
+    if(!r.Ok()||(g_equipmentRun==token&&(int32_t)(revision-g_equipmentReceived)<=0))return;
+    if(g_equipmentRun!=token)ClearEquipment(core::IsPlayerReady());
+    for(size_t i=0;i<3;++i){incoming[i].handle=g_equipment[i].handle;incoming[i].taken|=g_equipment[i].taken;}
+    g_equipment=incoming;g_equipmentRun=token;g_equipmentReceived=revision;
+}
+void UpdateEquipment(){
+    auto token=StoryRunId();if(g_equipmentRun&&token!=g_equipmentRun)ClearEquipment(true);if(!token)return;
+    if(Net().IsHost()){
+        g_equipmentRun=token;
+        auto*me=FindPlayerPed(0);bool jetpack=me->Intelligence()&&CallMethod<0x601110,void*>(me->Intelligence());CVector source=me->GetPosition();int8_t area=me->AreaCode();
+        // Offer equipment as soon as its native mission pickup is available,
+        // including the underground jetpack before the host takes it.
+        if(!jetpack)for(int h:g_story)if(PickupAlive(h)&&Model(Pickup(h&0xffff))==370){auto*p=Pos(Pickup(h&0xffff));source={p[0]/8.f,p[1]/8.f,p[2]/8.f};if(auto*o=Ref<CObject*>(Pickup(h&0xffff)+4))area=o->AreaCode();jetpack=true;break;}
+        bool changed=false;
+        if(jetpack)for(auto&[id,peer]:Net().Peers())if(id<3&&id!=Net().MyId()&&!g_equipment[id].offered){
+            auto p=source+CVector{id==1?3.f:-3.f,-2.f,0};bool floor=false;float z=Call<0x5696C0,float>(p.x,p.y,p.z+3.f,&floor,(CEntity**)nullptr);
+            if(!floor||std::fabs(z-source.z)>4.f)continue;
+            auto&e=g_equipment[id];e.offered=true;e.position={p.x,p.y,z+.7f};e.area=area;changed=true;
+            LOGI("Story jetpack offered run=%llu player=%u area=%d at=%.2f,%.2f,%.2f",(unsigned long long)token,id,area,p.x,p.y,z+.7f);
+        }
+        if(changed||NowMs()-g_equipmentSent>1000)SendEquipment();return;
+    }
+    if(g_equipmentRun!=token||Net().MyId()>=3||!flow::InHostWorld())return;auto&e=g_equipment[Net().MyId()];
+    if(!e.offered||e.taken)return;
+    if(!PickupAlive(e.handle)){
+        if(FindPlayerPed(0)->AreaCode()!=e.area)return;
+        if(!IsModelLoaded(370)){RequestModel(370);return;}
+        g_applying=true;e.handle=Call<0x456F20,int>(e.position.x,e.position.y,e.position.z,(uint32_t)370,(int)PU_ONCE,(uint32_t)0,(uint32_t)0,0,(char*)nullptr);g_applying=false;
+        if(e.handle<0)return;g_personal.insert(e.handle);LOGI("Personal mission jetpack ready player=%u handle=%d",Net().MyId(),e.handle);
+    }
+    if(auto*o=Ref<CObject*>(Pickup(e.handle&0xffff)+4))o->AreaCode()=e.area;
+}
 void SendStoryPickups(bool force=false){
     if(!Net().IsHost()||!flow::InSharedWorld()||!core::IsPlayerReady()||(!force&&NowMs()-g_storySentMs<500))return;
     g_storySentMs=NowMs();
@@ -166,6 +226,7 @@ bool __fastcall HookPickupUpdate(void* pickup, void* edx, CPlayerPed* player, CV
     uint8_t before[0x20];
     memcpy(before, pickup, sizeof(before));  // Remove() clears the type and the object
     bool taken = g_origPickupUpdate(pickup, edx, player, veh, playerId);
+    if(g_personal.count(handle)){if(taken&&player==FindPlayerPed(0))EquipmentTaken(handle);return taken;}
     if (!flow::InSharedWorld() || g_applying || player != FindPlayerPed(0) || !Shared(type, Model((uintptr_t)before)))
         return taken;
     if (taken) {
@@ -369,11 +430,12 @@ public:
         Net().SetHandler(proto::G_PICKUP_EVENT, &HandleEvent);
         Net().SetHandler(proto::G_PICKUP_CREATE, &HandleCreate);
         Net().SetHandler(proto::G_STORY_PICKUPS,&HandleStoryPickups);
+        Net().SetHandler(proto::G_STORY_EQUIPMENT,&HandleEquipment);
     }
-    void OnSessionEnd() override { g_announced.clear(); g_story.clear();g_wantedStory.clear();g_storyCopies.clear();g_storySentMs=0; }
-    void OnGameStarted() override { g_announced.clear(); g_story.clear();g_storyCopies.clear();g_storySentMs=0; }
-    void OnGameShutdown()override{g_wantedStory.clear();g_storyCopies.clear();g_story.clear();}
-    void OnPostProcess()override{if(!Net().Online()||!core::IsPlayerReady())return;if(Net().IsHost())SendStoryPickups();else ApplyStoryPickups();}
+    void OnSessionEnd() override { ClearEquipment(core::IsPlayerReady());g_announced.clear(); g_story.clear();g_wantedStory.clear();g_storyCopies.clear();g_storySentMs=0; }
+    void OnGameStarted() override { ClearEquipment(false);g_announced.clear(); g_story.clear();g_storyCopies.clear();g_storySentMs=0; }
+    void OnGameShutdown()override{ClearEquipment(false);g_wantedStory.clear();g_storyCopies.clear();g_story.clear();}
+    void OnPostProcess()override{if(!Net().Online()||!core::IsPlayerReady())return;UpdateEquipment();if(Net().IsHost())SendStoryPickups();else ApplyStoryPickups();}
     void OnPeerResync(uint8_t) override {
         if(Net().IsHost())SendStoryPickups(true);
         // a restarted game lost what was announced to it: what is still here goes again

@@ -5,6 +5,7 @@
 #include "common/lib/buffer/Buffer.h"
 #include "shared/game/Game.h"
 #include "shared/lib/sync/MotionState.h"
+#include "entities/player/JetpackState.h"
 
 namespace coop {
 
@@ -75,6 +76,7 @@ struct OnFootState {
     PadState pad;
     CameraState cam;
     MotionState motion;
+    JetpackState jetpack;
 
     enum : uint8_t { F_DUCKING = 1, F_IN_AIR = 2, F_DEAD = 4, F_SWIMMING = 8, F_JETPACK = 16, F_IN_TRAIN = 32, F_PHONE = 64 };
 

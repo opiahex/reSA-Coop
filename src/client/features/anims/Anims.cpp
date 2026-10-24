@@ -156,7 +156,7 @@ public:
         uint32_t epoch=r.U32();
         uint8_t op = r.U8();
         RemotePlayer* rp = Players::Instance().Get(from);
-        if (!rp || !core::IsPlayerReady()) return;
+        if (!rp || !core::IsPlayerReady() || Ref<uint8_t>(0xB5F851)) return;
         if(auto it=m_actionTime.find(from);it!=m_actionTime.end()&&(int32_t)(time-it->second)<0)return;
         m_actionTime[from]=time;
         if(!rp->ped)return;

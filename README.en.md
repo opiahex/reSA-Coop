@@ -20,7 +20,7 @@ The host runs the original story from their save. Two guests join with separate 
 Mandatory story characters and native mission logic remain intact; no extra personal objectives or role HUD are added.
 Side activities remain personal, and each player controls their own radio.
 
-Current baseline: **0.2.24-3p, protocol 35**. Development is ongoing; the entire campaign and arbitrary third-party modifications are not certified bug-free.
+Current baseline: **0.2.25-3p, protocol 36**. Development is ongoing; the entire campaign and arbitrary third-party modifications are not certified bug-free.
 
 ## Install and play
 

@@ -13,4 +13,5 @@ void ClearStoryEntityDamage(uint8_t kind,int handle);
 void RecordStoryKill(game::CPed*victim,uint8_t player);
 void ResetCooperativeKills();
 int CooperativeGuestKills(int model);
+void ClearCooperativeStoryScript(void*script);
 }

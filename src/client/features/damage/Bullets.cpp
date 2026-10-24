@@ -55,6 +55,7 @@ void __fastcall HookBulletImpact(CWeapon* weapon, void* edx, CEntity* shooter, C
             Writer w(proto::G_BULLET); shot.Write(w);
             Net().Send(proto::CH_RELIABLE, w);
             if(LocalStoryRoleMode()==2)LOGD("Story gunner bullet sent seq=%u weapon=%u hit=%d",shot.sequence,shot.weapon,victim!=nullptr);
+            if(ped->Intelligence()&&CallMethod<0x601110,void*>(ped->Intelligence()))LOGD("Jetpack bullet sent seq=%u weapon=%u hit=%d",shot.sequence,shot.weapon,victim!=nullptr);
             g_bulletHit={victim,start,hit,shot.sequence,shot.weapon};
         }
     }

@@ -156,6 +156,7 @@ public:
         }
         for(auto&[id,n]:Vehicles::Instance().All())if(Vehicles::Alive(n)){
             auto*v=n.veh;auto*driver=v->Driver();
+            snprintf(b,sizeof(b),"{\"event\":\"vehicle_identity\",\"seq\":%llu,\"id\":%u,\"owner\":%u,\"native\":%d,\"generation\":%llu,\"script\":%d,\"mirror_created\":%d,\"lease_ms\":%llu}\n",(unsigned long long)seq,id,n.owner,n.handle,(unsigned long long)Net().EntityGeneration(ENTITY_VEHICLE,id),n.script,n.createdByUs,(unsigned long long)(n.handoverUntil>last?n.handoverUntil-last:0));Write(b);
             auto wheels=WheelState::Capture(v);
             auto damageCrc=Crc32(n.look.damage,sizeof(n.look.damage));
             damageCrc=Crc32(n.look.bikeTyres,sizeof(n.look.bikeTyres),damageCrc);

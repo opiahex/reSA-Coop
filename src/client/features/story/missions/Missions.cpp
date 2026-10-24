@@ -24,6 +24,7 @@
 #include "shared/api/story-actions/StoryActions.h"
 #include "shared/api/story-coop/StoryCoop.h"
 #include "shared/api/story-stage/StoryStage.h"
+#include "shared/lib/sync/StoryPosition.h"
 #include "shared/lib/sync/StoryContinuation.h"
 #include "shared/api/native-interaction/NativeInteraction.h"
 #include "common/api/protocol/Protocol.h"
@@ -82,7 +83,7 @@ void* FindMissionScript() {
 void* g_currentScript = nullptr;
 bool g_personalFlag = false;
 bool g_schoolFlag = false;
-bool g_sceneBypassed=false;uint64_t g_bypassWarpUntil=0;
+bool g_sceneBypassed=false;
 bool g_saveFlag = false;  // the flag up is PSAVE1's
 uint64_t g_localActivityUntil=0;void*g_localActivityScript=nullptr;
 void StopScriptCamera();
@@ -322,7 +323,8 @@ using ScriptProcessFn = void(__fastcall*)(void*, void*);
 ScriptProcessFn g_origScriptProcess = nullptr;
 int g_deadMissionPartner=-1;
 bool Replicating();
-void SendStoryWarp(CPlayerPed* cj);
+void SendStoryWarp(CPlayerPed* cj,uint8_t target=255,bool advance=true);
+CVector g_processStoryPosition;int8_t g_processStoryArea=0;CPlayerPed*g_processStoryPed=nullptr;
 void __fastcall HookScriptProcess(void* script, void* edx) {
     profile::Scope timing(profile::SCRIPT_PROCESS);
     // a world load from inside the game: the old scripts would run frames without a player (null peds)
@@ -344,7 +346,9 @@ void __fastcall HookScriptProcess(void* script, void* edx) {
     int16_t dir = FadeDirection();
     float seconds = FadeDuration();
     CPlayerPed* cj = Field<uint8_t>(script, 0xDC) && Net().IsHost() && Replicating() ? FindPlayerPed(0) : nullptr;  // m_bIsMission
-    CVector positionBefore=cj?cj->GetPosition():CVector{};
+    CVector positionBefore=cj?StoryPosition(cj):CVector{};
+    auto*previousStoryPed=g_processStoryPed;auto previousStoryPosition=g_processStoryPosition;auto previousStoryArea=g_processStoryArea;
+    g_processStoryPed=cj;g_processStoryPosition=positionBefore;g_processStoryArea=cj?cj->AreaCode():0;
     int8_t areaBefore=cj?cj->AreaCode():0;
     WeaponSlots weapons;
     if (cj) weapons.Take(cj);
@@ -390,8 +394,9 @@ void __fastcall HookScriptProcess(void* script, void* edx) {
         SendWeaponChanges(weapons,cj);
         // Physics does not run inside Process: a large displacement here came
         // from this shared story script, rather than ordinary player movement.
-        if(!CutsceneRunning()&&(cj->AreaCode()!=areaBefore||(cj->GetPosition()-positionBefore).Length()>8)){SendStoryWarp(cj);ArmCooperativeStage(script);}
+        if(!CutsceneRunning()&&(cj->AreaCode()!=areaBefore||(StoryPosition(cj)-positionBefore).Length()>8)){SendStoryWarp(cj);ArmCooperativeStage(script);}
     }
+    g_processStoryPed=previousStoryPed;g_processStoryPosition=previousStoryPosition;g_processStoryArea=previousStoryArea;
     // a fade that started during this script's commands is the script's (DO_FADE)
     bool sharedScript = Field<uint8_t>(script, 0xDC) && !PersonalActivity(script);
     if (sharedScript && Net().IsHost()) {
@@ -667,6 +672,13 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
         uint32_t saved[32];memcpy(saved,(void*)0xA43C78,sizeof saved);alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);int count=chainOp==0x01B4||chainOp==0x0715?2:1;CallMethod<0x464080>(copy,count);int first=Ref<int32_t>(0xA43C78),second=Ref<int32_t>(0xA43C7C);memcpy((void*)0xA43C78,saved,sizeof saved);
         bool gate=chainOp!=0x01B4||(first==0&&second==1);uint16_t source=0;
         if(chainOp==0x05EB||chainOp==0x0705||chainOp==0x085E||chainOp==0x0715)if(auto*v=GetVehicle(chainOp==0x0715?second:first))if(auto*n=Vehicles::Instance().EnsureNetworked(v))source=n->netId;
+        bool relocated=g_processStoryPed&&FindPlayerPed(0)==g_processStoryPed&&!CutsceneRunning()&&
+           (g_processStoryPed->AreaCode()!=g_processStoryArea||(StoryPosition(g_processStoryPed)-g_processStoryPosition).Length()>8);
+        // A native recording can complete the relocation itself (Stowaway's
+        // bike enters the cargo bay through START + SKIP_TO_END). Let that
+        // atomic entry finish; the next fade/control gate waits at its result.
+        if(relocated&&(chainOp==0x05EB||chainOp==0x0705||chainOp==0x085E))gate=false;
+        if(gate&&relocated)SendStoryWarp(g_processStoryPed);
         if(gate&&!AwaitCooperativeStage(script,chainOp,source)){Field<uint8_t*>(script,0x14)-=2;Field<uint32_t>(script,0xCC)=Ref<uint32_t>(addr::TimeInMs)+1;return 1;}
     }
     if(Net().Online()&&script==g_currentScript&&chainOp==0x01B4){
@@ -709,7 +721,7 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
         if(*ip==2||*ip==3){out=CallMethod<0x464790,int32_t*>(copy,0);if(out&&(uint8_t*)out>=copy&&(uint8_t*)out<copy+sizeof copy)out=(int32_t*)((uint8_t*)script+((uint8_t*)out-copy));}
         auto result=g_objectCommands[Group](script,edx,opcode);if(out)*out=(int32_t)CooperativeStoryClock();return result;
     }
-    if(story&&(chainOp==0x004E||chainOp==0x00D8))CancelCooperativeStage(script);
+    if(story&&(chainOp==0x004E||chainOp==0x00D8)){CancelCooperativeStage(script);ClearCooperativeStoryScript(script);}
     if(story&&(chainOp==0x016A||chainOp==0x03CB||chainOp==0x04BB||chainOp==0x01B4)){
         // Arm the next native timestamp at a real scene/control transition;
         // ordinary per-frame timer reads and free driving do not open barriers.
@@ -1664,7 +1676,7 @@ void HandleCutscene(uint8_t from, Reader& r) {
         s.act = r.U8();
         if (r.Ok() && player < proto::kMaxPlayers && player != Net().HostId()) scene::FollowSpot(s, at, player);
     } else if (op == CS_END) {
-        if(g_sceneBypassed){g_sceneBypassed=false;g_bypassWarpUntil=NowMs()+2000;return;}
+        if(g_sceneBypassed){g_sceneBypassed=false;return;}
         LOGI("Host cutscene ended (state %d, running %d)", g_csState, CutsceneRunning());
         if (g_csState == 2) PartnerEndCutscene();
         else if (g_csState == 1) g_csState = 3;
@@ -1878,6 +1890,7 @@ struct ScriptCamera {
     CVector pos, target;
     float fov = 70;
     uint8_t hud = 1, radar = 0;
+    uint16_t controls=0;
     uint64_t recv = 0;
     uint32_t time = 0;
     bool wide = false;
@@ -1902,7 +1915,12 @@ void StopScriptCamera() {
     Cmd(0x02EB).Run();  // RESTORE_CAMERA_JUMPCUT
     Cmd(0x04BB).I(me->AreaCode()).Run();
     Cmd(0x04D7).I(GetPedRef(me)).I(0).Run();
-    GetPad(0)->DisablePlayerControls = g_cameraControls;
+    // SET_PLAYER_CONTROL creates the native safe/camera bits while this shared
+    // camera is active. Do not restore those temporary bits from an earlier
+    // cutscene over the host's subsequent control-enable command.
+    auto sharedMask=(uint16_t)0xA1;
+    GetPad(0)->DisablePlayerControls = (g_cameraControls&~sharedMask)|
+        ((NowMs()-g_scriptCamera.recv<2000?g_scriptCamera.controls:0)&sharedMask);
     uint32_t* fields[] = {&me->Flags(), &me->PhysicalFlags(), &me->PedFlags(), &me->PedFlags2(), &me->PedFlags3(), &me->PedFlags4()};
     for (size_t i = 0; i < 6; ++i) *fields[i] = (*fields[i] & ~g_cameraMask[i]) | (g_cameraFlags[i] & g_cameraMask[i]);
     cam::Fov() = g_cameraFov;
@@ -1910,61 +1928,96 @@ void StopScriptCamera() {
     RestoreSceneHud();
 }
 struct StoryWarp {
-    bool pending=false;uint32_t sequence=0;uint64_t received=0;
-    CVector position;float heading=0;int8_t area=0;uint16_t vehicle=0;
+    bool pending=false,prepared=false;uint32_t sequence=0,phase=0;uint64_t received=0,run=0,loaded=0,warned=0;
+    CVector position;float heading=0;int8_t area=0;uint16_t vehicle=0;uint8_t flags=0;
+    std::vector<EntityRef>refs;
 }g_storyWarp;
 uint32_t g_storyWarpSequence=0,g_storyWarpLatest=0;
-void SendStoryWarp(CPlayerPed*cj){
-    if(!cj||!Net().IsHost()||!Replicating())return;
+uint64_t g_lastWarpSent=0,g_lastWarpRun=0;CVector g_lastWarpPosition;int8_t g_lastWarpArea=0;
+bool g_warpHolding=false,g_warpFrozen=false;uint16_t g_warpControls=0;
+void ReleaseStoryWarpHold(){
+    if(g_warpHolding&&core::IsPlayerReady()){
+        auto*me=FindPlayerPed(0);Cmd(0x04D7).I(GetPedRef(me)).I(g_warpFrozen).Run();
+        if(me->Health()>0&&!g_cameraApplied&&!CutsceneRunning()){
+            auto controls=g_warpControls;
+            if(!g_scriptCamera.active&&g_scriptCamera.recv&&NowMs()-g_scriptCamera.recv<2000)controls=(controls&~0xA1u)|(g_scriptCamera.controls&0xA1u);
+            GetPad(0)->DisablePlayerControls=controls;
+        }
+    }
+    g_warpHolding=false;SetLocalStoryTransitionPending(false);
+}
+void SendStoryWarp(CPlayerPed*cj,uint8_t target,bool advance){
+    if(!cj||!Net().IsHost()||!Replicating()||!StoryRunId())return;
+    auto p=StoryPosition(cj);auto now=NowMs();
+    if(target==255&&g_lastWarpRun==StoryRunId()&&g_lastWarpArea==cj->AreaCode()&&(p-g_lastWarpPosition).Length()<.25f&&now-g_lastWarpSent<250)return;
+    g_lastWarpSent=now;g_lastWarpRun=StoryRunId();g_lastWarpPosition=p;g_lastWarpArea=cj->AreaCode();
+    if(advance){AdvanceCooperativeStoryPhase(g_currentScript,"scripted relocation");PrepareCooperativeRelocation(cj->AreaCode(),p);}
     uint16_t vehicle=0;if(auto*v=cj->VehicleIfIn())if(auto*n=Vehicles::Instance().EnsureNetworked(v))vehicle=n->netId;
-    auto p=cj->GetPosition();Writer w(proto::G_STORY_WARP);w.U32(++g_storyWarpSequence);w.Vec({p.x,p.y,p.z});w.F32(cj->CurrentRotation());w.I8(cj->AreaCode());w.Entity(ENTITY_VEHICLE,vehicle);
+    uint8_t flags=0;if(cj->Intelligence()&&CallMethod<0x601110,void*>(cj->Intelligence()))flags|=1;
+    if(cj->IsInTheAir()&&cj->ActiveWeapon().type==46)flags|=2;
+    Writer w(proto::G_STORY_WARP);w.U64(StoryRunId());w.U32(CooperativeStoryPhase());w.U32(++g_storyWarpSequence);w.U8(target);
+    w.Vec({p.x,p.y,p.z});w.F32(cj->CurrentRotation());w.I8(cj->AreaCode());w.Entity(ENTITY_VEHICLE,vehicle);w.U8(flags);
     Net().Send(proto::CH_RELIABLE,w);
-    LOGI("Story group warp %u sent: %.1f %.1f %.1f area %d",g_storyWarpSequence,p.x,p.y,p.z,cj->AreaCode());
+    LOGI("Story group warp %u sent: %.1f %.1f %.1f area=%d phase=%u vehicle=%04X",g_storyWarpSequence,p.x,p.y,p.z,cj->AreaCode(),CooperativeStoryPhase(),vehicle);
 }
 void HandleStoryWarp(uint8_t from,Reader&r){
-    if(g_sceneBypassed||NowMs()<g_bypassWarpUntil)return;
-    StoryWarp next;next.sequence=r.U32();auto p=r.Vec();next.heading=r.F32();next.area=r.I8();next.vehicle=r.U16();
-    if(!r.Ok()||from!=Net().HostId()||Net().IsHost()||!next.sequence||(int32_t)(next.sequence-g_storyWarpLatest)<=0||
-       !std::isfinite(p.x)||!std::isfinite(p.y)||!std::isfinite(p.z)||!std::isfinite(next.heading))return;
-    g_storyWarpLatest=next.sequence;next.position={p.x,p.y,p.z};next.pending=true;next.received=NowMs();g_storyWarp=next;
+    StoryWarp next;next.run=r.U64();next.phase=r.U32();next.sequence=r.U32();auto target=r.U8();auto p=r.Vec();next.heading=r.F32();next.area=r.I8();next.vehicle=r.U16();next.flags=r.U8();
+    if(!r.Ok()||(target!=255&&target!=Net().MyId())||from!=Net().HostId()||Net().IsHost()||!next.run||next.run!=StoryRunId()||!next.phase||next.phase<CooperativeStoryPhase()||next.flags>3||!next.sequence||(int32_t)(next.sequence-g_storyWarpLatest)<=0||
+       !std::isfinite(p.x)||!std::isfinite(p.y)||!std::isfinite(p.z)||std::fabs(p.x)>20000||std::fabs(p.y)>20000||std::fabs(p.z)>5000||!std::isfinite(next.heading))return;
+    AdoptCooperativeStoryPhase(next.run,next.phase);
+    g_storyWarpLatest=next.sequence;next.position={p.x,p.y,p.z};next.pending=true;next.received=NowMs();next.refs=Net().EntityContext();g_storyWarp=std::move(next);SetLocalStoryTransitionPending(true);
 }
-CVector StoryWarpFootSpot(const StoryWarp&next,CPlayerPed*me){
+bool StoryWarpFootSpot(const StoryWarp&next,CPlayerPed*me,CVector&out){
+    if(next.flags){out=next.position+CVector{Net().MyId()==1?2.f:-2.f,0,0};return true;}
     float sign=Net().MyId()%2?-1.0f:1.0f;
     float offsets[][2]={{sign*.35f,-.8f},{-sign*.35f,-.8f},{sign*.7f,0},{0,-1.2f},{0,0}};
     if(next.vehicle){offsets[0][0]=sign*2.8f;offsets[0][1]=0;offsets[1][0]=-sign*2.8f;offsets[1][1]=0;offsets[2][0]=0;offsets[2][1]=-3.5f;}
-    // A fixed side offset can put a guest through a small interior's wall or
-    // onto its exit marker. Prefer a small spot behind CJ on actual loaded floor.
     for(auto&offset:offsets){
         auto p=next.position;float sn=std::sin(next.heading),cs=std::cos(next.heading);
         p.x+=cs*offset[0]-sn*offset[1];p.y+=sn*offset[0]+cs*offset[1];
-        bool found=false;CEntity*floor=nullptr;
-        float z=Call<0x5696C0,float>(p.x,p.y,p.z+.5f,&found,&floor);
-        if(!found||!std::isfinite(z)||std::fabs(z-(next.position.z-1))>1.5f)continue;
+        bool found=false;CEntity*floor=nullptr;float z=Call<0x5696C0,float>(p.x,p.y,p.z+.5f,&found,&floor);
+        // Recorded vehicle entries may start above the actual interior floor.
+        if(!found||!std::isfinite(z)||z>next.position.z+.5f||next.position.z-z>(next.vehicle?16.f:3.f))continue;
         p.z=z+1;
         if(Call<0x569E20,CEntity*>(p.x,p.y,p.z,.28f,(CEntity*)me,true,true,false,true,true,false))continue;
-        return p;
+        out=p;return true;
     }
-    return next.position; // the script selected this exact safe point for CJ
+    return false; // never release a guest over unloaded or missing floor
 }
 void ApplyStoryWarp(){
-    if(!g_storyWarp.pending||g_csState!=0||CutsceneRunning())return;
-    auto*me=FindPlayerPed(0);if(!me)return;auto next=g_storyWarp;
+    if(!g_storyWarp.pending)return;
+    if(g_storyWarp.run!=StoryRunId()||g_storyWarp.phase<CooperativeStoryPhase()||!Net().EntityContextValid(g_storyWarp.refs)){
+        LOGI("Obsolete story warp discarded seq=%u",g_storyWarp.sequence);g_storyWarp={};ReleaseStoryWarpHold();return;}
+    if(g_csState!=0||CutsceneRunning())return;
+    auto*me=FindPlayerPed(0);if(!me||me->Health()<=0)return;auto&next=g_storyWarp;
     auto*ownCar=me->VehicleIfIn();auto*networkCar=ownCar?Vehicles::Instance().Find(ownCar):nullptr;
     bool sameCar=next.vehicle&&networkCar&&networkCar->netId==next.vehicle;
-    if(sameCar&&(ownCar->GetPosition()-next.position).Length()>10&&NowMs()-next.received<1500)return;
-    auto p=next.position;
-    if(ownCar&&!sameCar){Vehicles::Instance().RememberUsed(ownCar);Cmd(0x0362).I(GetPedRef(me)).F(p.x).F(p.y).F(p.z-1).Run();}
-    if(!sameCar){
-        StopScriptCamera();g_localActivityUntil=0;g_localActivityScript=nullptr;
-        Cmd(0x0792).I(GetPedRef(me)).Run();Cmd(0x02EB).Run();Cmd(0x01B4).I(0).I(1).Run();Cmd(0x04D7).I(GetPedRef(me)).I(0).Run();
+    bool aircraft=LocalStoryRoleMode()==5&&ownCar&&(ownCar->VehicleSubClass()==VEHICLE_TYPE_PLANE||ownCar->VehicleSubClass()==VEHICLE_TYPE_HELI);
+    if(sameCar||aircraft){
+        if(ownCar->AreaCode()!=next.area||(ownCar->GetPosition()-next.position).Length()>(aircraft?80.f:10.f)||!LocalCooperativeRoleReady())return;
         Cmd(0x04BB).I(next.area).Run();Cmd(0x0860).I(GetPedRef(me)).I(next.area).Run();
-        Cmd(0x03CB).F(p.x).F(p.y).F(p.z).Run();
-        p=StoryWarpFootSpot(next,me);
-        Cmd(0x00A1).I(GetPedRef(me)).F(p.x).F(p.y).F(p.z-1).Run();
-        me->MoveSpeed()={};me->CurrentRotation()=me->AimingRotation()=next.heading;
-    }else{Cmd(0x04BB).I(next.area).Run();Cmd(0x0860).I(GetPedRef(me)).I(next.area).Run();Cmd(0x03CB).F(p.x).F(p.y).F(p.z).Run();}
-    g_storyWarp.pending=false;
-    LOGI("Story group warp %u applied: %.1f %.1f %.1f area %d",next.sequence,p.x,p.y,p.z,next.area);
+        next.pending=false;ReleaseStoryWarpHold();LOGI("Story warp %u vehicle ready",next.sequence);return;
+    }
+    if(!g_warpHolding){
+        g_warpControls=GetPad(0)->DisablePlayerControls;g_warpFrozen=(me->PhysicalFlags()&0x2000u)!=0;g_warpHolding=true;
+        if(ownCar){auto old=ownCar->GetPosition();Vehicles::Instance().RememberUsed(ownCar);Cmd(0x0362).I(GetPedRef(me)).F(old.x).F(old.y).F(old.z).Run();}
+    }
+    Cmd(0x04D7).I(GetPedRef(me)).I(1).Run();GetPad(0)->DisablePlayerControls=1;me->MoveSpeed()={};
+    if(!next.prepared||NowMs()-next.loaded>1500){
+        Cmd(0x04BB).I(next.area).Run();Cmd(0x0860).I(GetPedRef(me)).I(next.area).Run();
+        Cmd(0x04E4).F(next.position.x).F(next.position.y).Run();Cmd(0x03CB).F(next.position.x).F(next.position.y).F(next.position.z).Run();next.loaded=NowMs();next.prepared=true;
+    }
+    CVector p;if(!StoryWarpFootSpot(next,me,p)){
+        if(NowMs()-next.warned>3000){LOGI("Story warp blocked seq=%u phase=%u reason=floor area=%d target=%.1f,%.1f,%.1f",next.sequence,next.phase,next.area,next.position.x,next.position.y,next.position.z);next.warned=NowMs();}return;
+    }
+    if(next.flags&1){if(!IsModelLoaded(370)){RequestModel(370);return;}Cmd(0x07A7).I(GetPedRef(me)).Run();}
+    if(next.flags&2){if(!IsModelLoaded(371)){RequestModel(371);return;}Cmd(0x01B2).I(GetPedRef(me)).I(46).I(1).Run();Cmd(0x01B9).I(GetPedRef(me)).I(46).Run();}
+    StopScriptCamera();g_localActivityUntil=0;g_localActivityScript=nullptr;
+    if(!next.flags)Cmd(0x0792).I(GetPedRef(me)).Run();
+    Cmd(0x00A1).I(GetPedRef(me)).F(p.x).F(p.y).F(p.z-1).Run();
+    me->MoveSpeed()={};me->CurrentRotation()=me->AimingRotation()=next.heading;
+    next.pending=false;ReleaseStoryWarpHold();
+    LOGI("Story group warp %u applied: %.1f %.1f %.1f area=%d phase=%u",next.sequence,p.x,p.y,p.z,next.area,next.phase);
 }
 
 void HostSendScriptCamera() {
@@ -1976,7 +2029,7 @@ void HostSendScriptCamera() {
     if (!active && !g_cameraSent) return;
     if (active == g_cameraSent && NowMs() - g_cameraSentMs < 50) return;
     Writer w(proto::G_GAME_EVENT);
-    w.U8(4); w.U32((uint32_t)NowMs()); w.Bool(active);
+    w.U8(4); w.U32((uint32_t)NowMs()); w.Bool(active);w.U16(GetPad(0)->DisablePlayerControls);
     if (active) {
         const CVector& p = cam::Source();
         CVector t = p + cam::Front() * 100.0f;
@@ -1994,6 +2047,7 @@ void HandleGameEvent(uint8_t from, Reader& input) {
     ScriptCamera c;
     c.time = r.U32();
     c.active = r.Bool();
+    c.controls=r.U16();
     if (c.active) {
         c.area = r.I32();
         Vec3 p = r.Vec(), t = r.Vec();
@@ -2413,6 +2467,7 @@ void SendMissionState(){
 void MissionsResync(uint8_t player) {
     if(!Net().IsHost())return;
     ResyncCooperativeStory(player);
+    if(StoryRunId()&&core::IsPlayerReady()&&!CutsceneRunning())SendStoryWarp(FindPlayerPed(0),player,false);
     SendMissionState();
     if(g_waitSent)SendWait(true);
     if(!g_active&&!CutsceneRunning()&&Ref<int32_t>(kCutsceneLoadStatus)==0)return;
@@ -2593,10 +2648,10 @@ public:
 private:
     static void Reset() {
         g_contacts.clear();g_contactHistory.clear();g_contactCopies.clear();g_contactsSent=g_contactsApplied=0;
-        g_missionPayout=0;g_inheritedFlagMs=0;g_sceneBypassed=false;g_bypassWarpUntil=0;
+        g_missionPayout=0;g_inheritedFlagMs=0;g_sceneBypassed=false;
         g_missionRevision=g_partnerRevision=0;g_missionHeartbeat=0;g_recentMissionText.clear();
         g_pendingAudio.clear();for(auto&targets:g_audioTargets)targets.clear();
-        g_deadMissionPartner=-1;g_storyWarp={};g_storyWarpLatest=g_storyWarpSequence=0;
+        g_deadMissionPartner=-1;ReleaseStoryWarpHold();g_storyWarp={};g_storyWarpLatest=g_storyWarpSequence=0;g_lastWarpRun=g_lastWarpSent=0;
         for (auto& a : g_audioSlots) a = {};
         for (auto& token : g_hostAudioToken) token = 0;
         for (auto& event : g_hostAudio) event = -1;

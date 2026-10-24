@@ -1,3 +1,4 @@
+#include "shared/api/story-stage/StoryStage.h"
 #include <map>
 #include "shared/api/hit-evidence/HitEvidence.h"
 #include "shared/api/story-coop/StoryCoop.h"
@@ -39,14 +40,14 @@ bool __fastcall StealthProcess(void*task,void*edx,CPed*ped){
     auto birth=Net().EntityGeneration(ENTITY_PED,victim->netId);auto i=sent.find(task);
     if(i!=sent.end()&&i->second.handle==victim->handle&&i->second.generation==birth&&NowMs()-i->second.at<10000)return done;
     if(sent.size()>=64)sent.erase(sent.begin());sent[task]={victim->handle,birth,NowMs()};
-    Writer w(proto::G_STEALTH);w.U64(StoryRunId());w.U32(++sequence);w.Entity(ENTITY_PED,victim->netId);w.U8(victim->owner);WriteHitEvidence(w,target);Net().Send(proto::CH_RELIABLE,w);
+    Writer w(proto::G_STEALTH);w.U64(StoryRunId());w.U32(CooperativeStoryPhase());w.U32(++sequence);w.Entity(ENTITY_PED,victim->netId);w.U8(victim->owner);WriteHitEvidence(w,target);Net().Send(proto::CH_RELIABLE,w);
     LOGI("Native stealth action sent player=%u ped=%04X",Net().MyId(),victim->netId);return done;
 }
 class Stealth:public Module{const char*Name()const override{return "StoryStealth";}
  void OnInstallHooks()override{
     mem::HookFn(0x62E540,&StealthProcess,&original,"CTaskSimpleStealthKill::ProcessPed");
-    Net().SetHandler(proto::G_STEALTH,[](uint8_t from,Reader&r){auto run=r.U64();auto token=r.U32();auto id=r.U16();auto owner=r.U8();auto*ped=Peds::Instance().FindOwned(id);auto*rp=Players::Instance().Get(from);
-        if(!ReadHitEvidence(r,ped)||!r.Ok()||owner!=Net().MyId()||run!=StoryRunId()||from>=3||!token||!rp||!rp->ped||!rp->hasState||NowMs()-rp->stateRecvMs>1500||!ped||ped->Health()<=0||ped->InVehicle()||!seen[from].Accept(token))return;
+    Net().SetHandler(proto::G_STEALTH,[](uint8_t from,Reader&r){auto run=r.U64();auto phase=r.U32();auto token=r.U32();auto id=r.U16();auto owner=r.U8();auto*ped=Peds::Instance().FindOwned(id);auto*rp=Players::Instance().Get(from);
+        if(!ReadHitEvidence(r,ped)||!r.Ok()||owner!=Net().MyId()||run!=StoryRunId()||phase!=CooperativeStoryPhase()||from>=3||!token||!rp||!rp->ped||!rp->hasState||NowMs()-rp->stateRecvMs>1500||!ped||ped->Health()<=0||ped->InVehicle()||!seen[from].Accept(token))return;
         auto*attacker=rp->ped;auto delta=attacker->GetPosition()-ped->GetPosition();auto*matrix=ped->Matrix();bool fire=false;
         auto proof=ped->PhysicalFlags()&CPhysical::PF_INVULNERABLE;ped->PhysicalFlags()&=~CPhysical::PF_INVULNERABLE;bool damage=CallMethod<0x5448B0,bool>(ped,4,&fire);ped->PhysicalFlags()|=proof;
         if(!damage||!matrix||rp->state.weapon!=4||attacker->Health()<=0||rp->state.area!=AreaOf(ped)||delta.Length()>3.f||delta.Dot(matrix->forward)>.5f||!ped->Intelligence()||anim::FindTask(ped,kStealthTask))return;

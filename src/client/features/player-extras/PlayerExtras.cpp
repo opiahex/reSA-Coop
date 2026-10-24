@@ -14,6 +14,7 @@
 #include "shared/lib/memory/Memory.h"
 #include "entities/player/PlayerExtrasState.h"
 #include "shared/api/story-coop/StoryCoop.h"
+#include "shared/api/story-stage/StoryStage.h"
 
 namespace coop {
 namespace {
@@ -25,7 +26,7 @@ CObject* Held(CPed*ped){auto*t=anim::FindTask(ped,307);auto*o=t?Field<CObject*>(
 bool Attached(CObject*o,CPed*ped){return o&&o->AttachedTo()==ped;}
 struct RemoteExtras {PlayerExtrasState state;uint32_t time=0;uint64_t received=0;std::array<int,3> objects{-1,-1,-1};bool phone=false;int pedHandle=-1;};
 std::map<uint8_t,RemoteExtras> extras;
-struct Resume {OnFootState state;uint16_t vehicle=0;int8_t seat=-2;PlayerExtrasState extras;AnimationState action;uint64_t saved=0,run=0;};
+struct Resume {OnFootState state;uint16_t vehicle=0;int8_t seat=-2;PlayerExtrasState extras;AnimationState action;uint64_t saved=0,run=0;uint32_t phase=0;std::vector<EntityRef>refs;};
 std::map<std::string,Resume> remembered;
 std::map<uint8_t,Resume> rejoining;
 Resume pendingResume;uint64_t restoreAt=0;
@@ -88,11 +89,11 @@ public:
             auto&e=extras[from];if(e.received&&(int32_t)(time-e.time)<=0)return;
             e.state=std::move(state);e.time=time;e.received=NowMs();
         }else if(op==2){
-            uint8_t target=r.U8();Resume state;state.run=r.U64();
+            uint8_t target=r.U8();Resume state;state.run=r.U64();state.phase=r.U32();
             if(from!=Net().HostId()||target!=Net().MyId()||!state.state.Read(r))return;
             state.vehicle=r.U16();state.seat=r.I8();
             if(!state.extras.Read(r)||!state.action.Read(r)||state.seat< -2||state.seat>7)return;
-            pendingResume=std::move(state);restoreAt=NowMs()+750;
+            state.refs=Net().EntityContext();pendingResume=std::move(state);restoreAt=NowMs()+750;SetLocalStoryRecoveryPending(true);
             LOGI("Reconnect restore received: vehicle %04X seat %d",pendingResume.vehicle,pendingResume.seat);
         }
     });
@@ -106,28 +107,30 @@ public:
     lastSent=0;lastPacket.clear();
     if(!Net().IsHost())return;
     auto it=rejoining.find(id);if(it==rejoining.end())return;
-    auto&resume=it->second;Writer w(proto::G_PLAYER_EXTRAS);w.U8(2);w.U32((uint32_t)NowMs());w.U8(id);w.U64(resume.run);
+    auto&resume=it->second;Writer w(proto::G_PLAYER_EXTRAS);w.U8(2);w.U32((uint32_t)NowMs());w.U8(id);w.U64(resume.run);w.U32(resume.phase);
     resume.state.Write(w);w.Entity(ENTITY_VEHICLE,resume.vehicle);w.I8(resume.seat);resume.extras.Write(w);resume.action.Write(w);Net().Send(proto::CH_RELIABLE,w);
     rejoining.erase(it);remembered.erase(Net().PeerName(id));
     LOGI("Reconnect restore sent to player %u",id);
  }
  void OnPeerLeave(uint8_t id)override{auto it=extras.find(id);if(it!=extras.end()){DeleteProps(it->second);extras.erase(it);}rejoining.erase(id);}
- void OnSessionEnd()override{for(auto&[id,e]:extras)DeleteProps(e);extras.clear();remembered.clear();rejoining.clear();restoreAt=motionRestoreUntil=0;lastPacket.clear();lastSent=0;}
- void OnGameShutdown()override{for(auto&[id,e]:extras){e.objects={-1,-1,-1};e.phone=false;}if(Net().IsHost()){remembered.clear();rejoining.clear();}}
+ void OnSessionEnd()override{for(auto&[id,e]:extras)DeleteProps(e);extras.clear();remembered.clear();rejoining.clear();restoreAt=motionRestoreUntil=0;SetLocalStoryRecoveryPending(false);lastPacket.clear();lastSent=0;}
+ void OnGameShutdown()override{for(auto&[id,e]:extras){e.objects={-1,-1,-1};e.phone=false;}restoreAt=0;SetLocalStoryRecoveryPending(false);if(Net().IsHost()){remembered.clear();rejoining.clear();}}
  void OnPostProcess()override{
     if(!Net().Online()||!core::IsPlayerReady())return;
     auto now=NowMs();auto*me=FindPlayerPed(0);
     if(restoreAt&&now>=restoreAt&&flow::InHostWorld()&&!Ref<uint8_t>(0xB5F851)){
         auto&resume=pendingResume;if(resume.run&&StoryRunId()==0&&now<restoreAt+5000)return;
-        if(resume.run!=StoryRunId()||StoryRoleOwnsCamera()){restoreAt=0;LOGI("Obsolete reconnect action discarded run=%llu current=%llu",(unsigned long long)resume.run,(unsigned long long)StoryRunId());return;}auto*nv=Vehicles::Instance().Find(resume.vehicle);
-        bool wait=resume.vehicle&&!nv&&now<restoreAt+5000;
+        if(resume.run!=StoryRunId()||resume.phase!=CooperativeStoryPhase()||!Net().EntityContextValid(resume.refs)){restoreAt=0;SetLocalStoryRecoveryPending(false);LOGI("Obsolete reconnect action discarded run=%llu current=%llu",(unsigned long long)resume.run,(unsigned long long)StoryRunId());return;}if(!LocalStoryRecoveryReady())return;auto*nv=Vehicles::Instance().Find(resume.vehicle);
+        bool forced=LocalStoryRoleMode()>=2;
+        bool wait=resume.vehicle&&(!nv||!Vehicles::Alive(*nv))&&now<restoreAt+5000&&!forced;
+        if(!wait&&resume.vehicle&&(!nv||!Vehicles::Alive(*nv))&&!forced){restoreAt=0;SetLocalStoryRecoveryPending(false);LOGI("Reconnect restore cancelled: vehicle dependency removed");return;}
         if(!wait){
-            restoreAt=0;auto s=resume.state;auto p=s.pos;
+            restoreAt=0;if(forced)BeginCooperativeInventoryRestore();auto s=resume.state;auto p=s.pos;
             if(nv&&IsVehicleValid(nv->veh))p=nv->veh->GetPosition()+CVector{3,0,1};
             int area=nv&&IsVehicleValid(nv->veh)?nv->veh->AreaCode():s.area;
-            Cmd(0x04BB).I(area).Run();Cmd(0x0860).I(GetPedRef(me)).I(area).Run();Cmd(0x03CB).F(p.x).F(p.y).F(p.z).Run();
+            if(!forced){Cmd(0x04BB).I(area).Run();Cmd(0x0860).I(GetPedRef(me)).I(area).Run();Cmd(0x03CB).F(p.x).F(p.y).F(p.z).Run();
             Cmd(0x00A1).I(GetPedRef(me)).F(p.x).F(p.y).F(p.z-1).Run();me->Health()=s.health?s.health:100;me->Armour()=s.armour;
-            me->CurrentRotation()=me->AimingRotation()=s.rotation;
+            me->CurrentRotation()=me->AimingRotation()=s.rotation;}
             Cmd(0x048F).I(GetPedRef(me)).Run();
             for(int i=0;i<13;++i)if(resume.extras.weapons[i]){
                 int weapon=resume.extras.weapons[i];
@@ -136,13 +139,16 @@ public:
                 Cmd(0x01B2).I(GetPedRef(me)).I(weapon).I((int)resume.extras.ammo[i]).Run();
             }
             Cmd(0x01B9).I(GetPedRef(me)).I(s.weapon).Run();
-            if(nv&&IsVehicleValid(nv->veh)&&resume.seat>=-1){
+            if(!forced&&nv&&IsVehicleValid(nv->veh)&&resume.seat>=-1){
                 CPed*occupied=resume.seat<0?nv->veh->Driver():nv->veh->Passengers()[resume.seat];
                 if(!occupied||occupied==me){
                     if(resume.seat<0)Cmd(0x036A).I(GetPedRef(me)).I(nv->handle).Run();
                     else if(resume.seat<nv->veh->MaxPassengers())Cmd(0x0430).I(GetPedRef(me)).I(nv->handle).I(resume.seat).Run();
                 }
             }
+            if(forced)CompleteCooperativeInventoryRestore();
+            if(!forced&&(s.flags&OnFootState::F_JETPACK)&&LoadModelNow(370))Cmd(0x07A7).I(GetPedRef(me)).Run();
+            SetLocalStoryRecoveryPending(false);
             if(resume.extras.phone)Cmd(0x0729).I(GetPedRef(me)).I(1).Run();
             resumedMotion=s.motion;motionRestoreUntil=now+1500;
             if(!me->InVehicle()&&s.health&&s.motion.kind==MotionState::NORMAL){
@@ -168,7 +174,7 @@ public:
         }else motionRestoreUntil=0;
     }
     if(Net().IsHost())for(auto&[id,rp]:Players::Instance().All())if(rp.hasState&&now-rp.stateRecvMs<1500&&!rejoining.count(id)){
-        Resume value;value.run=StoryRunId();value.state=rp.state;value.vehicle=rp.mode==RemotePlayer::Mode::OnFoot?0:rp.vehNetId;value.seat=rp.mode==RemotePlayer::Mode::OnFoot?-2:rp.seat;
+        Resume value;value.run=StoryRunId();value.phase=CooperativeStoryPhase();value.state=rp.state;value.vehicle=rp.mode==RemotePlayer::Mode::OnFoot?0:rp.vehNetId;value.seat=rp.mode==RemotePlayer::Mode::OnFoot?-2:rp.seat;
         auto it=extras.find(id);if(it==extras.end()||!it->second.received)continue;
         value.extras=it->second.state;
         if(rp.ped)value.action=anim::Capture(anim::ActionAssociation(rp.ped));

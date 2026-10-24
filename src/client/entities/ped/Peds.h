@@ -93,6 +93,7 @@ struct NetPed {
     bool animFull = false;                      // it is not partial: locomotion tasks must wait
     bool extraFull=false,interactionAttached=false,interactionPending=false,pairedAction=false;
     AnimationState extraLayers[PedInteraction::LayerCount];
+    uint8_t handArm=255;uint16_t pairAnchor=0;game::CVector pairOffset;
     bool actionSentActive=false;
     uint32_t actionRevision=0,actionSignature=0,actionSentRevision=0;
     uintptr_t actionLeaf=0;float actionTime=0;

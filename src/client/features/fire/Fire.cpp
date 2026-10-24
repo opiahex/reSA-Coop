@@ -18,6 +18,7 @@
 #include "entities/vehicle/Vehicles.h"
 #include "shared/api/net-session/Session.h"
 #include "shared/game/Game.h"
+#include "shared/game/Transform.h"
 #include "shared/lib/core/Core.h"
 #include "shared/lib/sync/EventWindow.h"
 #include "shared/lib/memory/Memory.h"
@@ -74,7 +75,7 @@ bool IsCopy(uintptr_t f) {
 bool PlayerFighting(const CVector& at) {
     CPlayerPed* me = FindPlayerPed(0);
     if (!me || (me->GetPosition() - at).Length() > 30.0f) return false;
-    if (me->InVehicle()) return me->Vehicle() && me->Vehicle()->ModelIndex() == 407;  // FIRETRUK
+    if (me->InVehicle()) return me->Vehicle() && (me->Vehicle()->ModelIndex() == 407||me->Vehicle()->ModelIndex()==601);  // FIRETRUK
     return me->ActiveWeapon().type == 42;
 }
 
@@ -508,43 +509,59 @@ void RetryCombat(){
 // A fire truck's or a SWAT van's water jet (CWaterCannons::UpdateOne each frame it shoots) shoots from the other game's
 // copy of the vehicle too, and puts out and knocks down there what it reaches.
 struct Jet {
-    CVector offset, speed;  // where it leaves the vehicle, how fast
-    uint64_t ms;
+    CVector offset,speed;uint64_t ms=0,generation=0;uint32_t sequence=0;uint8_t owner=255;bool active=false;
 };
-std::map<uint16_t, Jet> g_jets;          // the other game's, by vehicle
-std::map<uint16_t, uint64_t> g_jetSent;  // ours: when each was sent
-
-using WaterCannonFn = void(__cdecl*)(uint32_t, CVector*, CVector*);
-WaterCannonFn g_origWaterCannon = nullptr;
-void __cdecl HookWaterCannon(uint32_t vehicle, CVector* start, CVector* speed) {
-    g_origWaterCannon(vehicle, start, speed);
-    if (!Net().Online() || !core::IsPlayerReady()) return;
-    NetVehicle* nv = Vehicles::Instance().Find((CVehicle*)(uintptr_t)vehicle);
-    if (!nv || Vehicles::Instance().IsMirror(*nv) || !IsVehicleValid(nv->veh) || NowMs() - g_jetSent[nv->netId] < 66) return;
-    g_jetSent[nv->netId] = NowMs();
-    CVector at = *start - nv->veh->GetPosition();
-    Writer w(proto::G_WATER_CANNON);
-    w.Entity(ENTITY_VEHICLE,nv->netId);
-    w.Vec({at.x, at.y, at.z});
-    w.Vec({speed->x, speed->y, speed->z});
-    Net().Send(proto::CH_STATE, w);
+struct SentJet {uint64_t input=0,sent=0,generation=0;CVector offset,speed;bool active=false;};
+std::map<uint16_t,Jet>g_jets;std::map<uint16_t,SentJet>g_jetSent;uint32_t g_jetSequence=0;
+using WaterCannonFn=void(__cdecl*)(uint32_t,CVector*,CVector*);
+WaterCannonFn g_origWaterCannon=nullptr;
+using PushWaterFn=void(__fastcall*)(void*,void*);PushWaterFn g_origPushWater=nullptr;
+void __fastcall PushWater(void*cannon,void*edx){
+    if(!Net().Online()){g_origPushWater(cannon,edx);return;}
+    // Native PushPeds applies force even when the damage event is rejected.
+    // Its existing exclusion bit suppresses physics on replicas, while each
+    // participant and NPC authority still receives the same real water impact.
+    std::vector<std::pair<CPed*,bool>> held;
+    auto hold=[&](CPed*p){if(p&&IsPedValid(p)){held.push_back({p,(p->PhysicalFlags()&1u)!=0});p->PhysicalFlags()|=1u;}};
+    for(auto&[id,rp]:Players::Instance().All())hold(rp.ped);
+    for(auto&[id,np]:Peds::Instance().All())if(np.owner!=Net().MyId())hold(np.ped);
+    g_origPushWater(cannon,edx);
+    for(auto&[p,was]:held)if(IsPedValid(p))p->PhysicalFlags()=(p->PhysicalFlags()&~1u)|(was?1u:0u);
 }
-
-void ShootJets() {
-    for (auto it = g_jets.begin(); it != g_jets.end();) {
-        NetVehicle* nv = Vehicles::Instance().Find(it->first);
-        if (NowMs() - it->second.ms > 200 || !nv || !IsVehicleValid(nv->veh)) {  // it stopped shooting
-            it = g_jets.erase(it);
-            continue;
-        }
-        CVector start = nv->veh->GetPosition() + it->second.offset, speed = it->second.speed;
-        g_origWaterCannon((uint32_t)(uintptr_t)nv->veh, &start, &speed);
-        ++it;
+CVector CannonLocal(const CMatrix&m,const CVector&v){return {Dot(v,m.right),Dot(v,m.forward),Dot(v,m.up)};}
+CVector CannonWorld(const CMatrix&m,const CVector&v){return m.right*v.x+m.forward*v.y+m.up*v.z;}
+void SendJet(uint16_t id,SentJet&jet,bool active,bool reliable){
+    Writer w(proto::G_WATER_CANNON);w.Entity(ENTITY_VEHICLE,id);w.U32(++g_jetSequence);w.Bool(active);
+    if(active){w.Vec({jet.offset.x,jet.offset.y,jet.offset.z});w.Vec({jet.speed.x,jet.speed.y,jet.speed.z});}
+    Net().Send(reliable?proto::CH_RELIABLE:proto::CH_STATE,w);jet.sent=NowMs();jet.active=active;
+    if(reliable)LOGD("Water cannon edge sent vehicle=%04X on=%d seq=%u",id,active,g_jetSequence);
+}
+void __cdecl HookWaterCannon(uint32_t vehicle,CVector*start,CVector*speed){
+    auto*car=(CVehicle*)(uintptr_t)vehicle;
+    auto*known=Net().Online()&&IsVehicleValid(car)?Vehicles::Instance().Find(car):nullptr;
+    if(known&&Vehicles::Instance().IsMirror(*known))return; // replicas replay only the owner's nozzle
+    g_origWaterCannon(vehicle,start,speed);
+    if(!Net().Online()||!core::IsPlayerReady()||!start||!speed||!IsVehicleValid(car)||!car->Matrix())return;
+    auto*n=Vehicles::Instance().EnsureNetworked(car);if(!n||Vehicles::Instance().IsMirror(*n))return;
+    auto&jet=g_jetSent[n->netId];auto generation=Net().EntityGeneration(ENTITY_VEHICLE,n->netId);if(jet.generation!=generation)jet={};
+    jet.generation=generation;jet.input=NowMs();jet.offset=CannonLocal(*car->Matrix(),*start-car->GetPosition());jet.speed=CannonLocal(*car->Matrix(),*speed-car->MoveSpeed());
+    if(!jet.active||NowMs()-jet.sent>=50)SendJet(n->netId,jet,true,!jet.active);
+}
+void ShootJets(){
+    for(auto i=g_jetSent.begin();i!=g_jetSent.end();){auto*n=Vehicles::Instance().Find(i->first);auto&j=i->second;
+        if(!n||!Vehicles::Alive(*n)||Vehicles::Instance().IsMirror(*n)||Net().EntityGeneration(ENTITY_VEHICLE,i->first)!=j.generation){i=g_jetSent.erase(i);continue;}
+        if(j.active&&NowMs()-j.input>100)SendJet(i->first,j,false,true);++i;}
+    for(auto i=g_jets.begin();i!=g_jets.end();){auto*n=Vehicles::Instance().Find(i->first);auto&j=i->second;
+        if(NowMs()-j.ms>750||!n||!Vehicles::Alive(*n)||n->owner!=j.owner||!Vehicles::Instance().IsMirror(*n)||Net().EntityGeneration(ENTITY_VEHICLE,i->first)!=j.generation){i=g_jets.erase(i);continue;}
+        if(j.active&&n->veh->Matrix()&&(n->veh->AreaCode()==FindPlayerPed(0)->AreaCode()||n->veh->AreaCode()==13)){
+            auto start=n->veh->GetPosition()+CannonWorld(*n->veh->Matrix(),j.offset);auto speed=CannonWorld(*n->veh->Matrix(),j.speed)+n->veh->MoveSpeed();
+            g_origWaterCannon((uint32_t)(uintptr_t)n->veh,&start,&speed);
+        }++i;
     }
 }
 
 class Fires : public Module {
-    void OnEntityReplaced(uint8_t kind,uint8_t,uint16_t id)override{if(kind!=ENTITY_FIRE)return;g_pendingFires.erase(id);PutOut(id);}
+    void OnEntityReplaced(uint8_t kind,uint8_t,uint16_t id)override{if(kind==ENTITY_VEHICLE){g_jets.erase(id);g_jetSent.erase(id);return;}if(kind!=ENTITY_FIRE)return;g_pendingFires.erase(id);PutOut(id);}
 
 public:
     const char* Name() const override { return "Fires"; }
@@ -571,14 +588,16 @@ public:
         mem::HookFn(0x737C80, &HookAddProjectile, &g_origAddProjectile, "CProjectileInfo::AddProjectile");
         Net().SetHandler(proto::G_PROJECTILE, &HandleProjectile);
         mem::HookFn(0x728CB0, &HookWaterCannon, &g_origWaterCannon, "CWaterCannons::UpdateOne");
+        mem::HookFn(0x7295E0, &PushWater, &g_origPushWater, "CWaterCannon::PushPeds authority");
         Net().SetHandler(proto::G_WATER_CANNON, [](uint8_t from, Reader& r) {
-            uint16_t id = r.U16();
-            Vec3 at = r.Vec(), v = r.Vec();
-            if (!r.Ok() || !core::IsPlayerReady()) return;
-            auto*nv=Vehicles::Instance().Find(id);
-            if(!nv||!Vehicles::Alive(*nv)||nv->owner!=from||CVector{at.x,at.y,at.z}.Length()>20||CVector{v.x,v.y,v.z}.Length()>100)return;
-            if (!g_jets.count(id)) LOGD("Water cannon of vehicle %04X shoots here", id);
-            g_jets[id] = {{at.x, at.y, at.z}, {v.x, v.y, v.z}, NowMs()};
+            auto id=r.U16();auto sequence=r.U32();bool active=r.Bool();Vec3 at{},v{};if(active){at=r.Vec();v=r.Vec();}
+            if(!r.Ok()||!sequence||!core::IsPlayerReady())return;auto*n=Vehicles::Instance().Find(id);
+            auto finite=[](Vec3 p){return std::isfinite(p.x)&&std::isfinite(p.y)&&std::isfinite(p.z);};
+            if(!n||!Vehicles::Alive(*n)||n->owner!=from||!Vehicles::Instance().IsMirror(*n)||!finite(at)||!finite(v)||CVector{at.x,at.y,at.z}.Length()>20||CVector{v.x,v.y,v.z}.Length()>10)return;
+            auto generation=Net().EntityGeneration(ENTITY_VEHICLE,id);auto&j=g_jets[id];
+            if(j.generation==generation&&j.owner==from&&j.sequence&&(int32_t)(sequence-j.sequence)<=0)return;
+            bool edge=j.active!=active||!j.ms;j={{at.x,at.y,at.z},{v.x,v.y,v.z},NowMs(),generation,sequence,from,active};
+            if(edge)LOGD("Water cannon edge received vehicle=%04X owner=%u on=%d seq=%u",id,from,active,sequence);
         });
         Net().SetHandler(proto::G_FIRE, [](uint8_t from, Reader& r) {
             uint8_t op = r.U8();
@@ -691,7 +710,7 @@ private:
         g_sent.clear();
         g_copies.clear();g_pendingFires.clear();
         g_jets.clear();
-        g_jetSent.clear();
+        g_jetSent.clear();g_jetSequence=0;
     }
 };
 

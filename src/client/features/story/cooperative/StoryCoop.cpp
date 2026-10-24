@@ -108,7 +108,7 @@ void DeclineLocalRole(){
 bool DeclinedSource(uint8_t id,uint16_t source,uint64_t generation,uint16_t object=0){auto&d=declined[id];return (d.source||d.object)&&d.source==source&&d.generation==generation&&d.object==object;}
 void Snapshot(){
     if(!Net().IsHost()||!run)return;
-    Writer w(proto::G_STORY_COOP);w.U8(SNAPSHOT);w.U64(run);w.U32(++snapshotRevision);w.Bool(active);w.Str(missionName,16);w.Bool(mandatoryCamera);
+    Writer w(proto::G_STORY_COOP);w.U8(SNAPSHOT);w.U64(run);w.U32(++snapshotRevision);w.U32(CooperativeStoryPhase());w.Bool(active);w.Str(missionName,16);w.Bool(mandatoryCamera);
     for(auto&r:roles){w.U8(r.mode);w.U32(r.assignment);w.Entity(ENTITY_VEHICLE,r.vehicle);w.Entity(ENTITY_VEHICLE,r.source);w.Entity(ENTITY_PED,r.driver);w.Bool(r.combat);w.Entity(ENTITY_OBJECT,r.object);w.Vec({r.offset.x,r.offset.y,r.offset.z});w.U16(r.angle);w.F32(r.range);w.U8((uint8_t)r.weapon);}
     w.U8((uint8_t)allySeats.size());for(auto&[id,a]:allySeats){w.Entity(ENTITY_PED,a.ped);w.Entity(ENTITY_VEHICLE,a.vehicle);w.I8(a.seat);}
     Net().Send(proto::CH_RELIABLE,w);lastSnapshot=NowMs();
@@ -155,18 +155,31 @@ void UpdateEnemies(){
 bool SpawnPoint(CVehicle*source,uint8_t player,CVector&point){
     if(!source->Matrix())return false;const bool air=source->VehicleSubClass()==VEHICLE_TYPE_PLANE||source->VehicleSubClass()==VEHICLE_TYPE_HELI;
     for(int attempt=0;attempt<8;++attempt){auto*m=source->Matrix();float side=((player+attempt)&1)?1.f:-1.f;
-        auto p=m->pos+m->right*(side*(5.f+(attempt/2)*3.f))-m->forward*(4.f+player*3.f);
-        if(air){p=m->pos+m->right*(side*(18.f+(attempt/2)*12.f))-m->forward*(20.f+player*12.f);if(source->GetPosition().z>30.f)p.z+=3.f;}else{bool ground=false;p.z=Call<0x5696C0,float>(p.x,p.y,p.z+8.f,&ground,(CEntity**)nullptr)+.7f;if(!ground)continue;}
+        CVector right{m->right.x,m->right.y,0},forward{m->forward.x,m->forward.y,0};
+        float rl=right.Length(),fl=forward.Length();if(rl<.1f||fl<.1f)return false;right=right*(1.f/rl);forward=forward*(1.f/fl);
+        auto p=m->pos+right*(side*(5.f+(attempt/2)*3.f))-forward*(4.f+player*3.f);
+        if(air){p=m->pos+right*(side*(24.f+(attempt/2)*14.f))-forward*(25.f+player*14.f);
+            // N.O.E.'s aircraft starts by the hangars. The usable apron is in
+            // front of it; putting guests behind it places planes by the wall.
+            if(!_stricmp(missionName.c_str(),"DESERT6")&&source->ModelIndex()==476)
+                p=m->pos+forward*(50.f+(attempt/2)*12.f)+right*(side*(18.f+(attempt/2)*12.f));
+            bool atSource=false;float sourceFloor=Call<0x5696C0,float>(m->pos.x,m->pos.y,m->pos.z+3.f,&atSource,(CEntity**)nullptr);
+            if(atSource&&m->pos.z-sourceFloor<5.f&&std::fabs(source->MoveSpeed().z)<.08f){
+                bool ground=false;float floor=Call<0x5696C0,float>(p.x,p.y,p.z+5.f,&ground,(CEntity**)nullptr);
+                if(!ground||std::fabs(floor-sourceFloor)>2.f)continue;p.z=floor+std::max(.8f,m->pos.z-sourceFloor);
+            }else p.z+=3.f;
+        }else{bool ground=false;p.z=Call<0x5696C0,float>(p.x,p.y,p.z+8.f,&ground,(CEntity**)nullptr)+.7f;if(!ground)continue;}
         bool blocked=false;auto*pool=VehiclePool();for(int i=0;pool&&i<pool->size;++i)if(pool->byteMap[i]>=0){auto*v=(CVehicle*)(pool->objects+(size_t)i*kVehiclePoolElemSize);if((v->GetPosition()-p).Length()<(air?15.f:4.f)){blocked=true;break;}}
         if(!blocked){point=p;return true;}}
     return false;
 }
 bool CreateRole(CVehicle*source,uint8_t player,uint8_t mode){
     const bool gunner=mode==2;
-    auto*src=Vehicles::Instance().EnsureNetworked(source);if(!src)return false;CVector p;if(!SpawnPoint(source,player,p))return false;
+    auto*src=Vehicles::Instance().EnsureNetworked(source);if(!src)return false;CVector p;if(!SpawnPoint(source,player,p)){
+        static uint64_t reported=0;if(NowMs()-reported>3000){reported=NowMs();LOGI("Story vehicle offer waiting player=%u source=%04X reason=clear-spawn-point",player,src->netId);}return false;}
     auto previousComponents=Ref<uint16_t>(0x8A6458);for(int i=0;i<2;++i)Ref<int8_t>(0x8A6458+i)=Field<int8_t>(source,0x438+i);
     int h=-1;Cmd(0x00A5).I(source->ModelIndex()).F(p.x).F(p.y).F(p.z).Out(&h).Run();Ref<uint16_t>(0x8A6458)=previousComponents;auto*car=GetVehicle(h);if(!car)return false;
-    Cmd(0x0175).I(h).F(source->GetHeading()*57.29578f).Run();
+    Cmd(0x0175).I(h).F(mode==1&&!_stricmp(missionName.c_str(),"DESERT6")&&source->ModelIndex()==476?90.f:source->GetHeading()*57.29578f).Run();
     memcpy((uint8_t*)car+0x434,(uint8_t*)source+0x434,4);car->DoorLock()=0;car->Health()=1000;car->SetEngineOn(true);
     car->SetStreamingDontDelete(true);auto*n=Vehicles::Instance().EnsureNetworked(car);if(!n){Cmd(0x00A6).I(h).Run();return false;}
     Vehicles::Instance().CloneAppearance(source,car);
@@ -217,7 +230,13 @@ void HostRoles(bool preparing=false){
     for(uint8_t id=0;id<3;++id)if(roles[id].mode&&roles[id].mode!=4){auto&r=roles[id];auto*n=Vehicles::Instance().Find(r.vehicle);
         bool broken=!n||!Vehicles::Alive(*n)||n->veh->Health()<=0||Net().EntityGeneration(ENTITY_VEHICLE,r.vehicle)!=r.generation;
         if(r.mode==2){auto*d=GetPed(Peds::Instance().HandleOf(r.driver));broken|=!d||d->Health()<=0;}
-        if(broken&&NowMs()>=repairAt[id]){auto old=r;RetireRole(r,true);repairAt[id]=NowMs()+3000;
+        if(broken&&NowMs()>=repairAt[id]){
+            auto*source=Vehicles::Instance().Find(r.source);
+            bool recover=source&&Vehicles::Alive(*source)&&source->veh->Health()>0&&source->veh->AreaCode()==me->AreaCode()&&
+                Net().EntityGeneration(ENTITY_VEHICLE,r.source)==r.sourceGeneration&&me->Health()>0&&Ref<int8_t>(0xA444B0)==0;
+            if(!recover){auto old=r;RetireRole(r,true);declined[id]={old.source,old.object,old.sourceGeneration};Snapshot();LOGI("Story role recovery cancelled player=%u: source/stage ended",id);continue;}
+            if(mandatoryCamera)continue;
+            auto old=r;RetireRole(r,true);repairAt[id]=NowMs()+3000;
             if(++repairCount[id]>3)declined[id]={old.source,old.object,old.sourceGeneration};Snapshot();LOGI("Story role recovery player=%u attempt=%u",id,repairCount[id]);}}
     if(me->AttachedTo()&&me->AttachedTo()->Matrix()&&!me->InVehicle()){
         auto*parent=me->AttachedTo();uint16_t vehicle=0,object=0;
@@ -262,8 +281,15 @@ void HostRoles(bool preparing=false){
         if(trail.empty()||(trail.back().position-t.position).Length()>.08f)trail.push_back(t);if(trail.empty())trail.push_back(t);while(trail.size()>512)trail.pop_front();
     }
     auto key=std::make_pair(src->netId,Net().EntityGeneration(ENTITY_VEHICLE,src->netId));
+    bool onGround=false;float ground=Call<0x5696C0,float>(car->GetPosition().x,car->GetPosition().y,car->GetPosition().z+3.f,&onGround,(CEntity**)nullptr);
+    bool airborne=air&&(!onGround||car->GetPosition().z-ground>5.f||std::fabs(car->MoveSpeed().z)>.08f);
+    // N.O.E. gives CJ a single-seat Rustler on the airstrip. Guests choose
+    // their parked aircraft; first boarding a mission plane in mid-air must
+    // not create new airborne N.O.E. copies or force guests into a cockpit.
+    bool optionalAircraft=air&&!_stricmp(missionName.c_str(),"DESERT6")&&car->ModelIndex()==476;
+    if(optionalAircraft&&airborne)return;
     for(uint8_t id=0;id<3;++id)if(id!=Net().MyId()&&Participant(id)){
-        if(!roles[id].mode&&NowMs()>=repairAt[id]&&!DeclinedSource(id,src->netId,key.second)&&!allocated.count(key)){if(CreateRole(car,id,gunner?2:air?5:1)&&preparing&&gunner&&!shooting){roles[id].combat=false;Snapshot();}}
+        if(!roles[id].mode&&NowMs()>=repairAt[id]&&!DeclinedSource(id,src->netId,key.second)&&!allocated.count(key)){if(CreateRole(car,id,gunner?2:air?(optionalAircraft?1:5):1)&&preparing&&gunner&&!shooting){roles[id].combat=false;Snapshot();}}
         if(gunner&&roles[id].mode==2&&roles[id].source==src->netId&&!trail.empty())MoveRoleBike(roles[id],car);
     }
     bool all=true;for(auto&[id,p]:Net().Peers())if(id!=Net().MyId()&&!roles[id].mode)all=false;if(all)allocated.insert(key);
@@ -321,7 +347,7 @@ class CooperativeStory:public Module{
     if(from!=Net().HostId()||Net().IsHost()||!token)return;
     if(op==REWARD){auto target=r.U8();auto money=r.I32();if(!r.Ok()||target!=Net().MyId()||money<=0||money>10000000)return;
         if(pendingCredits.size()<64&&!std::any_of(pendingCredits.begin(),pendingCredits.end(),[&](auto&c){return c.token==token;}))pendingCredits.push_back({token,money});return;}
-    if(op!=SNAPSHOT)return;auto revision=r.U32();bool nextActive=r.Bool();auto name=r.Str(16);bool nextCamera=r.Bool();std::array<Role,3> incoming;
+    if(op!=SNAPSHOT)return;auto revision=r.U32();auto nextPhase=r.U32();bool nextActive=r.Bool();auto name=r.Str(16);bool nextCamera=r.Bool();std::array<Role,3> incoming;
     for(uint8_t id=0;id<3;++id){auto&v=incoming[id];v.player=id;v.mode=r.U8();v.assignment=r.U32();v.vehicle=r.U16();v.source=r.U16();v.driver=r.U16();v.combat=r.Bool();v.generation=Net().ExpectedEntityGeneration(ENTITY_VEHICLE,v.vehicle);v.sourceGeneration=Net().ExpectedEntityGeneration(ENTITY_VEHICLE,v.source);v.object=r.U16();v.objectGeneration=Net().ExpectedEntityGeneration(ENTITY_OBJECT,v.object);v.driverGeneration=Net().ExpectedEntityGeneration(ENTITY_PED,v.driver);auto offset=r.Vec();v.offset={offset.x,offset.y,offset.z};v.angle=r.U16();v.range=r.F32();v.weapon=r.U8();if(v.mode>5||v.weapon>46||!std::isfinite(v.range)||v.offset.Length()>100)return;}
     std::map<uint16_t,AllySeat>incomingSeats;auto seats=r.U8();if(seats>32)return;for(int i=0;i<seats;++i){AllySeat a;a.ped=r.U16();a.vehicle=r.U16();a.seat=r.I8();a.pedGeneration=Net().ExpectedEntityGeneration(ENTITY_PED,a.ped);a.vehicleGeneration=Net().ExpectedEntityGeneration(ENTITY_VEHICLE,a.vehicle);a.until=NowMs()+6000;if(a.seat<0||a.seat>7)return;incomingSeats[a.ped]=a;}
     if(!r.Ok()||(receivedRun==token&&receivedRevision&&(int32_t)(revision-receivedRevision)<=0))return;
@@ -332,7 +358,7 @@ class CooperativeStory:public Module{
     if(run!=token||!nextActive){ReleaseLocalRole();for(auto&b:roleBlips){if(b>=0&&core::IsPlayerReady())Cmd(0x0164).I(b).Run();b=-1;}if(active)ReleaseStoryCargo();}
     if(nextActive&&!nextCamera&&Net().MyId()<3&&incoming[Net().MyId()].mode>0&&incoming[Net().MyId()].combat){
         ReleaseStoryScriptCamera();if(roles[Net().MyId()].mode==2&&!roles[Net().MyId()].combat&&localRoleRun)Cmd(0x01B4).I(0).I(1).Run();}
-    receivedRun=run=token;receivedRevision=revision;active=nextActive;missionName=name;roles=incoming;mandatoryCamera=nextCamera;allySeats=std::move(incomingSeats);
+    receivedRun=run=token;receivedRevision=revision;active=nextActive;missionName=name;roles=incoming;mandatoryCamera=nextCamera;allySeats=std::move(incomingSeats);AdoptCooperativeStoryPhase(token,nextPhase);
     LOGD("Story role snapshot run=%llu revision=%u active=%d",(unsigned long long)run,revision,active);
  });}
  void OnSessionStart()override{LoadOutbox();}
@@ -353,9 +379,16 @@ class CooperativeStory:public Module{
 } feature;
 struct Register{Register(){core::RegisterModule(&feature);}} registration;
 }
+void BeginCooperativeInventoryRestore(){if(!Net().IsHost())ReleaseLocalRole();}
+void CompleteCooperativeInventoryRestore(){if(!Net().IsHost())LocalRole();}
 void PrepareCooperativeStoryStage(){if(Net().IsHost()&&active)HostRoles(true);}
+void PrepareCooperativeRelocation(int8_t area,const CVector&position){
+    if(!Net().IsHost()||!active)return;
+    bool old=false;for(auto&r:roles)if(r.mode){auto*n=Vehicles::Instance().Find(r.vehicle);old|=!n||!Vehicles::Alive(*n)||n->veh->AreaCode()!=area||(n->veh->GetPosition()-position).Length()>100;}
+    if(old){RetireRoles(true);allocated.clear();Snapshot();LOGI("Story roles released at scripted relocation phase=%u",CooperativeStoryPhase());}
+}
 uint64_t StoryRunId(){return active?run:0;}
-void BeginCooperativeStory(const std::string&name){if(!Net().IsHost())return;RetireRoles(true);declined={};repairAt={};repairCount={};enemies.clear();allies.clear();groups.clear();memberGroups.clear();allySeats.clear();releasedAllies.clear();mandatoryCamera=false;allocated.clear();plannedGunner=0;plannedGunnerUntil=0;
+void BeginCooperativeStory(const std::string&name){if(!Net().IsHost())return;ResetCooperativeStages();RetireRoles(true);declined={};repairAt={};repairCount={};enemies.clear();allies.clear();groups.clear();memberGroups.clear();allySeats.clear();releasedAllies.clear();mandatoryCamera=false;allocated.clear();plannedGunner=0;plannedGunnerUntil=0;
     run=std::max(run+1,(uint64_t(GetTickCount64())<<20)|((uint64_t(GetCurrentProcessId())&0xFFF)<<8)|(++runCounter&0xFF));
     active=true;passed=false;missionName=name;started=NowMs();snapshotRevision=0;Snapshot();LOGI("Story run begin %llu %s",(unsigned long long)run,name.c_str());}
 void UpdateCooperativeStoryName(const std::string&name){if(Net().IsHost()&&active&&!name.empty()&&missionName!=name){missionName=name;Snapshot();}}
@@ -363,7 +396,7 @@ void MarkCooperativeStoryPassed(){if(Net().IsHost()&&active)passed=true;}
 void EndCooperativeStory(int32_t reward){if(!Net().IsHost()||!active)return;
     if(passed&&reward>0&&reward<=10000000)for(auto&[id,p]:Net().Peers())if(id!=Net().MyId()){
         if(outbox.size()>=64){LOGW("Story reward outbox full; retaining unpaid records");break;}outbox.push_back({run,reward,p.name});SaveOutbox();SendCredit(outbox.back(),id);}
-    ReleaseStoryCargo();RetireRoles(true);active=false;enemies.clear();allies.clear();groups.clear();memberGroups.clear();allySeats.clear();releasedAllies.clear();mandatoryCamera=false;Snapshot();LOGI("Story run end %llu passed=%d reward=%d",(unsigned long long)run,passed,passed?reward:0);}
+    ReleaseStoryCargo();RetireRoles(true);active=false;enemies.clear();allies.clear();groups.clear();memberGroups.clear();allySeats.clear();releasedAllies.clear();mandatoryCamera=false;Snapshot();LOGI("Story run end %llu passed=%d reward=%d",(unsigned long long)run,passed,passed?reward:0);ResetCooperativeStages();}
 void ResyncCooperativeStory(uint8_t player){if(!Net().IsHost())return;Snapshot();for(auto&c:outbox)if(c.name==Net().PeerName(player))SendCredit(c,player);}
 bool LocalCooperativeRoleReady(){if(!active||Net().IsHost()||Net().MyId()>=3)return true;auto&r=roles[Net().MyId()];if(r.mode==0||r.mode==1||r.assignment==declinedAssignment)return true;if(r.mode==3)return localRoleRun==run&&localMode==3&&Cmd(0x0241).I(0).Run();if(r.mode==4)return localRoleRun==run&&localMode==4&&FindPlayerPed(0)->AttachedTo();auto*n=Vehicles::Instance().Find(r.vehicle);auto*me=FindPlayerPed(0);return n&&Vehicles::Alive(*n)&&me&&me->InVehicle()&&me->Vehicle()==n->veh;}
 bool StoryRoleOwnsCamera(){return active&&!Net().IsHost()&&Net().MyId()<3&&roles[Net().MyId()].mode>0&&!mandatoryCamera&&roles[Net().MyId()].combat;}

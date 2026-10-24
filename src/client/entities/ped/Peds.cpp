@@ -117,6 +117,27 @@ void* FindTask(CPed* ped, int type) {
 // The action animation the ped plays: anything but its own walk/run/idle set (CPed::m_nAnimGroup).
 // Full-body animations while moving are turns and start/stop steps, also locomotion. A partial one (a punch, a guard)
 // plays over a full-body one (the fight stance) and is the action while it lasts: the mirror keeps the stance under it.
+struct HandContact{int handle=-1,target=-1;uint64_t at=0;uint8_t arm=255;int16_t bone=0;CVector offset;float speed=.25f;int blend=250;};
+std::map<uint16_t,HandContact>handContacts;
+void* CoupleTask(CPed*ped){
+    if(!ped||!ped->Intelligence())return nullptr;
+    auto*manager=(uint8_t*)ped->Intelligence()+4;
+    for(int slot=0;slot<5;++slot)if(auto*task=CallMethod<0x6817D0,void*>(manager,slot,1215))return task;
+    return nullptr;
+}
+using PointArmFn=void(__fastcall*)(void*,void*,const char*,int,CPed*,CEntity*,int,CVector*,float,int,float);
+PointArmFn originalPointArm=nullptr;
+void __fastcall PointArm(void*manager,void*edx,const char*purpose,int arm,CPed*ped,CEntity*target,int bone,CVector*offset,float speed,int blend,float distance){
+    originalPointArm(manager,edx,purpose,arm,ped,target,bone,offset,speed,blend,distance);
+    if(!Net().Online()||arm<0||arm>1)return;
+    auto*couple=CoupleTask(ped);if(!couple)return;
+    auto*partner=target&&target->IsPed()?(CPed*)target:!target&&bone==-1?Field<CPed*>(couple,0x10):nullptr;
+    if(!partner||!IsPedValid(partner))return;
+    auto*n=Peds::Instance().Find(ped);if(!n||n->owner!=Net().MyId())return;
+    CVector point=offset?*offset:CVector{};
+    if(!target){auto d=point-partner->GetPosition();float h=partner->CurrentRotation();point={d.x*std::cos(h)+d.y*std::sin(h),-d.x*std::sin(h)+d.y*std::cos(h),d.z};}
+    handContacts[n->netId]={GetPedRef(ped),GetPedRef(partner),NowMs(),(uint8_t)arm,(int16_t)bone,point,speed,blend};
+}
 
 void CaptureInteraction(NetPed&np,PedSyncState&s){
     auto*ped=np.ped;
@@ -130,12 +151,15 @@ void CaptureInteraction(NetPed&np,PedSyncState&s){
             if(type==244)out.sequenceStep=(int8_t)std::clamp(Field<int32_t>(task,0xC),-1,7);
             if(type==275){out.sequenceStep=(int8_t)std::clamp(Field<int32_t>(task,0x10),-1,7);out.sequenceRepeat=(uint16_t)std::clamp(Field<int32_t>(task,0x18),0,65535);}
             if(type==256||type==1202||type==1203||type==1204||type==1209)partner=Field<CPed*>(task,0x38);
-            if(type==1215)partner=Field<CPed*>(task,0x10);
+            if(type==1215){partner=Field<CPed*>(task,0x10);out.couple=true;}
             if(type==1027)partner=Field<CPed*>(task,0xC);
             if(type==1100)partner=Field<CPed*>(task,8);
             task=CallVirtual<2,void*>(task);
         }
     }
+    // Temporary obstacle avoidance can pre-empt the couple's primary task
+    // without ending the relationship or its IK contact.
+    if(!partner)if(auto*couple=CoupleTask(ped)){partner=Field<CPed*>(couple,0x10);out.couple=true;}
     // Story handshakes also use two independently scripted clips, without
     // a native Partner task. Bind only a unique complementary, phase-matched
     // pair; unrelated nearby actors keep their ordinary world-space motion.
@@ -153,6 +177,8 @@ void CaptureInteraction(NetPed&np,PedSyncState&s){
         }
     }
     if(partner&&partner!=ped&&IsPedValid(partner)){
+        if(out.couple)if(auto i=handContacts.find(np.netId);i!=handContacts.end()&&i->second.handle==np.handle&&i->second.target==GetPedRef(partner)&&CallStd<0x6182B0,bool>((int)i->second.arm,ped)){
+            auto&h=i->second;out.handArm=h.arm;out.handBone=h.bone;out.handOffset=h.offset;out.handSpeed=h.speed;out.handBlend=h.blend;}
         if(partner==FindPlayerPed(0)){out.partnerKind=2;out.partnerId=Net().MyId();}
         else if(auto*rp=Players::Instance().FindByPed(partner)){out.partnerKind=2;out.partnerId=rp->id;}
         else if(auto*n=Peds::Instance().EnsureNetworked(partner)){out.partnerKind=1;out.partnerId=n->netId;}
@@ -199,6 +225,15 @@ void CaptureInteraction(NetPed&np,PedSyncState&s){
 }
 bool ApplyInteraction(NetPed&np,float age){
     auto*ped=np.ped;const auto&state=np.state.interaction;bool wasExtra=np.extraFull;np.extraFull=false;np.interactionPending=false;
+    if(np.handArm<2&&(state.handArm!=np.handArm||!state.couple||!state.partnerKind))CallStd<0x6182F0>((int)np.handArm,ped,250);
+    np.handArm=state.handArm;
+    if(state.couple&&state.partnerKind==1){auto*partner=GetPed(Peds::Instance().HandleOf(state.partnerId));
+        if(partner&&IsPedValid(partner)&&Net().EntityLink(ENTITY_PED,np.netId,ENTITY_PED,state.partnerId)&&partner->Health()>0&&(partner->GetPosition()-ped->GetPosition()).Length()<4){
+            if(state.handArm<2){auto offset=state.handOffset;CEntity*target=(CEntity*)partner;
+                if(state.handBone==-1){float h=partner->CurrentRotation();offset=partner->GetPosition()+CVector{offset.x*std::cos(h)-offset.y*std::sin(h),offset.x*std::sin(h)+offset.y*std::cos(h),offset.z};target=nullptr;}
+                originalPointArm((void*)0xC15448,nullptr,"coop couple",state.handArm,ped,target,(int)state.handBone,&offset,state.handSpeed,state.handBlend,999.f);}
+            if(np.state.motion.Present())anim::Replay(ped->RwObject(),np.state.motion,age);
+        }}
     if(np.state.motion.Present()&&np.state.animBlock!=kNoAnim&&(np.state.animFlags&anim::F_PARTIAL))
         anim::Replay(ped->RwObject(),np.state.motion,age);
     for(int i=0;i<PedInteraction::LayerCount;++i){
@@ -241,12 +276,12 @@ bool ApplyInteraction(NetPed&np,float age){
             // One canonical anchor prevents a pair from correcting each other
             // in a feedback loop. Use owner samples, never the rendered copy.
             if(other&&other->hasState&&other->owner==np.owner&&state.partnerId<np.netId&&!(other->state.flags&PedSyncState::F_DEAD)&&
-               std::abs((int32_t)(other->state.time-np.state.time))<=250){partner=other->ped;point=other->state.pos;velocity=other->state.vel;heading=other->state.heading;fresh=NowMs()-other->recvMs<1000;}
+               std::abs((int32_t)(other->state.time-np.state.time))<=250){partner=other->ped;point=state.couple?partner->GetPosition():other->state.pos;velocity=other->state.vel;heading=state.couple?partner->CurrentRotation():other->state.heading;fresh=NowMs()-other->recvMs<1000;}
         }else if(state.partnerKind==2){
             if(state.partnerId==Net().MyId()){partner=FindPlayerPed(0);if(partner){point=partner->GetPosition();heading=partner->CurrentRotation();fresh=true;}}
             else if(auto*rp=Players::Instance().Get((uint8_t)state.partnerId);rp&&rp->hasState&&rp->ped){partner=rp->ped;point=rp->state.pos;velocity=rp->state.vel;heading=rp->state.rotation;fresh=NowMs()-rp->stateRecvMs<1000;}
         }
-        bool action=np.state.animBlock!=kNoAnim;for(auto&layer:state.layers)action|=layer.Present();
+        bool action=state.couple||np.state.animBlock!=kNoAnim;for(auto&layer:state.layers)action|=layer.Present();
         if(partner&&fresh&&action&&partner->Health()>0&&AreaOf(partner)==np.state.area&&state.partnerOffset.Length()<3.5f){
             if(state.partnerKind==2){
                 // The local native attacker moves toward this victim. Moving
@@ -256,7 +291,9 @@ bool ApplyInteraction(NetPed&np,float age){
                 ped->CurrentRotation()=ped->AimingRotation()=np.state.heading;
                 ped->MoveSpeed()=np.state.vel*(1.f/50.f);ped->Flags()&=~1u;return true;
             }
-            float c=std::cos(heading),s=std::sin(heading);auto target=point+CVector{c*state.partnerOffset.x-s*state.partnerOffset.y,s*state.partnerOffset.x+c*state.partnerOffset.y,state.partnerOffset.z};
+            auto offset=state.partnerOffset;
+            if(state.couple){if(np.pairAnchor!=state.partnerId){np.pairOffset=offset;np.pairAnchor=state.partnerId;}else np.pairOffset=np.pairOffset+(offset-np.pairOffset)*std::min(1.f,TimeStep()*.2f);offset=np.pairOffset;}
+            float c=std::cos(heading),s=std::sin(heading);auto target=point+CVector{c*offset.x-s*offset.y,s*offset.x+c*offset.y,offset.z};
             // Do not reattach a grabbed actor after the authoritative contact
             // has ended or if the two snapshots are from different locations.
             if((target-np.state.pos).Length()<1.5f){SetEntityPosition(ped,target);ped->CurrentRotation()=ped->AimingRotation()=heading+state.partnerHeading;ped->MoveSpeed()=velocity*(1.f/50.f);ped->Flags()&=~1u;return true;}
@@ -425,6 +462,7 @@ int Peds::SpecialModelFor(const std::string& name) {
 }
 
 void Peds::OnInstallHooks() {
+    mem::HookFn(0x618B60,&PointArm,&originalPointArm,"IKChainManager::PointArm couple contact");
     mem::HookFn(0x409D10, &HookRequestSpecialModel, &g_origRequestSpecial, "CStreaming::RequestSpecialModel");
     mem::HookFn(0x608540, &HookGetVacantSlot, &g_origVacantSlot, "CPedScriptedTaskRecord::GetVacantSlot");
     mem::HookFn(0x5E4A00, &HookSetMoveAnim, &g_origSetMoveAnim, "CPed::SetMoveAnim");
@@ -494,7 +532,7 @@ PedSyncState Peds::Capture(NetPed& np) {
     s.armour = std::clamp(ped->Armour(),0.f,1000000.f);
     s.weapon = (uint8_t)ped->ActiveWeapon().type;
     s.area = AreaOf(ped);
-    s.entityFlags=(ped->IsVisible()?1:0)|((ped->Flags()&1u)?2:0)|((ped->PhysicalFlags()&0x2000u)?4:0)|((Field<uint8_t>(ped,0x475)&1)?8:0);
+    s.entityFlags=(ped->IsVisible()?1:0)|((ped->Flags()&1u)?2:0)|((ped->PhysicalFlags()&0x2000u)?4:0)|((Field<uint8_t>(ped,0x475)&1)?8:0)|(StoryPed(ped)?16:0);
     if(s.entityFlags&4)s.vel={}; // native frozen peds can retain a stale falling velocity
     s.flags = (IsPedDead(ped) ? PedSyncState::F_DEAD : 0) | (ped->IsDucking() ? PedSyncState::F_DUCKING : 0);
 
@@ -923,7 +961,12 @@ void Peds::ApplyMirror(NetPed& np) {
     int area=camera?Ref<int32_t>(0xB72914):focus->AreaCode();
     CVector centre=camera?cam::Source():focus->GetPosition();
     bool nearPlayer=(st.area==focus->AreaCode()||st.area==13)&&(st.pos-focus->GetPosition()).Length2D()<280;
-    bool relevant=nearPlayer||((st.area==area||st.area==13)&&(st.pos-centre).Length2D()<280);
+    // Wide scripted shots can show mission vehicles hundreds of metres away.
+    // Keep their actors as long as the visible vehicle itself exists; normal
+    // population still uses the bounded player/camera streaming distance.
+    bool story=(st.entityFlags&16)&&np.owner==Net().HostId()&&HostMissionRecent(0);
+    auto*sceneCar=story&&st.vehNetId?Vehicles::Instance().Find(st.vehNetId):nullptr;
+    bool relevant=nearPlayer||((st.area==area||st.area==13)&&((st.pos-centre).Length2D()<(story?1100.f:280.f)||(sceneCar&&Vehicles::Alive(*sceneCar))));
     if(!relevant){
         if(IsAlive(np)&&now-np.lastRelevantMs>5000){auto*old=np.ped;m_byPtr.erase(old);Cmd(0x009B).I(np.handle).Run();np.ped=nullptr;np.handle=-1;np.animBlock=np.baseBlock=kNoAnim;np.animFull=false;np.lastTaskMove=0;np.gunMode=0;}
         return;
@@ -1324,6 +1367,9 @@ void Peds::OnPreProcess() {
 }
 
 void Peds::OnPostProcess() {
+    for(auto i=handContacts.begin();i!=handContacts.end();){auto*p=GetPed(i->second.handle);
+        i=!p||!GetPed(i->second.target)||!CallStd<0x6182B0,bool>((int)i->second.arm,p)?handContacts.erase(i):std::next(i);
+    }
     bool ready = Net().Online() && core::IsPlayerReady();
     // Native SetMoveAnim recalculates mission-ped speed during ProcessControl. Restore the
     // owner's rate afterwards so the rendered steps match its displacement and next frame.
@@ -1355,6 +1401,7 @@ void Peds::OnPostProcess() {
 }
 
 void Peds::OnSessionEnd() {
+    handContacts.clear();
     for(auto&[id,np]:m_byId)HoldCorpseOutside(np,false);
     // mirrors stay in the world as ordinary random peds
     for (auto& [id, np] : m_byId)
@@ -1402,6 +1449,7 @@ void Peds::OnGameStarted() {
 }
 
 void Peds::OnGameShutdown() {
+    handContacts.clear();
     Net().AdvanceWorldEpoch(); OnGameStarted(); }
 
 }  // namespace coop

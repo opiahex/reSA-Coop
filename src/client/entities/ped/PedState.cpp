@@ -64,6 +64,6 @@ bool PedSyncState::Read(Reader&r){auto&s=*this;
     return r.Ok()&&motionOk&&std::isfinite(s.pos.x)&&std::isfinite(s.pos.y)&&std::isfinite(s.pos.z)&&
         std::isfinite(s.health)&&s.health>=0&&s.health<=1000000&&std::isfinite(s.armour)&&s.armour>=0&&s.armour<=1000000&&
         std::isfinite(s.animTime)&&std::isfinite(s.animSpeed)&&s.moveState<=7&&s.seat>=-1&&s.seat<8&&s.aimKind<=2&&
-        (!(s.flags&F_IN_VEHICLE)||s.vehNetId!=0)&&(!(s.entityFlags&~15u));
+        (!(s.flags&F_IN_VEHICLE)||s.vehNetId!=0)&&(!(s.entityFlags&~31u));
 }
 }

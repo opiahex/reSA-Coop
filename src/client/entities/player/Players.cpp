@@ -1,3 +1,4 @@
+#include "shared/api/vehicle-effects/VehicleEffects.h"
 #include "shared/api/story-coop/StoryCoop.h"
 #include "shared/api/mission-objects/SharedObject.h"
 #include "entities/player/Players.h"
@@ -288,6 +289,19 @@ void __cdecl HookDeleteChar(CPed* ped) {
     g_origRemoveThisPed(ped);
 }
 
+using JetpackInputFn=void(__fastcall*)(void*,void*,CPlayerPed*);
+JetpackInputFn originalJetpackInput=nullptr,originalJetpackThrust=nullptr;
+void __fastcall JetpackInput(void*task,void*edx,CPlayerPed*ped){
+    originalJetpackInput(task,edx,ped);
+    if(auto*rp=Players::Instance().FindByPed(ped);rp&&rp->hasState&&(rp->state.flags&OnFootState::F_JETPACK)&&NowMs()-rp->stateRecvMs<1000)rp->renderedJetpack.Apply(task);
+}
+void __fastcall JetpackThrust(void*task,void*edx,CPlayerPed*ped){
+    auto*rp=Players::Instance().FindByPed(ped);auto velocity=ped->MoveSpeed();
+    if(rp&&rp->hasState&&(rp->state.flags&OnFootState::F_JETPACK))rp->renderedJetpack.Apply(task);
+    originalJetpackThrust(task,edx,ped);
+    // Keep native legs, exhaust and audio; only the owner supplies flight velocity.
+    if(rp)ped->MoveSpeed()=velocity;
+}
 using ProcessControlFn = void(__fastcall*)(CPlayerPed*, void*);
 ProcessControlFn g_origProcessControl = nullptr;
 bool g_inRemoteContext = false;
@@ -362,7 +376,7 @@ void __fastcall HookVehicleAudioService(void* audio, void* edx) {
     bool remote = driver && driver->PedType() == PED_TYPE_PLAYER1 && driver != FindPlayerPed(0);
     if (veh) if (auto* nv = Vehicles::Instance().Find(veh); nv && Vehicles::Instance().IsMirror(*nv) && nv->hasState) {
         if(nv->state.extras&VehicleState::X_WHEELS)nv->renderedWheels.Apply(veh);
-        bool horn = NowMs() - nv->recvMs < 500 && (nv->state.flags & VehicleState::F_HORN);
+        bool horn = RemoteVehicleHorn(veh,false);
         static std::map<uint16_t,bool> horns;
         if (horn != horns[nv->netId]) { horns[nv->netId]=horn; LOGI("Vehicle %04X horn %s in native audio service",nv->netId,horn?"on":"off"); }
         int type = veh->VehicleSubClass();
@@ -676,6 +690,8 @@ float RemoteDistance(const CVector& p, int8_t area, uint8_t* who) {
 void Players::OnInstallHooks() {
     mem::HookFn(0x61ED10, &HookAimGun, &g_originalAimGun, "CTaskSimpleUseGun::AimGun");
     mem::HookFn(0x61EB10, &HookFireGun, &g_originalFireGun, "CTaskSimpleUseGun::FireGun");
+    mem::HookFn(0x67E7B0,&JetpackInput,&originalJetpackInput,"CTaskSimpleJetPack::ProcessControlInput");
+    mem::HookFn(0x67EF20,&JetpackThrust,&originalJetpackThrust,"CTaskSimpleJetPack::ProcessThrust");
     mem::HookFn(0x60EA90, &HookPlayerProcessControl, &g_origProcessControl, "CPlayerPed::ProcessControl");
     void* coopGame = nullptr;  // CGameLogic::IsCoopGameGoingOn, always false (Patches)
     mem::RedirectCall(0x644A1A, (const void*)&PassengerDriveBy, &coopGame);
@@ -1160,6 +1176,9 @@ void Players::ApplyState(RemotePlayer& rp) {
 
     ped->Health() = (float)st.health;
     ped->Armour() = (float)st.armour;
+    // ScenePartner owns these native peds for the cutscene. Old seat, phone,
+    // weapon and jetpack tasks must not replace its staged animation.
+    if(Ref<uint8_t>(0xB5F851)){rp.padNew={};rp.padOld={};return;}
     if (!Ref<uint8_t>(0xB5F851)) ped->AreaCode() = st.area;  // CCutsceneMgr::ms_running: the scene sets it (Missions)
 
     // crouching toggles on the crouch button's press, which the copy replays from the owner's pad: a press lost on the
@@ -1193,13 +1212,13 @@ void Players::ApplyState(RemotePlayer& rp) {
     // the jetpack flies by the player's buttons, which this ped gets: it only needs one. Dropping it (the enter key)
     // happens here as there; whatever is left over goes with the flag
     bool jetpack = (st.flags & OnFootState::F_JETPACK) != 0;
-    if (jetpack != HasJetpack(ped) && rp.mode == RemotePlayer::Mode::OnFoot && NowMs() - rp.jetpackMs > 1000) {
+    if (jetpack != HasJetpack(ped) && rp.mode == RemotePlayer::Mode::OnFoot && NowMs() - rp.jetpackMs > 250) {
         rp.jetpackMs = NowMs();
         if (jetpack) {
-            LoadModelNow(370);                   // the jetpack
-            Cmd(0x07A7).I(rp.pedHandle).Run();   // TASK_JETPACK
+            RequestModel(370);
+            if(IsModelLoaded(370))Cmd(0x07A7).I(rp.pedHandle).Run();   // TASK_JETPACK
         } else {
-            Cmd(0x0792).I(rp.pedHandle).Run();   // CLEAR_CHAR_TASKS_IMMEDIATELY
+            if(auto*task=CallMethod<0x601110,void*>(ped->Intelligence()))CallMethod<0x67E6E0,bool>(task,ped,0,(void*)nullptr);
         }
         LOGI("Remote player %d: jetpack %s", rp.id, jetpack ? "on" : "off");
     }
@@ -1252,8 +1271,9 @@ void Players::ApplyState(RemotePlayer& rp) {
                 a.motion.offset.y+(b.motion.offset.y-a.motion.offset.y)*t,a.motion.offset.z+(b.motion.offset.z-a.motion.offset.z)*t};
             s.motion.heading=LerpAngle(a.motion.heading,b.motion.heading,t);
         }
-        s.rotation=LerpAngle(a.rotation,b.rotation,t);return s;
+        s.rotation=LerpAngle(a.rotation,b.rotation,t);if((a.flags&b.flags&OnFootState::F_JETPACK)!=0)s.jetpack=JetpackState::Blend(a.jetpack,b.jetpack,t);return s;
     },[](OnFootState&s,float age,bool stale){s.pos=s.pos+s.vel*age;if(stale)s.vel={};});
+    rp.renderedJetpack=rp.history.Size()?sampled.jetpack:st.jetpack;
     CVector target=rp.history.Size()?sampled.pos:st.pos;
     bool supported=false;
     CEntity*support=nullptr;
@@ -1278,7 +1298,7 @@ void Players::ApplyState(RemotePlayer& rp) {
     float ground = Call<0x5696C0, float>(target.x, target.y, target.z + 1.0f, &found, (CEntity**)nullptr);  // FindGroundZFor3DCoord
     bool groundless = st.area != me->AreaCode() || !found || (target - me->GetPosition()).Length2D() > 150.0f;
     bool sunk = found && cur.z < ground + 0.3f && target.z > ground + 0.5f;  // a standing ped is ~1 m above its ground
-    bool special=st.motion.kind==MotionState::SWIM||st.motion.kind==MotionState::CLIMB||st.motion.kind==MotionState::PARACHUTE;
+    bool special=(st.flags&OnFootState::F_JETPACK)||st.motion.kind==MotionState::SWIM||st.motion.kind==MotionState::CLIMB||st.motion.kind==MotionState::PARACHUTE;
     if(supported||special){
         SetEntityPosition(ped,target);ped->MoveSpeed()=(rp.history.Size()?sampled.vel:st.vel)*(1.0f/50.0f);
     } else if (dist2d > kTeleportDist || std::fabs(err.z) > kTeleportDist || sunk) {
@@ -1727,6 +1747,7 @@ void Players::SendLocalState() {
     st.area = me->AreaCode();
     st.moveState = (uint8_t)me->MoveState();
     uint32_t previousEpoch=m_actionEpoch;
+    if((st.flags&OnFootState::F_JETPACK)&&me->Intelligence())st.jetpack=JetpackState::Capture(CallMethod<0x601110,void*>(me->Intelligence()));
     CaptureMotion(st,me);
     bool transition=previousEpoch!=m_actionEpoch;
     st.wanted = WantedLevel(me);

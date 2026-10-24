@@ -133,6 +133,7 @@ void OnFootState::Write(Writer& w) const {
     pad.Write(w);
     cam.Write(w);
     motion.Write(w);
+    if(flags&F_JETPACK)jetpack.Write(w);
 }
 
 bool OnFootState::Read(Reader& r) {
@@ -154,7 +155,8 @@ bool OnFootState::Read(Reader& r) {
     if (fightingStyle < 4 || fightingStyle > 16) return false;
     pad.Read(r);
     cam.Read(r);
-    return motion.Read(r);
+    if(!motion.Read(r))return false;
+    return !(flags&F_JETPACK)||jetpack.Read(r);
 }
 
 }  // namespace coop

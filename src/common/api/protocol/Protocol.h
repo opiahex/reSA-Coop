@@ -181,6 +181,8 @@ enum MsgId : uint8_t {
     G_STORY_COOP = 168, // mission roles, run snapshots and once-paid reward receipts
     G_PED_ACTION = 167, // reliable revisioned NPC action/sequence transition
 
+    G_VEH_HORN = 172, // reliable native horn edges and active heartbeat
+    G_STORY_EQUIPMENT = 173, // phase-scoped native special equipment
     G_VOICE = 200,            // unreliable: voice frame
     G_LAST = 255,
 };

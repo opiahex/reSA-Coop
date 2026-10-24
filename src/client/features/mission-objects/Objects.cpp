@@ -27,6 +27,7 @@
 #include "shared/lib/sync/EventWindow.h"
 #include "shared/api/mission-objects/SharedObject.h"
 #include "shared/api/story-coop/StoryCoop.h"
+#include "shared/api/story-stage/StoryStage.h"
 #include "shared/api/story-actions/StoryActions.h"
 #include "shared/game/Anim.h"
 
@@ -193,7 +194,7 @@ void ApplyMotion(NetObject&n,bool simulator=false){
 }
 enum:uint8_t{CLAIM=1,GRANT=2,CARRY_POSE=3,RELEASE=4,DENY=5,PUSH=6,CARGO_CLAIM=7,CARGO_POSE=8,CARGO_RELEASE=9};
 void Decision(NetObject&n,uint8_t op=GRANT){
-    Writer w(proto::G_OBJ_CARRY);w.U64(StoryRunId());w.U8(op);w.Entity(ENTITY_OBJECT,n.netId);w.U32(n.motion.revision);w.U8(n.motion.holder);w.U8(n.motion.simulator);w.Entity(ENTITY_VEHICLE,n.motion.supportVehicle);Net().Send(proto::CH_RELIABLE,w);
+    Writer w(proto::G_OBJ_CARRY);w.U64(StoryRunId());w.U32(CooperativeStoryPhase());w.U8(op);w.Entity(ENTITY_OBJECT,n.netId);w.U32(n.motion.revision);w.U8(n.motion.holder);w.U8(n.motion.simulator);w.Entity(ENTITY_VEHICLE,n.motion.supportVehicle);Net().Send(proto::CH_RELIABLE,w);
 }
 bool Claim(NetObject&n,uint8_t from){
     if(!Alive(n)||n.broken)return false;
@@ -220,7 +221,7 @@ int HoldGate(void*task,CPed*ped){
                 if(Net().IsHost())Claim(*n,Net().MyId());
                 else if(NowMs()<n->claimDeniedUntil){CallMethod<0x6916E0>(task);return -1;}
                 else if(n->claimBegan&&NowMs()-n->claimBegan>2000){n->claimBegan=0;n->claimDeniedUntil=NowMs()+300;CallMethod<0x6916E0>(task);return -1;}
-                else if(NowMs()-n->claimSent>300){if(!n->claimBegan)n->claimBegan=NowMs();Writer w(proto::G_OBJ_CARRY);w.U64(StoryRunId());w.U8(CLAIM);w.Entity(ENTITY_OBJECT,n->netId);w.U32(n->motion.revision);Net().Send(proto::CH_RELIABLE,w);n->claimSent=NowMs();}
+                else if(NowMs()-n->claimSent>300){if(!n->claimBegan)n->claimBegan=NowMs();Writer w(proto::G_OBJ_CARRY);w.U64(StoryRunId());w.U32(CooperativeStoryPhase());w.U8(CLAIM);w.Entity(ENTITY_OBJECT,n->netId);w.U32(n->motion.revision);Net().Send(proto::CH_RELIABLE,w);n->claimSent=NowMs();}
                 if(n->motion.holder!=Net().MyId())return 0;
             }
             n->claimBegan=0;n->lease=NowMs()+2500;
@@ -246,7 +247,7 @@ void CargoTick(){
         for(auto i=g_pushes.begin();i!=g_pushes.end()&&budget-->0;){auto c=i->second;i=g_pushes.erase(i);
             auto*v=Vehicles::Instance().Find(c.vehicle);auto o=g_mirrors.find(c.object);
             if(!v||!Vehicles::Alive(*v)||v->owner!=Net().MyId()||o==g_mirrors.end()||!Alive(o->second)||!PhysicalCargo(o->second))continue;
-            Writer w(proto::G_OBJ_CARRY);w.U64(StoryRunId());w.U8(PUSH);w.Entity(ENTITY_OBJECT,c.object);w.U32(c.revision);w.Entity(ENTITY_VEHICLE,c.vehicle);
+            Writer w(proto::G_OBJ_CARRY);w.U64(StoryRunId());w.U32(CooperativeStoryPhase());w.U8(PUSH);w.Entity(ENTITY_OBJECT,c.object);w.U32(c.revision);w.Entity(ENTITY_VEHICLE,c.vehicle);
             if(++g_pushSequence==0)++g_pushSequence;w.U32(g_pushSequence);auto m=LimitCargo(c.move,20),t=LimitCargo(c.turn,12);
             w.VecQ({m.x,m.y,m.z},30);w.VecQ({t.x,t.y,t.z},15);Net().Send(proto::CH_RELIABLE,w);
         }
@@ -263,7 +264,7 @@ void SimulateCargo(){
                 (n.obj->GetPosition()-v->veh->GetPosition()).Length()<25;
             bool held=valid&&(n.obj->AttachedTo()==v->veh||now-n.cargoTouch<1800);
             if(now-n.claimSent<50)continue;n.claimSent=now;CaptureMotion(n);
-            Writer w(proto::G_OBJ_CARRY);w.U64(StoryRunId());w.U8(held?CARGO_POSE:CARGO_RELEASE);w.Entity(ENTITY_OBJECT,id,ENTITY_SNAPSHOT);w.U32(n.motion.revision);
+            Writer w(proto::G_OBJ_CARRY);w.U64(StoryRunId());w.U32(CooperativeStoryPhase());w.U8(held?CARGO_POSE:CARGO_RELEASE);w.Entity(ENTITY_OBJECT,id,ENTITY_SNAPSHOT);w.U32(n.motion.revision);
             auto p=n.obj->GetPosition();w.Vec({p.x,p.y,p.z});RotationOf(n.obj).Write(w);n.motion.Write(w);w.U8(ObjectFlags(n.obj));
             Net().Send(held?proto::CH_STATE:proto::CH_RELIABLE,w);
             if(!held){n.motion.simulator=255;Cmd(0x0550).I(n.handle).I(1).Run();}
@@ -283,7 +284,7 @@ void SimulateCargo(){
             auto*car=FindPlayerPed(0)->VehicleIfIn();auto*v=car?Vehicles::Instance().Find(car):nullptr;
             if(v&&v->owner==Net().MyId()&&v->model==530&&car->Matrix()){
                 auto d=n.obj->GetPosition()-car->GetPosition();auto&m=*car->Matrix();float x=d.x*m.right.x+d.y*m.right.y;float y=d.x*m.forward.x+d.y*m.forward.y;
-                if(std::fabs(x)<1.5f&&y>.3f&&y<4.f&&std::fabs(d.z)<3.5f){Writer w(proto::G_OBJ_CARRY);w.U64(StoryRunId());w.U8(CARGO_CLAIM);w.Entity(ENTITY_OBJECT,id);w.U32(n.motion.revision);w.Entity(ENTITY_VEHICLE,v->netId);Net().Send(proto::CH_RELIABLE,w);n.cargoAsk=now;}
+                if(std::fabs(x)<1.5f&&y>.3f&&y<4.f&&std::fabs(d.z)<3.5f){Writer w(proto::G_OBJ_CARRY);w.U64(StoryRunId());w.U32(CooperativeStoryPhase());w.U8(CARGO_CLAIM);w.Entity(ENTITY_OBJECT,id);w.U32(n.motion.revision);w.Entity(ENTITY_VEHICLE,v->netId);Net().Send(proto::CH_RELIABLE,w);n.cargoAsk=now;}
             }
         }
     }
@@ -300,7 +301,7 @@ void CarryTick(){
                 if(held)n.lease=NowMs()+2500;
                 else{n.motion.holder=255;++n.motion.revision;CaptureMotion(n);Decision(n);}
             }else if(NowMs()-n.claimSent>=50){
-                n.claimSent=NowMs();CaptureMotion(n);auto p=n.obj->GetPosition();Writer w(proto::G_OBJ_CARRY);w.U64(StoryRunId());
+                n.claimSent=NowMs();CaptureMotion(n);auto p=n.obj->GetPosition();Writer w(proto::G_OBJ_CARRY);w.U64(StoryRunId());w.U32(CooperativeStoryPhase());
                 w.U8(held?CARRY_POSE:RELEASE);w.Entity(ENTITY_OBJECT,id,ENTITY_SNAPSHOT);w.U32(n.motion.revision);w.Vec({p.x,p.y,p.z});RotationOf(n.obj).Write(w);n.motion.Write(w);w.U8(ObjectFlags(n.obj));Net().Send(held?proto::CH_STATE:proto::CH_RELIABLE,w);
                 if(!held)n.motion.holder=255;
             }
@@ -317,7 +318,7 @@ void CarryTick(){
     }
 }
 void HandleCarry(uint8_t from,Reader&r){
-    auto run=r.U64();if(run!=StoryRunId())return;
+    auto run=r.U64();auto phase=r.U32();if(run!=StoryRunId()||phase!=CooperativeStoryPhase())return;
     uint8_t op=r.U8();uint16_t id=r.U16();uint32_t revision=r.U32();
     if(!r.Ok()||!core::IsPlayerReady())return;
     if(Net().IsHost()){
@@ -744,7 +745,7 @@ bool ProcessSharedCargoContact(CargoContactFn original,CPhysical*a,void*edx,CPhy
     if(n->motion.simulator==Net().MyId()&&n->motion.supportVehicle==v->netId){n->cargoTouch=NowMs();return false;}
     if(!PhysicalCargo(*n)||n->motion.simulator!=255)return false;
     if(!Net().IsHost()&&v->owner==Net().MyId()&&NowMs()-n->cargoAsk>500){
-        Writer w(proto::G_OBJ_CARRY);w.U64(StoryRunId());w.U8(CARGO_CLAIM);w.Entity(ENTITY_OBJECT,n->netId);w.U32(n->motion.revision);w.Entity(ENTITY_VEHICLE,v->netId);Net().Send(proto::CH_RELIABLE,w);n->cargoAsk=NowMs();
+        Writer w(proto::G_OBJ_CARRY);w.U64(StoryRunId());w.U32(CooperativeStoryPhase());w.U8(CARGO_CLAIM);w.Entity(ENTITY_OBJECT,n->netId);w.U32(n->motion.revision);w.Entity(ENTITY_VEHICLE,v->netId);Net().Send(proto::CH_RELIABLE,w);n->cargoAsk=NowMs();
     }
     if(Net().IsHost()){
         if(v->owner==Net().MyId())return false;

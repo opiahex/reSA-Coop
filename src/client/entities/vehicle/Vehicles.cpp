@@ -1,3 +1,4 @@
+#include "shared/api/vehicle-effects/VehicleEffects.h"
 #include "entities/vehicle/Vehicles.h"
 
 #include <algorithm>
@@ -147,10 +148,25 @@ using HornStateFn=void(__fastcall*)(void*,void*,bool*,void*);
 HornStateFn g_origHornState=nullptr;
 void __fastcall HookHornState(void* audio,void* edx,bool* on,void* params) {
     g_origHornState(audio,edx,on,params);
-    if(!on||*on||!params||!Net().Online())return;
-    auto* vehicle=Field<CVehicle*>(params,0x10);
-    if(auto* nv=Vehicles::Instance().Find(vehicle);nv&&Vehicles::Instance().IsMirror(*nv)&&nv->hasState&&NowMs()-nv->recvMs<500)
-        *on=(nv->state.flags&VehicleState::F_HORN)!=0;
+    if(!on||!params||!Net().Online())return;
+    auto*vehicle=Field<CVehicle*>(params,0x10);
+    if(!vehicle||!IsVehicleValid(vehicle))return;
+    if(auto*n=Vehicles::Instance().Find(vehicle);n&&Vehicles::Instance().IsMirror(*n))*on=RemoteVehicleHorn(vehicle,*on);
+}
+using PlayHornFn=void(__fastcall*)(void*,void*,bool,bool,bool,void*);
+PlayHornFn originalPlayHorn=nullptr;
+void __fastcall PlayHorn(void*audio,void*edx,bool horn,bool siren,bool fast,void*params){
+    auto*vehicle=params?Field<CVehicle*>(params,0x10):nullptr;
+    auto*n=vehicle&&IsVehicleValid(vehicle)?Vehicles::Instance().Find(vehicle):nullptr;
+    bool mirror=n&&Vehicles::Instance().IsMirror(*n);
+    if(Net().Online()&&n){if(mirror)horn=RemoteVehicleHorn(vehicle,horn);else CaptureVehicleHorn(vehicle,horn);}
+    // GTA latches the horn flag even when the sound allocation failed. Retry
+    // an active remote horn once its sound bank/channel becomes available.
+    if(mirror&&horn&&!Field<void*>(audio,0x178))Field<uint8_t>(audio,0xBE)=0;
+    originalPlayHorn(audio,edx,horn,siren,fast,params);
+    if(mirror){static std::map<uint16_t,std::pair<bool,uint64_t>>reported;auto&last=reported[n->netId];
+        if(last.first!=horn||(horn&&NowMs()-last.second>1000)){last={horn,NowMs()};auto*sound=Field<void*>(audio,0x178);
+            LOGI("Horn native playback vehicle=%04X on=%d sound=%d volume=%.1f hardware=%d playing=%d",n->netId,horn,sound!=nullptr,sound?Field<float>(sound,0x60):-100.f,sound?Field<int16_t>(sound,0x5A):0,sound?Field<int16_t>(sound,0x5E):0);}}
 }
 using RenderLightsFn = void(__cdecl*)();
 RenderLightsFn g_originalLights = nullptr;
@@ -223,6 +239,7 @@ void Vehicles::OnInstallHooks() {
 
     mem::HookFn(0x6C45B0,&HookAddSearchLight,&g_origAddSearchLight,"CHeli::AddHeliSearchLight");
     mem::HookFn(0x4F61E0,&HookHornState,&g_origHornState,"CAEVehicleAudioEntity::GetHornState");
+    mem::HookFn(0x4F99D0,&PlayHorn,&originalPlayHorn,"CAEVehicleAudioEntity::PlayHornOrSiren network playback");
     Net().SetHandler(proto::G_SCRIPT_LOCK,[](uint8_t from,Reader&r){
         uint16_t id=r.U16();uint8_t lock=r.U8();if(!r.Ok()||from!=Net().HostId()||Net().IsHost())return;
         auto&self=Instance();if(!id){self.m_scriptLocks.clear();return;}self.m_scriptLocks[id]=lock;LOGD("Story lock %04X received: %u",id,lock);
@@ -358,7 +375,7 @@ NetVehicle* Vehicles::EnsureNetworked(CVehicle* v) {
     nv.lastChangeMs = NowMs();
     m_byPtr[v] = id;
     Announce(nv);SendLook(nv);
-    LOGI("Vehicle %04X (model %d) is now networked", id, nv.model);
+    LOGI("Vehicle %04X (model %d) is now networked native=%d generation=%llu at=%.1f,%.1f,%.1f",id,nv.model,nv.handle,(unsigned long long)Net().EntityGeneration(ENTITY_VEHICLE,id),v->GetPosition().x,v->GetPosition().y,v->GetPosition().z);
     return &nv;
 }
 
@@ -603,8 +620,8 @@ bool Vehicles::CreateMirror(const VehicleSpawn& sp) {
     }
     if(m_adoptPending.erase(sp.netId)){
         nv.owner=Net().MyId();nv.hasState=false;nv.history.Clear();Release(nv);nv.handoverUntil=NowMs()+3000;
-        nv.lastChangeMs=NowMs();
-        if(!nv.script&&!HasPlayerInside(v)){Cmd(0x00A8).I(nv.handle).Run();Cmd(0x00AD).I(nv.handle).F(12.f).Run();}
+        nv.firstAnnouncedMs=nv.lastChangeMs=NowMs();
+        if(!nv.script&&v->Driver()&&v->Driver()->Health()>0&&!HasPlayerInside(v)){Cmd(0x00A8).I(nv.handle).Run();Cmd(0x00AD).I(nv.handle).F(12.f).Run();}
         Announce(nv);SendLook(nv);SendState(nv,true);
     }
     LOGI("Vehicle %04X (model %d) %s for player %d", sp.netId, sp.model, adopted ? "adopted" : "created", sp.owner);
@@ -615,7 +632,7 @@ void Vehicles::Forget(uint16_t netId, bool deleteVehicle) {
     auto it = m_byId.find(netId);
     if (it == m_byId.end()) return;
     NetVehicle& nv = it->second;
-    LOGD("Vehicle %04X forgotten (owner %u, delete %d)",netId,nv.owner,deleteVehicle);
+    LOGD("Vehicle %04X forgotten (owner %u, delete %d) native=%d generation=%llu mirror_created=%d",netId,nv.owner,deleteVehicle,nv.handle,(unsigned long long)Net().EntityGeneration(ENTITY_VEHICLE,netId),nv.createdByUs);
     if (deleteVehicle && Alive(nv)) {
         auto*me=FindPlayerPed(0);
         if(me&&me->InVehicle()&&me->Vehicle()==nv.veh){auto p=me->GetPosition();Cmd(0x0362).I(GetPedRef(me)).F(p.x).F(p.y).F(p.z+1).Run();}
@@ -818,7 +835,7 @@ bool Vehicles::QueueGiveAway(CVehicle* v, uint8_t to) {
 void Vehicles::HandleHandover(uint8_t from, Reader& r) {
     uint16_t id = r.U16();
     uint8_t to = r.U8();
-    if (!r.Ok()) return;
+    if (!r.Ok()||to>=proto::kMaxPlayers||(to!=Net().MyId()&&!Net().Peer(to))) return;
     if (auto pending = m_pending.find(id); pending != m_pending.end() && pending->second.owner == from)
         pending->second.owner = to;
     NetVehicle* nv = Find(id);
@@ -853,6 +870,7 @@ void Vehicles::HandleHandover(uint8_t from, Reader& r) {
     }
     Release(*nv);
     if (nv->playerUsed || IsRecent(id)) Protect(*nv);
+    nv->firstAnnouncedMs=NowMs();nv->handoverUntil=NowMs()+3000;
     nv->lastSendMs = nv->lastChangeMs = 0;
     Announce(*nv);
     SendLook(*nv);
@@ -1090,7 +1108,7 @@ void Vehicles::OnPreProcess() {
         else{
             auto*me=FindPlayerPed(0);auto type=nv.veh->VehicleSubClass();
             bool ground=type==VEHICLE_TYPE_AUTOMOBILE||type==VEHICLE_TYPE_BIKE||type==VEHICLE_TYPE_BMX||type==VEHICLE_TYPE_QUAD||type==VEHICLE_TYPE_MTRUCK||type==VEHICLE_TYPE_TRAILER;
-            bool away=me&&(nv.veh->AreaCode()!=me->AreaCode()||(nv.veh->GetPosition()-me->GetPosition()).Length2D()>180);
+            bool away=me&&(nv.veh->AreaCode()!=me->AreaCode()||(nv.veh->GetPosition()-me->GetPosition()).Length()>180);
             auto*driver=nv.veh->Driver();
             bool corpse=driver&&(driver->Health()<=0||driver->PedState()==54||driver->PedState()==55);
             HoldUnloadedPhysics(nv,ground&&away&&(!driver||corpse)&&!HasPlayerInside(nv.veh)&&(nv.playerUsed||nv.script||ScriptHolds(nv.veh)||(corpse&&PopulationNeededAt(nv.veh->GetPosition(),nv.veh->AreaCode(),140))));
@@ -1144,7 +1162,11 @@ void Vehicles::ScanTraffic() {
     if (!pool) return;
     std::vector<uint16_t> gone;
     for (auto& [id, nv] : m_byId)
-        if (!IsMirror(nv) && NowMs()-nv.firstAnnouncedMs>3000 && !nv.playerUsed && IsVehicleValid(nv.veh) && !ScriptHolds(nv.veh) && !OccupiedTowChain(nv.veh) &&
+        if (!IsMirror(nv) && NowMs()-nv.firstAnnouncedMs>3000 && NowMs()>=nv.handoverUntil && !nv.playerUsed && Alive(nv) && !ScriptHolds(nv.veh) && !OccupiedTowChain(nv.veh) &&
+            // A handover's new owner can be next to the car while every remote
+            // player is far away/in a school interior. Retiring solely by remote
+            // distance discarded its ID and re-announced the same car repeatedly.
+            (FindPlayerPed(0)->AreaCode()!=nv.veh->AreaCode()||(FindPlayerPed(0)->GetPosition()-nv.veh->GetPosition()).Length()>kTrafficOut) &&
             RemoteDistance(nv.veh->GetPosition(), nv.veh->AreaCode()) > kTrafficOut)
             gone.push_back(id);
     for (uint16_t id : gone) {
@@ -1242,6 +1264,10 @@ void Vehicles::OnPostProcess() {
         if(!Alive(nv)||nv.veh->ModelIndex()!=nv.model)continue;
         if (IsMirror(nv)) {
             if(TrainingVehicleRestricted(nv.veh))nv.veh->DoorLock()=2;
+            // Recorded mission vehicles must render the sampled pose after
+            // native NPC/recording physics too. Otherwise that extra local
+            // movement is snapped back at the start of the next frame.
+            if(nv.script&&nv.hasState&&nv.veh->Driver()!=me)ApplyMirror(nv,TimeStep()/50.f);
             // keep the visual controls after the physics step (wheels, brake lights)
             if (nv.hasState) {
                 nv.veh->SetEngineOn((nv.state.flags&VehicleState::F_ENGINE)!=0);
@@ -1329,22 +1355,27 @@ void Vehicles::OnSessionEnd() {
 
 void Vehicles::OnPeerLeave(uint8_t id) {
     m_recent.erase(id);
+    std::vector<uint8_t> survivors{Net().MyId()};
+    for(auto&[peerId,peer]:Net().Peers())if(peerId!=id)survivors.push_back(peerId);
+    const auto successor=VehicleSuccessor(Net().HostId(),id,survivors);
+    for(auto it=m_giveAway.begin();it!=m_giveAway.end();)it=it->second==id?m_giveAway.erase(it):std::next(it);
     for(auto it=m_pendingStates.begin();it!=m_pendingStates.end();)it=it->second.first==id?m_pendingStates.erase(it):std::next(it);
-    for(auto it=m_pending.begin();it!=m_pending.end();){
-        if(it->second.owner==id){m_pendingStates.erase(it->first);m_pendingLooks.erase(it->first);m_adoptPending.erase(it->first);it=m_pending.erase(it);}else ++it;
+    // Streaming can still be loading the departed player's model. Keep the
+    // same identity instead of losing that car and later creating a second one.
+    for(auto&[vid,spawn]:m_pending)if(spawn.owner==id){
+        spawn.owner=successor;spawn.script=false;
+        if(successor==Net().MyId())m_adoptPending.insert(vid);else m_adoptPending.erase(vid);
     }
-    // the vehicles of the leaving player stay in the world and become ours (its scripts are gone with it)
-    for (auto& [vid, nv] : m_byId)
-        if (nv.owner == id) {
-            // All observers elect the same simulator; two survivors must not both take the car.
-            std::vector<uint8_t> survivors{Net().MyId()};
-            for (auto& [peerId, peer] : Net().Peers()) if (peerId != id) survivors.push_back(peerId);
-            nv.owner = VehicleSuccessor(Net().HostId(), id, survivors);
-            nv.hasState = false;
-            nv.script = false;
-            if (nv.owner == Net().MyId()) Release(nv);
-            else Protect(nv);
-        }
+    for(auto&[vid,nv]:m_byId)if(nv.owner==id){
+        nv.owner=successor;nv.hasState=false;nv.history.Clear();
+        nv.script=Alive(nv)&&ScriptHolds(nv.veh);
+        nv.firstAnnouncedMs=NowMs();nv.handoverUntil=NowMs()+3000;
+        if(successor==Net().MyId()){
+            Release(nv);
+            if(Alive(nv)){Announce(nv);SendLook(nv);SendState(nv,true);}
+        }else Protect(nv);
+        LOGI("Vehicle %04X inherited from player %u by %u native=%d generation=%llu",vid,id,successor,nv.handle,(unsigned long long)Net().EntityGeneration(ENTITY_VEHICLE,vid));
+    }
 }
 
 void Vehicles::OnSessionStart() { m_ids.Reset((uint32_t)NowMs()); }

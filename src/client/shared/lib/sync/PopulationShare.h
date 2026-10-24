@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <cmath>
 #include <array>
 #include "shared/game/Types.h"
 
@@ -11,7 +12,7 @@ struct PopulationShare {
     int8_t area=0;
     uint8_t source=255;
     bool Contains(const game::CVector& position,int8_t entityArea)const {
-        return active&&entityArea==area&&(position-centre).Length2D()<300;
+        return active&&entityArea==area&&std::fabs(position.z-centre.z)<80.f&&(position-centre).Length2D()<300;
     }
 };
 inline PopulationShare& NearbyPopulationShare(){static PopulationShare share;return share;}
@@ -34,7 +35,7 @@ inline std::array<uint8_t,3> ElectPopulationSources(const std::array<PopulationV
         const auto&s=indexed[source];if(!s.active||!s.canGenerate)continue;
         result[source]=source;
         for(size_t i=0;i<indexed.size();++i){const auto&v=indexed[i];
-            if(result[i]!=255||!v.active||v.area!=s.area)continue;
+            if(result[i]!=255||!v.active||v.area!=s.area||std::fabs(v.position.z-s.position.z)>=80.f)continue;
             float radius=previous[i]==source?leave:enter;
             if((v.position-s.position).Length2D()<radius)result[i]=source;
         }
@@ -46,12 +47,12 @@ inline int& PopulationBudgetExcluded(){static int count=0;return count;}
 // camera rotation must not send the same ambient entity back and forth.
 inline uint8_t PopulationOwnerAt(const game::CVector& at,int8_t area,float radius=80.0f){
     uint8_t best=255;
-    for(const auto& v:PopulationViewers())if(v.active&&v.canGenerate&&v.id<3&&PopulationSources()[v.id]==v.id&&v.area==area&&(v.position-at).Length2D()<radius)
+    for(const auto& v:PopulationViewers())if(v.active&&v.canGenerate&&v.id<3&&PopulationSources()[v.id]==v.id&&v.area==area&&std::fabs(v.position.z-at.z)<80.f&&(v.position-at).Length2D()<radius)
         if(best==255||v.id==PopulationHost()||(best!=PopulationHost()&&v.id<best))best=v.id;
     return best;
 }
 inline bool PopulationNeededAt(const game::CVector& at,int8_t area,float radius){
-    for(const auto&v:PopulationViewers())if(v.active&&v.area==area&&(v.position-at).Length2D()<radius)return true;
+    for(const auto&v:PopulationViewers())if(v.active&&v.area==area&&std::fabs(v.position.z-at.z)<80.f&&(v.position-at).Length2D()<radius)return true;
     return false;
 }
 }

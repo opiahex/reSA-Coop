@@ -49,6 +49,7 @@ struct RemotePlayer {
     uint64_t exitTaskMs = 0;
     SeatTransition seatTransition;
     bool deadShown = false;     // the owner reported death and the local ped plays it
+    JetpackState renderedJetpack;
     uint64_t jetpackMs = 0;     // when it was last given the jetpack
     std::vector<uint8_t> stats; // owner's CStats block (G_PLAYER_STATS): used while the ped is processed
     uint64_t heardMs = 0;       // its last voice frame was played (set by the voice feature)
