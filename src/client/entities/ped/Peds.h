@@ -95,6 +95,7 @@ struct NetPed {
     AnimationState extraLayers[PedInteraction::LayerCount];
     uint8_t handArm=255;uint16_t pairAnchor=0;game::CVector pairOffset;
     bool actionSentActive=false;
+    bool carContact=false; // native carjacker's contact/entry pose is owned by its simulator
     uint32_t actionRevision=0,actionSignature=0,actionSentRevision=0;
     uintptr_t actionLeaf=0;float actionTime=0;
     uint16_t actionBlock=0xFFFF,actionIndex=0;

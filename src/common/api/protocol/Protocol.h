@@ -183,6 +183,8 @@ enum MsgId : uint8_t {
 
     G_VEH_HORN = 172, // reliable native horn edges and active heartbeat
     G_STORY_EQUIPMENT = 173, // phase-scoped native special equipment
+    G_NPC_CARJACK = 174, // authoritative NPC pull-out -> victim's native seat exit
+    G_NPC_CAR_DOOR = 175, // NPC-owned native door animation, including guest-owned vehicles
     G_VOICE = 200,            // unreliable: voice frame
     G_LAST = 255,
 };

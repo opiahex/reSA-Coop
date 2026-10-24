@@ -20,7 +20,7 @@ The host runs the original story from their save. Two guests join with separate 
 Mandatory story characters and native mission logic remain intact; no extra personal objectives or role HUD are added.
 Side activities remain personal, and each player controls their own radio.
 
-Current baseline: **0.2.26-3p, protocol 37**. Version 0.2.26 fixes stuck horns, shared police handling of guest wanted levels and false school contacts. Previous Stowaway, water cannon, jetpack and vehicle handover fixes are included. Development is ongoing; the entire campaign and arbitrary third-party modifications are not certified bug-free.
+Current baseline: **0.2.27-3p, protocol 38**. Version 0.2.27 fixes NPC carjacking of guest vehicles, carjacker poses and doors, pursuit cleanup after wanted levels clear, and personal driving-school records with native skill awards. Previous fixes are included. The entire campaign and arbitrary third-party mod combinations are not certified bug-free.
 
 ## Install and play
 

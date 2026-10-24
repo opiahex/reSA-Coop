@@ -49,6 +49,7 @@
 #include "shared/lib/sync/DialogueQueue.h"
 #include "shared/lib/sync/GroupReadiness.h"
 #include "shared/lib/sync/SchoolPolicy.h"
+#include "shared/api/progress/SchoolProgress.h"
 #include "shared/lib/memory/Memory.h"
 #include "shared/ui/chat/Chat.h"
 
@@ -381,7 +382,9 @@ void __fastcall HookScriptProcess(void* script, void* edx) {
         }
     }
     auto timersBefore=Field<std::array<int32_t,2>>(script,0xBC);
+    bool personalDriving=BeginPersonalDrivingSchool(script);
     g_origScriptProcess(script, edx);
+    if(personalDriving)EndPersonalDrivingSchool();
     if(!Field<uint8_t>(script,0xC4))CancelCooperativeStage(script);
     if(CooperativeStageWaiting(script))Field<std::array<int32_t,2>>(script,0xBC)=timersBefore;
     if(partnerFailed)Ref<int8_t>(0xA444B0)=priorFailure;

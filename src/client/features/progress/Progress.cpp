@@ -12,6 +12,7 @@
 #include <windows.h>
 
 #include <cstring>
+#include <array>
 #include <map>
 #include <vector>
 
@@ -21,6 +22,7 @@
 #include "entities/ped/Peds.h"
 #include "entities/player/Players.h"
 #include "entities/profile/Profile.h"
+#include "shared/api/progress/SchoolProgress.h"
 #include "shared/api/story-coop/StoryCoop.h"
 #include "entities/session/Flow.h"
 #include "shared/api/net-session/Session.h"
@@ -38,7 +40,7 @@ using namespace game;
 using game::script::Cmd;
 
 constexpr uint32_t kProfileMagic = 0x46504353;  // "SCPF"
-constexpr uint16_t kProfileVersion = 4;  // 2: the rewards of side missions (CPlayerInfo +0x14C..+0x152); 3: whose look
+constexpr uint16_t kProfileVersion = 5;  // 5: personal driving-school records; older profiles remain readable
 constexpr uintptr_t kStatsBlock = 0xB79000;  // CStats::StatTypesInt + StatTypesFloat
 constexpr size_t kStatsSize = 0x4C8;
 // stats the world owns, not the player (CStats::StatTypesInt, id - 120): the profile keeps the values of the world it was
@@ -46,6 +48,20 @@ constexpr size_t kStatsSize = 0x4C8;
 // hospitals, the radio) and the story's accomplished missions, gang strength and territory
 constexpr int kWorldStats[][2] = {{148, 148}, {180, 181}, {302, 342}};  // missions in game; no more hurricanes, city; story
 constexpr size_t kClothesSize = sizeof(CPedClothesDesc);
+constexpr std::array<uint16_t,13> kDrivingGlobals={344,428,420,392,384,376,412,364,404,368,408,400,388};
+using DrivingRecords=std::array<int32_t,kDrivingGlobals.size()>;
+DrivingRecords g_driving{},g_drivingWorld{};
+bool g_drivingReady=false;unsigned g_drivingDepth=0;int32_t g_drivingSkillBefore=0;
+DrivingRecords ReadDrivingGlobals(){DrivingRecords result{};for(size_t i=0;i<result.size();++i)result[i]=Ref<int32_t>(addr::ScriptSpace+kDrivingGlobals[i]);return result;}
+void PutDrivingGlobals(const DrivingRecords& values){for(size_t i=0;i<values.size();++i)Ref<int32_t>(addr::ScriptSpace+kDrivingGlobals[i])=values[i];}
+void ResetDrivingRecords(){g_driving={};g_drivingReady=false;g_drivingDepth=0;}
+void WriteDrivingRecords(Writer&w){w.U32(0x4C4F4F48);for(auto value:g_driving)w.I32(value);}
+bool ReadDrivingRecords(Reader&r,bool stored){
+    DrivingRecords values{};
+    if(stored){if(r.U32()!=0x4C4F4F48)return false;for(auto&value:values)value=r.I32();
+        for(size_t i=0;i<values.size();++i)if(values[i]<0||values[i]>(i?100:1))return false;}
+    if(!r.Ok())return false;g_driving=values;g_drivingReady=true;return true;
+}
 
 void RebuildPlayer(CPlayerPed* ped, bool keepDescFatMuscle) { Call<0x5A82C0>(ped, keepDescFatMuscle); }  // CClothes::RebuildPlayer
 
@@ -140,6 +156,7 @@ std::vector<uint8_t> CaptureProfile() {
     w.U8(perks[6]);  // m_bFreeHealthCare
     w.U8(LookIsOwn());
     WriteStoryRewardHistory(w);
+    WriteDrivingRecords(w);
     return w.Buffer();
 }
 
@@ -163,6 +180,8 @@ bool ApplyProfile(const std::vector<uint8_t>& blob, bool& lookOwn) {
         for (uint8_t& b : perks) b = r.U8();
     uint8_t own = version >= 3 ? r.U8() : 0;
     if(version>=4&&!ReadStoryRewardHistory(r))return false;
+    if(!ReadDrivingRecords(r,version>=5))return false;
+    if(version<5)LOGI("Legacy profile has no personal driving-school records; initialized separately from host (skills retained)");
     if (!r.Ok() || stats.size() != kStatsSize || clothes.size() != kClothesSize) return false;
     lookOwn = own != 0;
 
@@ -269,6 +288,7 @@ public:
         Net().onProfileSaved=[](uint32_t crc){if(Instance().m_applied&&crc==Instance().m_pendingCrc)StoryRewardProfileSaved();};
         Net().onProfile = [](const std::vector<uint8_t>& blob) {
             StoryProfileReady(false);
+            g_drivingReady=false;
             Progress& p = Instance();
             // an empty profile after a real one, or during a prologue, in the same session (the first one of a session
             // is the newcomer's): the host began a new game, which this game is not in yet
@@ -291,6 +311,7 @@ public:
         m_profileReceived = m_applied = m_resetPending = m_reset = false;
         m_profile.clear();
         g_looks.clear();
+        ResetDrivingRecords();
     }
     void OnPeerJoin(uint8_t) override { ResendAppearance(); }
     void OnPeerResync(uint8_t) override { ResendAppearance(); }
@@ -302,6 +323,7 @@ public:
     }
     void OnGameStarted() override {  // a new world: the partner's profile goes on top again
         m_applied = false;StoryProfileReady(false);
+        g_drivingReady=false;
         g_foreignGame = Net().Online() && !Net().IsHost();
         if (m_resetPending && flow::InHostWorld()) m_reset = true, m_resetPending = false;  // the new game's world
     }
@@ -322,6 +344,7 @@ public:
             m_applied = true;
             bool own = false;
             if (m_profile.empty()) {
+                g_driving={};g_drivingReady=true;
                 ui::TheChat().AddSystem(m_reset ? TR("Хост начал новую игру. Деньги, оружие и навыки у вас тоже начинаются заново.",
                                                      "The host started a new game. Your money, weapons and skills start over too.")
                                                 : TR("Вы здесь впервые. Дальше деньги, навыки и внешность у вас будут свои.",
@@ -334,6 +357,7 @@ public:
                 ui::TheChat().AddSystem(TR("Загружены ваши деньги, навыки и внешность.", "Your money, skills and look are loaded."));
             } else {
                 LOGW("Profile rejected (bad format), starting from the world's state");
+                g_driving={};g_drivingReady=true;
             }
             g_lookOwn = own || WearOwnLook(m_profile.empty());
             if (!g_lookOwn) memcpy(g_givenKeys, me->ClothesDesc(), sizeof g_givenKeys);
@@ -444,5 +468,23 @@ struct Reg {
 }  // namespace
 
 void SaveProfileNow(bool always) { Progress::Instance().SaveNow(always); }
+
+bool BeginPersonalDrivingSchool(void*script){
+    if(!script||!g_drivingReady||!Net().Online()||Net().IsHost()||!flow::InHostWorld())return false;
+    const auto*name=game::Field<char[8]>(script,8);
+    if(_strnicmp(name,"dskool",8)&&_strnicmp(name,"trace",8))return false;
+    if(g_drivingDepth++==0){
+        g_drivingWorld=ReadDrivingGlobals();PutDrivingGlobals(g_driving);
+        g_drivingSkillBefore=game::Ref<int32_t>(kStatsBlock+(160-120)*4);
+    }
+    return true;
+}
+void EndPersonalDrivingSchool(){
+    if(!g_drivingDepth||--g_drivingDepth)return;
+    auto now=ReadDrivingGlobals();bool changed=now!=g_driving||
+        g_drivingSkillBefore!=game::Ref<int32_t>(kStatsBlock+(160-120)*4);
+    g_driving=now;PutDrivingGlobals(g_drivingWorld);
+    if(changed){LOGI("Personal driving-school progress changed; skill=%d completed=%d",game::Ref<int32_t>(kStatsBlock+(160-120)*4),g_driving[0]);SaveProfileNow(true);}
+}
 
 }  // namespace coop

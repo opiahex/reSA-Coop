@@ -942,7 +942,9 @@ void Players::SpawnRemote(RemotePlayer& rp) {
         Cmd(0x018B).I(blip).I(2).Run();       // CHANGE_BLIP_DISPLAY: radar only, no 3D arrow
         rp.blip = blip;
     }
-    LOGI("Remote player %d spawned (ped %p, handle %d)", rp.id, (void*)ped, handle);
+    auto*local=FindPlayerPed(0);
+    LOGI("Remote player %d spawned (ped %p, handle %d), wanted local=%u remote=%u separate=%d",rp.id,(void*)ped,handle,
+        local&&local->PlayerData()?WantedLevel(local):0,WantedLevel(ped),!local||!local->PlayerData()||local->Wanted()!=ped->Wanted());
 }
 
 void Players::DestroyRemote(RemotePlayer& rp) {
@@ -1102,6 +1104,10 @@ void Players::HandleExitCar(uint8_t from, Reader& r) {
     if (!rp || !rp->ped || !nv || !Vehicles::Alive(*nv)) return;
     if(rp->hasState&&(int32_t)(time-rp->lastStateTime)<0&&rp->mode==RemotePlayer::Mode::OnFoot)return;
     rp->enterPending=false;
+    // The owner acknowledges a native drag-out with the ordinary exit event.
+    // Do not replace that physical response with TASK_LEAVE_CAR halfway through
+    // the pull, or clear its protection against stale driver snapshots.
+    if(rp->seatTransition.jacked&&rp->seatTransition.HoldSeat(netId,NowMs()))return;
     if (!rp->seatTransition.Begin(netId, time, NowMs())) return;
     if (rp->ped->InVehicle() && rp->ped->Vehicle() == nv->veh) {
         rp->exitTaskMs = NowMs();

@@ -805,6 +805,7 @@ CPed* Peds::SpawnMirror(NetPed& np) {
     Cmd(0x087E).I(handle).I(0).Run();                      // SET_CHAR_DROPS_WEAPONS_WHEN_DEAD false
     ped->CurrentRotation() = ped->AimingRotation() = st.heading;
     ped->AreaCode() = st.area;
+    if(!(st.flags&PedSyncState::F_ENTERING))np.carContact=false;
     np.ped = ped;np.deadApplied=false;
     np.handle = handle;
     m_byPtr[ped] = np.netId;
@@ -1130,6 +1131,20 @@ void Peds::ApplyMirror(NetPed& np) {
     }
     np.leaveTaskMs = 0;
     if (st.flags & PedSyncState::F_ENTERING) {
+        bool pulling=false;for(unsigned i=0;i<st.interaction.depth;++i)
+            pulling|=st.interaction.chain[i]==817||st.interaction.chain[i]==820;
+        if(pulling||np.carContact){
+            // Running another enter/jack task here lets each viewer independently
+            // grab the victim and choose when the driver seat becomes free.
+            // Once contact begins, show the owner's real clip and transform until
+            // its seat snapshot arrives; only the victim owner runs the drag-out.
+            if(!np.carContact){Cmd(0x0687).I(np.handle).Run();np.carContact=true;np.enterTaskMs=0;}
+            SetEntityPosition(ped,st.pos);AlignContactHeading(np,st.heading);
+            ped->MoveSpeed()={};ped->Flags()&=~1u;
+            if(st.motion.Present())anim::Replay(ped->RwObject(),st.motion,std::min(.2f,(now-np.recvMs)/1000.f));
+            ReplayBoundAction(np,std::min(.2f,(now-np.recvMs)/1000.f));
+            return;
+        }
         NetVehicle* nv = (Net().EntityLink(ENTITY_PED,np.netId,ENTITY_VEHICLE,st.vehNetId)?Vehicles::Instance().Find(st.vehNetId):nullptr);
         if (nv && Vehicles::Alive(*nv) && np.enterVeh != st.vehNetId) {
             if (st.seat < 0) Cmd(0x05CB).I(np.handle).I(nv->handle).I(10000).Run();  // TASK_ENTER_CAR_AS_DRIVER
@@ -1142,6 +1157,7 @@ void Peds::ApplyMirror(NetPed& np) {
     } else if (now - np.enterTaskMs > kCarTaskGraceMs) {
         np.enterVeh = 0;
     }
+    np.carContact=false;
 
     // ---- on foot
     const auto* peer = Net().Peer(np.owner);

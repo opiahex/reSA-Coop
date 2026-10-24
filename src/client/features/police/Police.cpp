@@ -63,13 +63,32 @@ public:
         activeTarget=target;
         if(auto*rp=target?Players::Instance().FindByPed(target):nullptr){
             slot.emplace(*PlayerInfo(1),rp->info);PlayerInFocus()=1;
-        }
+        }else PlayerInFocus()=0;
     }
     ~Context(){slot.reset();PlayerInFocus()=savedFocus;activeTarget=savedTarget;}
 };
 bool AmbientCop(CPed*p){
     if(!p||p->PedType()!=PED_TYPE_COP||p->CreatedBy()!=1)return false;
     auto*n=Peds::Instance().Find(p);return !n||n->owner==Net().MyId();
+}
+void WantedChange(void*w,uint32_t before,const char*source,void*caller){
+    if(!w)return;
+    auto*me=FindPlayerPed(0);if(!me||!IsPedValid(me)||!me->PlayerData()||me->Wanted()!=w)return;
+    uint32_t after=Field<uint32_t>(w,0x2C);if(after==before)return;
+    auto pos=me->GetPosition();auto*v=me->VehicleIfIn();
+    LOGI("Police local wanted %u -> %u source=%s caller=%p chaos=%u focus=%d position=%.1f,%.1f,%.1f vehicle=%d",
+        before,after,source,caller,Field<uint32_t>(w,0),PlayerInFocus(),pos.x,pos.y,pos.z,v?GetVehicleRef(v):-1);
+}
+using WantedFn=void(__fastcall*)(void*,void*,uint32_t);WantedFn originalWanted=nullptr,originalNoDrop=nullptr;
+void __fastcall WantedLevel(void*w,void*edx,uint32_t level){
+    auto before=Field<uint32_t>(w,0x2C);originalWanted(w,edx,level);WantedChange(w,before,"set",__builtin_return_address(0));
+}
+void __fastcall WantedNoDrop(void*w,void*edx,uint32_t level){
+    auto before=Field<uint32_t>(w,0x2C);originalNoDrop(w,edx,level);WantedChange(w,before,"no-drop",__builtin_return_address(0));
+}
+using UpdateWantedFn=void(__fastcall*)(void*,void*);UpdateWantedFn originalUpdateWanted=nullptr;
+void __fastcall UpdateWanted(void*w,void*edx){
+    auto before=Field<uint32_t>(w,0x2C);originalUpdateWanted(w,edx);WantedChange(w,before,"chaos",__builtin_return_address(0));
 }
 using CopFn=void(__fastcall*)(CPed*,void*);CopFn originalCop=nullptr;
 void __fastcall CopControl(CPed*p,void*edx){
@@ -88,14 +107,16 @@ void __cdecl CarAI(CVehicle*v){
 }
 using PursuitFn=bool(__fastcall*)(void*,void*,CPed*);PursuitFn originalPursuit=nullptr;
 bool __fastcall SetPursuit(void*t,void*edx,CPed*cop){
-    if(!activeTarget)return originalPursuit(t,edx,cop);
+    if(!Net().Online()||!AmbientCop(cop))return originalPursuit(t,edx,cop);
+    auto*target=activeTarget?activeTarget:SelectTarget(cop);
     // Native SetPursuit picks the closest of two slots, even if that player
     // is innocent. Use the suspect whose wanted context runs this cop.
     auto*&old=Field<CEntity*>(t,0x14);
     if(old)CallMethod<0x571A00>(old,&old);old=nullptr;
-    if(!CallMethod<0x563060,bool>(activeTarget->Wanted(),cop))return false;
-    old=activeTarget;CallMethod<0x571B70>(old,&old);
-    LOGD("Police pursuit suspect=%u cop=%d",Players::Instance().FindByPed(activeTarget)?Players::Instance().FindByPed(activeTarget)->id:Net().MyId(),GetPedRef(cop));
+    if(!Available(target,cop->GetPosition(),AreaOf(cop)))return false;
+    if(!CallMethod<0x563060,bool>(target->Wanted(),cop))return false;
+    old=target;CallMethod<0x571B70>(old,&old);
+    LOGD("Police pursuit suspect=%u cop=%d",Players::Instance().FindByPed(target)?Players::Instance().FindByPed(target)->id:Net().MyId(),GetPedRef(cop));
     return true;
 }
 using ClearFn=void(__stdcall*)(CPed*);ClearFn originalClear=nullptr;
@@ -107,16 +128,35 @@ void __stdcall ClearPursuit(CPed*cop){
         CallMethod<0x562C10>(rp.ped->Wanted(),cop);
 }
 CopFn originalDestructor=nullptr;
+using PersistFn=bool(__fastcall*)(void*,void*,CPed*);PersistFn originalPersist=nullptr;
+bool __fastcall PersistPursuit(void*t,void*edx,CPed*cop){
+    if(Net().Online()&&AmbientCop(cop)){
+        auto*p=Field<CPed*>(t,0x14);
+        if(p&&(p==FindPlayerPed(0)||Players::Instance().FindByPed(p))&&
+           !Available((CPlayerPed*)p,cop->GetPosition(),AreaOf(cop))){
+            ClearPursuit(cop);return false;
+        }
+    }
+    return originalPersist(t,edx,cop);
+}
 void __fastcall CopDestructor(CPed*cop,void*edx){
     ClearPursuit(cop);originalDestructor(cop,edx);
 }
 class Police:public Module {
     const char*Name()const override{return "Police";}
+    void OnGameStarted()override{
+        auto*me=FindPlayerPed(0);if(me&&me->PlayerData()&&me->Wanted())
+            LOGI("Police world loaded: local wanted=%u chaos=%u",Field<uint32_t>(me->Wanted(),0x2C),Field<uint32_t>(me->Wanted(),0));
+    }
     void OnInstallHooks()override{
         mem::HookFn(0x5DE160,&CopControl,&originalCop,"CCopPed::ProcessControl");
+        mem::HookFn(0x562470,&WantedLevel,&originalWanted,"CWanted::SetWantedLevel");
+        mem::HookFn(0x562570,&WantedNoDrop,&originalNoDrop,"CWanted::SetWantedLevelNoDrop");
+        mem::HookFn(0x561C90,&UpdateWanted,&originalUpdateWanted,"CWanted::UpdateWantedLevel");
         mem::HookFn(0x608260,&Intelligence,&originalIntel,"CPedIntelligence::Process");
         mem::HookFn(0x41DA30,&CarAI,&originalCar,"CCarAI::UpdateCarAI");
         mem::HookFn(0x68BBD0,&SetPursuit,&originalPursuit,"CTaskComplexPolicePursuit::SetPursuit");
+        mem::HookFn(0x68BDC0,&PersistPursuit,&originalPersist,"CTaskComplexPolicePursuit::PersistPursuit");
         mem::HookFn(0x68BD90,&ClearPursuit,&originalClear,"CTaskComplexPolicePursuit::ClearPursuit");
         mem::HookFn(0x5DE0D0,&CopDestructor,&originalDestructor,"CCopPed::~CCopPed");
     }

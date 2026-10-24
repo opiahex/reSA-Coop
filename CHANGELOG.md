@@ -2,7 +2,35 @@
 
 Первая публикация форка объединяет локальные версии **0.2.6-3p–0.2.24-3p** и перенесённые исправления SA:COOP.
 Это перечень итоговых изменений по подсистемам: промежуточные экспериментальные решения, которые были заменены, отдельными возможностями не считаются.
-Текущая база — **0.2.26-3p, протокол 37**. Все участники и сервер должны обновляться вместе.
+Текущая база — **0.2.27-3p, протокол 38**. Все участники и сервер должны обновляться вместе.
+
+## 0.2.27-3p
+
+### Русский
+
+- Исправлено вытаскивание гостя из машины NPC: команда доходит до владельца персонажа и запускает штатную физическую реакцию GTA.
+- Событие выхода больше не перебивает анимацию угона и не возвращает жертву на водительское место запоздавшим пакетом.
+- Угонщик передаёт свою фазу анимации; сетевые копии не проводят независимый повторный угон. После завершения машина переходит к симулятору NPC.
+- Открывание и закрывание двери NPC передаются и тогда, когда машиной ещё владеет гость.
+- Исправлены вложенный выбор контекста полиции и продолжение старой погони за участником без розыска. Новая погоня проверяет личный розыск выбранной цели.
+- Диагностика записывает изменение личного розыска, его нативный источник и состояние при загрузке мира.
+- Результаты двенадцати испытаний автошколы и её завершение сохраняются в личном профиле гостя; меню школы не подхватывает медали хоста.
+- Сохраняются штатные награды навыка вождения: +30 за впервые полученное золото в испытании и +40 за первое завершение школы, без повторного начисления за тот же результат.
+- Профиль обновлён до версии 5. Старые профили сохраняют деньги, навыки и внешность; отсутствовавшие личные записи автошколы начинаются отдельно от медалей хоста. Общие сюжетные флаги мира за пределами школьного сценария сохраняются.
+- Протокол 38: обновить нужно всех клиентов и сервер.
+
+### English
+
+- Fixed NPCs dragging guests out of vehicles: the character owner receives the action and runs GTA's native physical response.
+- Exit acknowledgements no longer interrupt the carjack animation or let delayed driver snapshots put the victim back in the seat.
+- The carjacker replicates its animation phase; replicas do not independently repeat the theft. Vehicle authority transfers to the NPC simulator after completion.
+- NPC door opening/closing also replicates while the vehicle is still owned by a guest.
+- Fixed nested police player contexts and persistence of an old pursuit against an innocent participant. New pursuits validate the selected target's personal wanted level.
+- Diagnostics record personal wanted-level changes, their native source and the state loaded with the world.
+- Guests keep their twelve driving-school best scores and completion flag in their personal profile; school menus no longer inherit host medals.
+- Native driving-skill awards remain intact: +30 for first gold in a test and +40 for first school completion, without awarding the same result again.
+- Profile version 5 retains money, skills and appearance from older profiles. Previously unstored personal school records start separately from host medals. Shared story unlock flags are preserved outside the school interpreter.
+- Protocol 38 requires all clients and the server to update.
 
 ## 0.2.26-3p
 
