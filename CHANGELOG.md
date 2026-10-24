@@ -2,7 +2,29 @@
 
 Первая публикация форка объединяет локальные версии **0.2.6-3p–0.2.24-3p** и перенесённые исправления SA:COOP.
 Это перечень итоговых изменений по подсистемам: промежуточные экспериментальные решения, которые были заменены, отдельными возможностями не считаются.
-Текущая база — **0.2.25-3p, протокол 36**. Все участники и сервер должны обновляться вместе.
+Текущая база — **0.2.26-3p, протокол 37**. Все участники и сервер должны обновляться вместе.
+
+## 0.2.26-3p
+
+### Русский
+
+- Исправлен бесконечный гудок сетевых машин: нативный флаг прошлого воспроизведения больше не затирается перед остановкой аудиоканала. Исправление относится и к машинам трафика.
+- Розыск гостя теперь используется в нативных решениях общих полицейских, а не только в звёздах над игроком. Сохраняются личный розыск и сценарные запреты на преследование.
+- Полицейские выбирают разыскиваемого участника; ближайший невиновный игрок не становится целью только из-за расстояния. При завершении преследования очищаются списки нужного игрока.
+- Выбор полицейского транспорта и его управление учитывают разыскиваемого гостя в общей зоне населения.
+- Фильтр школьных столкновений распознаёт водителя до регистрации машины и завершения передачи владения.
+- Контакт между участниками школы не записывается как отложенное повреждение кузова и не пересылается повторно сетевым импульсом. Вне активного школьного сценария действует штатный урон.
+- Протокол 37 передаёт также личные флаги игнорирования полицией. Обновить нужно хоста, гостей и сервер вместе.
+
+### English
+
+- Fixed endlessly sounding horns on network vehicles: native previous-playback state is no longer overwritten before the audio channel can stop. This also fixes traffic vehicle replicas.
+- Guest wanted levels now feed native shared-police decisions instead of only the stars above their name tags. Personal wanted levels and scripted police back-off remain separate.
+- Police select a wanted participant; an innocent player is no longer selected merely for being closer. Pursuit cleanup removes the cop from the correct player's lists.
+- Shared police vehicle selection and steering take nearby wanted guests into account.
+- School contact filtering recognises the driver before vehicle registration and ownership handover finish.
+- Contact between school participants no longer records deferred body damage or forwards another network impulse. Native damage applies outside an active school script.
+- Protocol 37 also carries personal police back-off flags. The host, guests and server must all update together.
 
 ## 0.2.25-3p
 

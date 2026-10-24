@@ -327,8 +327,8 @@ void __fastcall HookPlayerProcessControl(CPlayerPed* self, void* edx) {
 }
 
 // The remote player's gang work (CPlayerPed::ProcessGroupBehaviour, called from its ProcessControl): recruiting this
-// game's Grove members with its buttons, and the Grove gang's hate for cops from its wanted level here, which is not
-// its real one. Its own game runs its gang.
+// game's Grove members with its buttons, and this game's Grove gang reacting
+// to its wanted level. Its own game runs its gang.
 using GroupBehaviourFn = void(__fastcall*)(CPlayerPed*, void*, CPad*);
 GroupBehaviourFn g_origGroupBehaviour = nullptr;
 void __fastcall HookGroupBehaviour(CPlayerPed* self, void* edx, CPad* pad) {
@@ -382,7 +382,8 @@ void __fastcall HookVehicleAudioService(void* audio, void* edx) {
         int type = veh->VehicleSubClass();
         if (type != VEHICLE_TYPE_BOAT && type != VEHICLE_TYPE_PLANE && type != VEHICLE_TYPE_HELI) {
             Field<uint32_t>(veh, 0x514) = horn ? 1 : 0;
-            Field<uint8_t>(veh, 0x1F6) = horn ? 1 : 0;
+            // veh + 0x1F6 is audio.m_IsHornOn, not an input flag. Native
+            // playback needs its previous value to stop an allocated sound.
         }
     }
     if (remote) driver->PedType() = PED_TYPE_PLAYER_NETWORK;
@@ -534,6 +535,10 @@ uint8_t WantedLevel(CPlayerPed* me) {
     void* wanted = me->PlayerData() ? me->Wanted() : nullptr;
     return wanted ? (uint8_t)std::clamp(Field<int32_t>(wanted, 0x2C), 0, 6) : 0;  // CWanted::m_nWantedLevel
 }
+uint8_t PoliceFlags(CPlayerPed* me) {
+    void* wanted=me->PlayerData()?me->Wanted():nullptr;
+    return wanted?Field<uint8_t>(wanted,0x1E)&7:0;
+}
 
 CVector CaptureAimOffset(CPlayerPed* me) {
     CVector origin, target;
@@ -573,6 +578,7 @@ void FillCommon(OnFootState& st, CPlayerPed* me) {
     st.flags = me->Health() <= 0 || me->PedState() == 54 || me->PedState() == 55 ? OnFootState::F_DEAD : 0;
     st.health = ClampByte(me->Health());
     st.wanted = WantedLevel(me);
+    st.policeFlags = PoliceFlags(me);
     st.armour = ClampByte(me->Armour());
     CWeapon& w = me->ActiveWeapon();
     st.weapon = (uint8_t)w.type;
@@ -609,6 +615,7 @@ void WriteCommon(Writer& w, const OnFootState& st) {
     w.U16(st.ammo);
     w.I8(st.area);
     w.U8(st.wanted);
+    w.U8(st.policeFlags);
     w.U8(st.flags);
     w.U8(st.fightingStyle);
     w.U8(st.attackMoves);
@@ -624,6 +631,8 @@ bool ReadCommon(Reader& r, OnFootState& st) {
     st.ammo = r.U16();
     st.area = r.I8();
     st.wanted = r.U8();
+    st.policeFlags = r.U8();
+    if(st.wanted>6||(st.policeFlags&~7))return false;
     st.flags = r.U8();
     st.fightingStyle = r.U8();
     st.attackMoves = r.U8();
@@ -1751,6 +1760,7 @@ void Players::SendLocalState() {
     CaptureMotion(st,me);
     bool transition=previousEpoch!=m_actionEpoch;
     st.wanted = WantedLevel(me);
+    st.policeFlags = PoliceFlags(me);
     CPad* pad = GetPad(0);
     if (pad->DisablePlayerControls == 0 && !game::MenuActive()) st.pad = PadState::From(pad->NewState);
     CameraState& c = st.cam;

@@ -128,6 +128,7 @@ void OnFootState::Write(Writer& w) const {
     w.I8(area);
     w.U8(moveState);
     w.U8(wanted);
+    w.U8(policeFlags);
     w.U8(fightingStyle);
     w.U8(attackMoves);
     pad.Write(w);
@@ -150,6 +151,8 @@ bool OnFootState::Read(Reader& r) {
     area = r.I8();
     moveState = r.U8();
     wanted = r.U8();
+    policeFlags = r.U8();
+    if(wanted>6||(policeFlags&~7))return false;
     fightingStyle = r.U8();
     attackMoves = r.U8();
     if (fightingStyle < 4 || fightingStyle > 16) return false;

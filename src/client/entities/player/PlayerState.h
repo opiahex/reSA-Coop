@@ -72,6 +72,7 @@ struct OnFootState {
     int8_t area = 0;
     uint8_t moveState = 0;
     uint8_t wanted = 0;  // stars, shown on the name tag
+    uint8_t policeFlags = 0;  // CWanted back-off flags: scene, garage, everybody
     uint8_t fightingStyle = 4, attackMoves = 0;
     PadState pad;
     CameraState cam;

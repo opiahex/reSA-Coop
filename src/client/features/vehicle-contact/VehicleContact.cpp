@@ -7,6 +7,7 @@
 #include "common/lib/log/Log.h"
 #include "common/lib/util/Util.h"
 #include "entities/vehicle/Vehicles.h"
+#include "entities/activity/Activities.h"
 #include "shared/api/net-session/Session.h"
 #include "shared/lib/memory/Memory.h"
 #include "shared/api/mission-objects/SharedObject.h"
@@ -22,6 +23,11 @@ using ContactFn=bool(__fastcall*)(CPhysical*,void*,CPhysical*,void*,float*,float
 ContactFn originalHard=nullptr,originalSoft=nullptr;
 bool ProcessContact(ContactFn original,CPhysical*a,void*edx,CPhysical*b,void*point,float*damageA,float*damageB){
     if(!Net().Online()||!core::IsPlayerReady()||!a||!b)return original(a,edx,b,point,damageA,damageB);
+    if(TrainingIgnoresContact(a,b)){
+        if(damageA)*damageA=0;
+        if(damageB)*damageB=0;
+        return false;
+    }
     bool cargo=false;bool cargoResult=ProcessSharedCargoContact(original,a,edx,b,point,damageA,damageB,cargo);
     if(cargo)return cargoResult;
     if(!a->IsVehicle()||!b->IsVehicle())return original(a,edx,b,point,damageA,damageB);
@@ -60,7 +66,7 @@ public:
         auto*a=Vehicles::Instance().Find(source);auto*b=Vehicles::Instance().Find(target);
         if(!a||!b||a->owner!=from||b->owner!=Net().MyId()||from==b->owner||
            a->veh->AreaCode()!=b->veh->AreaCode()||(a->veh->GetPosition()-b->veh->GetPosition()).Length()>25||
-           (b->veh->PhysicalFlags()&0x2000u))return;
+           (b->veh->PhysicalFlags()&0x2000u)||TrainingIgnoresContact(a->veh,b->veh))return;
         if(a->hasState&&(int32_t)(a->lastTime-stamp)>500)return;
         uint32_t key=((uint32_t)source<<16)|target;
         // A vehicle retains its ID when another peer takes the wheel; that
@@ -78,7 +84,7 @@ public:
  void OnPostProcess()override{
     if(!Net().Online()||!core::IsPlayerReady()||NowMs()-lastSend<33)return;lastSend=NowMs();
     for(auto&[key,c]:pending){auto*a=Vehicles::Instance().Find(c.source);auto*b=Vehicles::Instance().Find(c.target);
-        if(!a||!b||a->owner!=Net().MyId()||b->owner!=c.owner||c.owner==Net().MyId())continue;
+        if(!a||!b||a->owner!=Net().MyId()||b->owner!=c.owner||c.owner==Net().MyId()||TrainingIgnoresContact(a->veh,b->veh))continue;
         auto m=Limit(c.move,20.f),t=Limit(c.turn,12.f);Writer w(proto::G_VEH_CONTACT);w.Entity(ENTITY_VEHICLE,c.source);w.Entity(ENTITY_VEHICLE,c.target);w.U32(++sequence);w.U32((uint32_t)NowMs());w.VecQ({m.x,m.y,m.z},30.f);w.VecQ({t.x,t.y,t.z},15.f);Net().Send(proto::CH_RELIABLE,w);
     }pending.clear();
     if(NowMs()-lastPrune>5000){lastPrune=NowMs();for(auto it=received.begin();it!=received.end();)it=(!Vehicles::Instance().Find((uint16_t)(it->first>>16))||!Vehicles::Instance().Find((uint16_t)it->first))?received.erase(it):std::next(it);for(auto it=nativeContacts.begin();it!=nativeContacts.end();)it=NowMs()-it->second>10000?nativeContacts.erase(it):std::next(it);}

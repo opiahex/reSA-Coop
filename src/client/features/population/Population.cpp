@@ -9,6 +9,7 @@
 #include <cmath>
 
 #include "features/population/Population.h"
+#include "shared/api/police/Police.h"
 #include "common/lib/log/Log.h"
 #include "common/lib/util/Util.h"
 #include "entities/ped/Peds.h"
@@ -95,7 +96,7 @@ void __cdecl HookGenerateRandomCars() {
     auto&missions=Ref<int32_t>(0x96909C);excluded=std::min(excluded,std::max(0,missions));
     PopulationBudgetExcluded()=excluded;
     missions-=excluded;
-    g_origGenerateRandomCars();
+    GeneratePoliceAwareTraffic(g_origGenerateRandomCars);
     missions+=excluded;
 }
 

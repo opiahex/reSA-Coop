@@ -36,7 +36,17 @@ uint8_t Owner(CEntity* entity) {
         if(auto*rp=Players::Instance().FindByPed((CPed*)entity))return rp->id;
         if(auto*np=Peds::Instance().Find((CPed*)entity))return np->owner;
     }
-    if(entity->IsVehicle())if(auto*nv=Vehicles::Instance().Find((CVehicle*)entity))return nv->owner;
+    if(entity->IsVehicle()){
+        auto*v=(CVehicle*)entity;
+        // A school can spawn/seat a car before the next entity scan or
+        // ownership handover. The player at the wheel identifies it now.
+        if(auto*driver=v->Driver()){
+            if(driver==FindPlayerPed(0))return Net().MyId();
+            if(auto*rp=Players::Instance().FindByPed(driver))return rp->id;
+        }
+        if(auto*nv=Vehicles::Instance().Find(v))return nv->owner;
+        if(Vehicles::ScriptControlled(v))return Net().MyId();
+    }
     return 255;
 }
 uint8_t Trainee(CEntity* entity) {
@@ -61,6 +71,13 @@ void FilterCollision(PreCollisionFn original,CPhysical*a,void*e,CPhysical*b,bool
 }
 void __fastcall PedCollision(CPhysical*a,void*e,CPhysical*b,bool i,bool*d,bool*g,bool*u,bool*s){FilterCollision(originalPed,a,e,b,i,d,g,u,s);}
 void __fastcall VehicleCollision(CPhysical*a,void*e,CPhysical*b,bool i,bool*d,bool*g,bool*u,bool*s){FilterCollision(originalVehicle,a,e,b,i,d,g,u,s);}
+using DamageRecordFn=void(__fastcall*)(CPhysical*,void*,float,CEntity*,const void*,float);
+DamageRecordFn originalDamageRecord=nullptr;
+void __fastcall DamageRecord(CPhysical*a,void*edx,float force,CEntity*b,const void*point,float distance){
+    // Direct/native collision paths can record damage outside the pair
+    // precheck. Do not leave a deferred impact for VehicleDamage next frame.
+    if(!TrainingIgnoresContact(a,b))originalDamageRecord(a,edx,force,b,point,distance);
+}
 class Activities:public Module {
 public:
     const char*Name()const override{return "Activities";}
@@ -70,6 +87,7 @@ public:
         // exercise targets. Turning off bUsesCollision would also lose those.
         mem::HookFn(0x5E3C30,&PedCollision,&originalPed,"CPed::SpecialEntityPreCollisionStuff");
         mem::HookFn(0x6D6640,&VehicleCollision,&originalVehicle,"CVehicle::SpecialEntityPreCollisionStuff");
+        mem::HookFn(0x5428C0,&DamageRecord,&originalDamageRecord,"CPhysical::SetDamagedPieceRecord");
     }
     void OnPreProcess()override{
         if(!Net().Online())return;

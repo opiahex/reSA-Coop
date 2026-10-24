@@ -1,4 +1,5 @@
 #include "shared/api/vehicle-effects/VehicleEffects.h"
+#include "shared/api/police/Police.h"
 #include "entities/vehicle/Vehicles.h"
 
 #include <algorithm>
@@ -137,7 +138,7 @@ SteerFn g_origSteerAI = nullptr;
 void __cdecl HookSteerAICarWithPhysics(CVehicle* v) {
     if (Net().Online() && v)
         if (NetVehicle* nv = Vehicles::Instance().Find(v); nv && Vehicles::Instance().IsMirror(*nv)) return;
-    g_origSteerAI(v);
+    ProcessPoliceVehicle(v,g_origSteerAI);
 }
 using AddSearchLightFn=void(__cdecl*)(const CVector&,const CVector&,float,float,uint32_t,uint8_t,uint8_t);
 AddSearchLightFn g_origAddSearchLight=nullptr;
