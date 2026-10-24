@@ -5,6 +5,8 @@
 // game hangs the same object on its copy of that person, without collision. Let go (the canopy on landing), the object
 // stays where the owner's is until that one is gone.
 #include <algorithm>
+#include "shared/api/native-interaction/NativeInteraction.h"
+#include "shared/lib/sync/SnapshotBuffer.h"
 #include <cmath>
 #include "shared/lib/sync/IdAllocator.h"
 #include "shared/api/mission-objects/SharedObject.h"
@@ -39,6 +41,7 @@ enum : uint8_t { BY_PLAYER = 0, BY_PED = 1 };
 enum : uint8_t { HANG_ATTACHED = 0, HANG_HELD = 1, HANG_LOOSE = 2 };
 
 struct Prop {
+    uint32_t time=0;CVector velocity;
     uint16_t model = 0;
     uint8_t by = BY_PLAYER;
     uint16_t holder = 0;  // BY_PED: the ped's net id
@@ -59,6 +62,7 @@ struct Prop {
 };
 
 void Write(Writer& w, const Prop& p) {
+    w.U32((uint32_t)NowMs());w.Vec({p.velocity.x,p.velocity.y,p.velocity.z});
     w.U16(p.model);
     w.U8(p.by);
     if(p.by==BY_PED)w.Entity(ENTITY_PED,p.holder);else w.U16(p.holder);
@@ -83,6 +87,7 @@ void Write(Writer& w, const Prop& p) {
 }
 
 void Read(Reader& r, Prop& p) {
+    p.time=r.U32();auto v=r.Vec();p.velocity={v.x,v.y,v.z};
     p.model = r.U16();
     p.by = r.U8();
     p.holder = r.U16();
@@ -122,6 +127,7 @@ bool Differs(const Prop& a, const Prop& b) {
 
 // ---------------------------------------------------------------- ours
 struct Owned {
+    bool pool=false;
     CObject* obj = nullptr;
     int handle = -1;
     Prop sent;
@@ -249,7 +255,9 @@ void Scan() {
                 bool roadblock = Field<uint8_t>(o, 0x13C) == 3 &&  // OBJECT_TEMPORARY (our copies are 6)
                                  (model == Ref<int16_t>(0x8CD57C) || model == Ref<int16_t>(0x8CD580));  // MI_DYN_ROADBARRIER_6, MI_LA_FUCKCAR1
                 int8_t area = o->AreaCode() == 13 ? 0 : o->AreaCode();  // 13: seen in every area (the roadblock's are)
-                if (!roadblock || RemoteDistance(o->GetPosition(), area) > 150.0f) continue;
+                bool poolBall=OwnsNativePoolTable()&&((model>=2995&&model<=3003)||(model>=3100&&model<=3106))&&
+                    (o->GetPosition()-me->GetPosition()).Length()<8&&Field<uint8_t>(o,0x13C)!=6;
+                if ((!roadblock&&!poolBall) || RemoteDistance(o->GetPosition(), area) > 150.0f) continue;
                 Prop p;
                 p.by = BY_PLAYER;
                 p.hang = HANG_LOOSE;
@@ -271,6 +279,7 @@ void Scan() {
     uint64_t now = NowMs();
     std::vector<uint16_t> gone;
     for (auto& [id, ow] : g_owned) {
+        if(ow.pool&&!OwnsNativePoolTable()){gone.push_back(id);continue;}
         if(IsSharedMissionObject(ow.obj)){gone.push_back(id);continue;}
         if (!Alive(ow.obj, ow.handle)) {
             gone.push_back(id);
@@ -295,6 +304,7 @@ void Scan() {
             p.offset = ow.obj->GetPosition();
             if (CMatrix* m = ow.obj->Matrix()) p.rot = Quat::FromMatrix(*m);
         }
+        if(p.hang==HANG_LOOSE)p.velocity=ow.obj->MoveSpeed()*50.f;
         if (!ReadLook(ow.obj, p)) {  // the animation as it was
             p.animBlock = ow.sent.animBlock;
             p.animIdx = ow.sent.animIdx;
@@ -316,7 +326,8 @@ void Scan() {
         Net().BeginEntity(ENTITY_PROP,id);Owned& ow = g_owned[id];
         ow.obj = o;
         ow.handle = h;
-        ReadLook(o, p);
+        ReadLook(o, p);if(p.hang==HANG_LOOSE)p.velocity=o->MoveSpeed()*50.f;
+        ow.pool=OwnsNativePoolTable()&&p.hang==HANG_LOOSE&&((p.model>=2995&&p.model<=3003)||(p.model>=3100&&p.model<=3106));
         p.animRev = 1;
         ow.sent = p;
         ow.animTime = p.animTime;
@@ -334,6 +345,7 @@ struct Copy {
     uint8_t from = 0;
     Prop p;
     uint64_t recvMs = 0;
+    SnapshotBuffer<Prop> history;
     CObject* obj = nullptr;
     int handle = -1;
     int8_t shown = -1;              // the visibility set on it
@@ -496,8 +508,9 @@ void Apply(Copy& c) {
         if (o->AttachedTo()) Detach(c);
         if (c.p.hang == HANG_HELD) {
             InHand(o, holder, c.p);
-        } else if (!c.placed) {
-            Place(o, c.p.offset, c.p.rot);
+        } else if (!c.placed || c.history.Size()>1) {
+            auto pose=c.history.At(NowMs(),[](const Prop&a,const Prop&b,float t){auto p=b;p.offset=a.offset+(b.offset-a.offset)*t;p.rot=Quat::Slerp(a.rot,b.rot,t);return p;},[](Prop&p,float age,bool stale){if(!stale)p.offset=p.offset+p.velocity*age;});
+            Place(o, pose.offset, pose.rot);
             c.placed = true;
         }
     }
@@ -525,10 +538,12 @@ void Handle(uint8_t from, Reader& r) {
     }
     Prop p;
     Read(r, p);
+    if (!std::isfinite(p.velocity.x)||!std::isfinite(p.velocity.y)||!std::isfinite(p.velocity.z)||p.velocity.Length()>200)return;
     if (!r.Ok() || op != OP_STATE || p.by > BY_PED || p.hang > HANG_LOOSE || p.bone >= kPedNodes || !std::isfinite(p.scale) || p.scale <= 0 || p.scale > 100) return;
     Copy& c = g_copies[k];
     bool remake = c.obj && c.p.model != p.model;
-    c.from = from;
+    if(remake||c.p.hang!=p.hang)c.history.Clear();
+    c.history.Push(p,NowMs());c.from = from;
     c.p = p;c.holderGeneration=p.by==BY_PED?Net().EntityGeneration(ENTITY_PED,p.holder):0;
     c.recvMs = NowMs();
     c.placed = false;

@@ -58,7 +58,7 @@ struct NetVehicle {
     SnapshotBuffer<VehicleState> history;
     uint64_t firstAnnouncedMs = 0;
     uint64_t lastSendMs = 0;
-    bool lastEngine=false;float lastRotor=0;
+    bool lastEngine=false;float lastRotor=0;float sentHealth=1000;
     uint64_t handoverUntil = 0;
     uint64_t lastChangeMs = 0;  // owned: last time it moved or was used
     uint64_t lastLocalDriverMs=0;

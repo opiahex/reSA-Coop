@@ -46,7 +46,7 @@ constexpr size_t kStatsSize = 0x4C8;
 // stats the world owns, not the player (CStats::StatTypesInt, id - 120): the profile keeps the values of the world it was
 // saved in, and laid over a newer one it took the city back (STAT_CITY_UNLOCKED: wanted stars over the bridges, the
 // hospitals, the radio) and the story's accomplished missions, gang strength and territory
-constexpr int kWorldStats[][2] = {{148, 148}, {180, 181}, {302, 342}};  // missions in game; no more hurricanes, city; story
+constexpr int kWorldStats[][2] = {{146, 148}, {180, 181}, {302, 342}};  // missions in game; no more hurricanes, city; story
 constexpr size_t kClothesSize = sizeof(CPedClothesDesc);
 constexpr std::array<uint16_t,13> kDrivingGlobals={344,428,420,392,384,376,412,364,404,368,408,400,388};
 using DrivingRecords=std::array<int32_t,kDrivingGlobals.size()>;
@@ -194,6 +194,8 @@ bool ApplyProfile(const std::vector<uint8_t>& blob, bool& lookOwn) {
     memcpy((void*)kStatsBlock, stats.data(), kStatsSize);
     for (const auto& range : kWorldStats)
         for (int id = range[0]; id <= range[1]; ++id) Ref<int32_t>(kStatsBlock + (uintptr_t)(id - 120) * 4) = world[id - 120];
+    // Progress made / total progress are campaign counters, not personal skills.
+    memcpy((void*)(kStatsBlock+0x380),(uint8_t*)world+0x380,2*sizeof(float));
     memcpy(me->ClothesDesc(), clothes.data(), kClothesSize);
     RebuildPlayer(me, false);  // body from the profile's fat/muscle stats
     Cmd(0x048F).I(h).Run();    // REMOVE_ALL_CHAR_WEAPONS

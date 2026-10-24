@@ -13,6 +13,7 @@
 //      screen      - fades and widescreen borders (G_FADE), onscreen timers/counters (G_ONSCREEN).
 // Mission peds and vehicles are ordinary host entities (Peds/Vehicles).
 #include <algorithm>
+#include "shared/api/story-world/StoryWorld.h"
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -762,7 +763,11 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
                 killModel=params[1];}
         }else coop=CooperativeStoryCondition(op,params,script);
     }
+    int mapParams[6]{};bool mapEdit=story&&(chainOp==0x0363||chainOp==0x088D||chainOp==0x03B6);
+    if(mapEdit){alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);uint32_t saved[32];memcpy(saved,(void*)0xA43C78,sizeof saved);CallMethod<0x464080>(copy,6);memcpy(mapParams,(void*)0xA43C78,sizeof mapParams);memcpy((void*)0xA43C78,saved,sizeof saved);}
+    if(mapEdit)mapEdit=ResolveStoryMapTarget(chainOp,mapParams);
     auto result=g_objectCommands[Group](script,edx,opcode);
+    if(mapEdit)RecordStoryMapCommand(chainOp,mapParams);
     if(story&&(chainOp==0x015A||chainOp==0x02EB))g_sceneScriptCamera=false;
     if(killOutput)*killOutput=std::clamp<int64_t>((int64_t)*killOutput+CooperativeGuestKills(killModel),0,1000000);
     if(coop){Field<uint8_t>(script,0xC5)=before;Field<int16_t>(script,0xD0)=logic;CallMethod<0x4859D0>(script,true);}

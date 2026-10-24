@@ -58,7 +58,7 @@ void UpdateSuppression() {
         if(want){g_populationCentre=PopulationViewers()[source].position;g_populationArea=PopulationViewers()[source].area;}
     }
     if (want != g_suppress || (want&&source!=NearbyPopulationShare().source)) LOGI("Population generation %s (source %u)", want ? "shared with a nearby player" : "local",want?source:Net().MyId());
-    if (g_suppress && !want) {
+    if (g_suppress && !want && Ref<float>(addr::TheCamera+0xBFC)>200.f) {
         // the engine adds one ped a frame at the edge of view: the empty streets around would fill slowly. The
         // countdowns of a game's start (and of a respawn) fill them at once
         Ref<uint8_t>(0xC0EC23) = 2;  // CPopulation::m_CountDownToPedsAtStart
@@ -145,7 +145,7 @@ const CVector* NearestRemote(const CVector& p, float maxDist, int8_t area, uint8
 using ManagePedFn = void(__cdecl*)(CPed*, const CVector*);
 ManagePedFn g_origManagePed = nullptr;
 void __cdecl HookManagePed(CPed* ped, const CVector* centre) {
-    if (Net().Online() && ped && centre) {
+    if (Net().Online() && ped && centre && !(ped->PedFlags2()&8)) {
         if(auto*np=Peds::Instance().Find(ped);np&&ped->Health()>0){
             const auto p=ped->GetPosition();const auto area=AreaOf(ped);
             if(np->owner!=Net().MyId())return;

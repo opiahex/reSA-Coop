@@ -153,6 +153,18 @@ void RestoreLocal(const LocalContext& c) {
     cam::CrosshairMultY() = c.chairY;
 }
 
+using AllowedDirectionFn=bool(__cdecl*)(CPed*,CVector,float);
+AllowedDirectionFn originalAllowedDirection=nullptr;
+bool __cdecl AllowedDirection(CPed*ped,CVector direction,float limit){
+    if(Net().Online()&&Players::Instance().FindByPed(ped))return true;
+    return originalAllowedDirection(ped,direction,limit);
+}
+using TwoPlayerControlsFn=bool(__cdecl*)(CPed*);TwoPlayerControlsFn originalTwoPlayerControls=nullptr;
+bool __cdecl TwoPlayerControls(CPed*ped){
+    if(Net().Online()&&Players::Instance().FindByPed(ped))return false;
+    return originalTwoPlayerControls(ped);
+}
+
 void ApplyRemote(RemotePlayer& rp) {
     rp.ped->FightingStyle() = rp.state.fightingStyle;
     rp.ped->AllowedAttackMoves() = rp.state.attackMoves;
@@ -707,6 +719,9 @@ float RemoteDistance(const CVector& p, int8_t area, uint8_t* who) {
 
 // ------------------------------------------------------------------ module
 void Players::OnInstallHooks() {
+    // Only network replicas bypass the native local-coop leash/aim axes.
+    mem::HookFn(0x441E10,&AllowedDirection,&originalAllowedDirection,"CGameLogic::IsPlayerAllowedToGoInThisDirection network replica");
+    mem::HookFn(0x442020,&TwoPlayerControls,&originalTwoPlayerControls,"CGameLogic::IsPlayerUse2PlayerControls network replica");
     mem::HookFn(0x61ED10, &HookAimGun, &g_originalAimGun, "CTaskSimpleUseGun::AimGun");
     mem::HookFn(0x61EB10, &HookFireGun, &g_originalFireGun, "CTaskSimpleUseGun::FireGun");
     mem::HookFn(0x67E7B0,&JetpackInput,&originalJetpackInput,"CTaskSimpleJetPack::ProcessControlInput");

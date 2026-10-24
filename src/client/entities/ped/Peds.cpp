@@ -148,6 +148,7 @@ void CaptureInteraction(NetPed&np,PedSyncState&s){
         for(int i=0;task&&i<12;++i){
             auto type=(uint16_t)CallVirtual<4,int>(task);if(type>=4096)break;
             out.chain[out.depth++]=type;if(!i)out.task=type;out.leaf=type;leaf=task;
+            if(type==108){auto ropeId=Field<uint32_t>(task,0xC);out.rope=true;for(int j=0;j<4;++j)out.rope&=Call<0x555E40,bool>(ropeId,j/3.f,&out.ropePoints[j],(CVector*)nullptr);}
             if(type==244)out.sequenceStep=(int8_t)std::clamp(Field<int32_t>(task,0xC),-1,7);
             if(type==275){out.sequenceStep=(int8_t)std::clamp(Field<int32_t>(task,0x10),-1,7);out.sequenceRepeat=(uint16_t)std::clamp(Field<int32_t>(task,0x18),0,65535);}
             if(type==256||type==1202||type==1203||type==1204||type==1209)partner=Field<CPed*>(task,0x38);
@@ -1199,6 +1200,8 @@ void Peds::ApplyMirror(NetPed& np) {
         ReplayBoundAction(np,age);
         return;
     }
+    bool abseil=false;for(unsigned i=0;i<st.interaction.depth;++i)abseil|=st.interaction.chain[i]==108;
+    if(abseil){SetEntityPosition(ped,target);ped->MoveSpeed()={};ped->CurrentRotation()=ped->AimingRotation()=st.heading;ReplayBoundAction(np,age);return;}
     if (d > 6.0f || std::fabs(err.z) > 4.0f) {
         SetEntityPosition(ped, target);
         ped->MoveSpeed() = st.vel * (1.0f / 50.0f);

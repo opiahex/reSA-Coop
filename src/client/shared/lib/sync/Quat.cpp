@@ -84,6 +84,11 @@ Quat Quat::Slerp(const Quat& a, const Quat& bIn, float t) {
     return r;
 }
 
+Quat Quat::Turned(const Quat&q,const game::CVector&v,float seconds){
+    float speed=v.Length();if(!std::isfinite(speed)||!std::isfinite(seconds)||speed<1e-6f||seconds<=0)return q;
+    float half=speed*seconds*.5f,s=std::sin(half)/speed;Quat d{v.x*s,v.y*s,v.z*s,std::cos(half)};
+    return {d.w*q.x+d.x*q.w+d.y*q.z-d.z*q.y,d.w*q.y-d.x*q.z+d.y*q.w+d.z*q.x,d.w*q.z+d.x*q.y-d.y*q.x+d.z*q.w,d.w*q.w-d.x*q.x-d.y*q.y-d.z*q.z};
+}
 void Quat::Write(Writer& out) const {
     out.I16(Writer::Quant(x, 1.0f));
     out.I16(Writer::Quant(y, 1.0f));

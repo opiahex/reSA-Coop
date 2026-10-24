@@ -185,6 +185,9 @@ enum MsgId : uint8_t {
     G_STORY_EQUIPMENT = 173, // phase-scoped native special equipment
     G_NPC_CARJACK = 174, // authoritative NPC pull-out -> victim's native seat exit
     G_NPC_CAR_DOOR = 175, // NPC-owned native door animation, including guest-owned vehicles
+    G_HELI_SHOT = 176, // authoritative helicopter gun round, generation + sequence
+    G_STORY_WORLD = 177, // host map/IPL edits and shared campaign counters
+    G_POLICE_RULES = 178, // nearby host gang-war and story police policy
     G_VOICE = 200,            // unreliable: voice frame
     G_LAST = 255,
 };

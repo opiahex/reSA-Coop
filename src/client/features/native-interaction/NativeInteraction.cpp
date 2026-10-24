@@ -72,6 +72,7 @@ bool RequestNativeInteraction(uint16_t model,int8_t area,float x,float y,float z
     if(now-asked>250){Writer w(proto::G_INTERACTION);w.U8(1);w.U64(key);w.U16(model);w.I8(area);w.Vec({x,y,z});Net().Send(proto::CH_RELIABLE,w);asked=now;}
     return NativeInteractionOwner(key)==Net().MyId();
 }
+bool OwnsNativePoolTable(){return localKey&&localModel==2964&&NativeInteractionOwner(localKey)==Net().MyId();}
 void ReleaseNativeInteraction(){if(localKey&&Net().Online()){if(Net().IsHost())Release(localKey,Net().MyId());else{Writer w(proto::G_INTERACTION);w.U8(3);w.U64(localKey);Net().Send(proto::CH_RELIABLE,w);}}localKey=asked=granted=0;}
 bool BeginNativeInteraction(void*script){
     if(!Net().Online()||!core::IsPlayerReady())return true;

@@ -1026,7 +1026,7 @@ void Vehicles::ApplyMirror(NetVehicle& nv, float dt) {
     VehicleState st = nv.history.Size()?nv.history.At(NowMs(),[](const VehicleState&a,const VehicleState&b,float t){
         auto s=b;s.pos=a.pos+(b.pos-a.pos)*t;s.vel=a.vel+(b.vel-a.vel)*t;
         s.turn=a.turn+(b.turn-a.turn)*t;s.rot=Quat::Slerp(a.rot,b.rot,t);s.wheels=WheelState::Blend(a.wheels,b.wheels,t,(uint32_t)(b.time-a.time)/1000.f);return s;
-    },[](VehicleState&s,float age,bool stale){s.pos=s.pos+s.vel*age;s.wheels.Predict(age,stale);if(stale)s.vel=s.turn={};}):nv.state;
+    },[](VehicleState&s,float age,bool stale){s.pos=s.pos+s.vel*age;if(!stale)s.rot=Quat::Turned(s.rot,s.turn,age);s.wheels.Predict(age,stale);if(stale)s.vel=s.turn={};}):nv.state;
     nv.renderedWheels=st.wheels;
     CMatrix before{};bool carry=v->Matrix()!=nullptr;if(carry)before=*v->Matrix();
     CPlayerPed* me = FindPlayerPed(0);
@@ -1081,6 +1081,11 @@ void Vehicles::ApplyMirror(NetVehicle& nv, float dt) {
     v->SetHandbrake((st.flags & VehicleState::F_HANDBRAKE)!=0);
     if(st.extras & VehicleState::X_WHEELS)nv.renderedWheels.Apply(v);
     v->Health() = st.health;
+    // The owner decides when the burning vehicle explodes; keep native smoke
+    // and flames without a replica's independent five-second detonation.
+    int fireType=v->VehicleSubClass();
+    if(fireType==VEHICLE_TYPE_BIKE||fireType==VEHICLE_TYPE_BMX)Field<float>(v,0x7BC)=std::min(Field<float>(v,0x7BC),4000.f);
+    else if(fireType!=VEHICLE_TYPE_BOAT&&fireType!=VEHICLE_TYPE_TRAIN)Field<float>(v,0x8E4)=std::min(Field<float>(v,0x8E4),4000.f);
     v->DoorLock() = TrainingVehicleRestricted(v)?2:m_scriptLocks.count(nv.netId)?m_scriptLocks[nv.netId]:st.lock;
     v->SetEngineOn((st.flags & VehicleState::F_ENGINE) != 0);
     v->SetSiren((st.flags & VehicleState::F_SIREN) != 0);
@@ -1140,7 +1145,7 @@ void Vehicles::SendState(NetVehicle& nv,bool reliable) {
     st.time = (uint32_t)NowMs();
     Writer w(proto::G_VEH_SYNC);
     w.Entity(ENTITY_VEHICLE,nv.netId,ENTITY_SNAPSHOT);
-    st.Write(w);
+    st.Write(w);nv.sentHealth=st.health;
     Net().Send(reliable?proto::CH_RELIABLE:proto::CH_STATE, w);
 }
 
@@ -1331,7 +1336,8 @@ void Vehicles::OnPostProcess() {
             nv.lastEngine=engine;nv.lastRotor=rotor;nv.lastChangeMs=now;nv.lastSendMs=now;SendState(nv,true);
         }
         float speed = nv.veh->MoveSpeed().Length() * 50.0f;
-        if (speed > 0.1f || (heli&&rotor>.001f)) nv.lastChangeMs = now;
+        if (speed > 0.1f || nv.veh->TurnSpeed().Length()>.0002f || (heli&&rotor>.001f) ||
+            std::fabs(nv.veh->Health()-nv.sentHealth)>=1.f) nv.lastChangeMs = now;
         bool active = now - nv.lastChangeMs < 3000;
         bool towed = Field<CVehicle*>(nv.veh, 0x4C4) != nullptr;  // CVehicle::m_pTowingVehicle
         uint64_t interval = towed ? 50 : active ? 100 : 500;

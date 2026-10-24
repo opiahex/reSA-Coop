@@ -127,7 +127,7 @@ inline void* ActionAssociation(CPed* ped) {
     if(void*task=FindTask(ped,1027)){void*wanted=Field<void*>(task,0x18);for(void*a=First(ped->RwObject());a;a=Next(a))if(a==wanted)return a;}
 
     constexpr int responseTasks[] = {400,402,403,404,405,406,407,408,409,410,411,412,413,414,416,418,419,420,421,422,423,424,425,426,427,428,429,430,205, 206, 207, 208, 209, 210, 211, 212, 214, 215, 217, 218, 228, 229, 240, 241, 250,
-                                     254, 256, 267, 268, 277,1202,1203,1204,1209,1215, 307, 807, 817, 818, 820, 821, 823, 824, 825, 826,1304,1305,1600};
+                                     108, 254, 256, 267, 268, 277,1202,1203,1204,1209,1215, 307, 807, 817, 818, 820, 821, 823, 824, 825, 826,1304,1305,1600};
     bool reacting = ped->AttachedTo()!=nullptr;
     for (int type : responseTasks) if (void*task=FindTask(ped,type)) {
         reacting=true;

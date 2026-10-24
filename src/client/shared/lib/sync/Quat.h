@@ -8,6 +8,7 @@ struct Quat {
     static Quat FromMatrix(const game::CMatrix& m);
     void ToMatrix(game::CMatrix& m) const;  // writes right/forward/up, keeps pos
     static Quat Slerp(const Quat& a, const Quat& b, float t);
+    static Quat Turned(const Quat& q,const game::CVector& radiansPerSecond,float seconds);
     void Write(Writer& w) const;
     void Read(Reader& r);
 };

@@ -146,6 +146,14 @@ void RemoveCopies(int owner = -1) {
         else ++it;
 }
 
+int NearestTrackNode(int track,const CVector&at){
+    if(track<0||track>3)return -1;
+    int count=Ref<int32_t>(0xC38014+track*4);auto*nodes=Ref<const int16_t*>(0xC38024+track*4);
+    if(!nodes||count<=0||count>65536)return -1;
+    int best=-1;float distance=1e30f;
+    for(int i=0;i<count;++i){const auto*n=nodes+i*5;CVector delta{n[0]/8.f-at.x,n[1]/8.f-at.y,n[2]/8.f-at.z};float d=delta.x*delta.x+delta.y*delta.y+delta.z*delta.z;if(d<distance){best=i;distance=d;}}
+    return best;
+}
 void ApplyTrain(uint32_t key,const PendingTrain&p){
     auto it=g_copies.find(key);
     if(it!=g_copies.end()&&(it->second.kind!=p.kind||it->second.track!=p.track||it->second.clockwise!=p.clockwise||
@@ -156,8 +164,9 @@ void ApplyTrain(uint32_t key,const PendingTrain&p){
         bool ready=true;for(int model:kTrainModels)if(!IsModelLoaded(model)){RequestModel(model,2);ready=false;}
         if(!ready){g_pending[key]=p;return;}
         if(!HasRoom(VehiclePool(),kKeepVehicles+10,"train")){g_pending[key]=p;return;}
+        int node=NearestTrackNode(p.track,p.pos);if(node<0){g_pending[key]=p;return;}
         CVehicle *first=nullptr,*last=nullptr;g_copying=true;
-        g_origCreateTrain(p.pos,p.clockwise,p.kind,&first,&last,-1,p.track,true);g_copying=false;
+        g_origCreateTrain(p.pos,p.clockwise,p.kind,&first,&last,node,p.track,true);g_copying=false;
         if(!first){g_pending[key]=p;return;}
         for(int model:kTrainModels)MarkModelNotNeeded(model);
         for(auto*t=first;t;t=NextCarriage(t)){t->DoorLock()=2;Field<int8_t>(t,0x5C0)=p.track;}
