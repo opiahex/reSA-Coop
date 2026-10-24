@@ -51,8 +51,13 @@ class Stages:public Module{const char*Name()const override{return "CooperativeSt
     if(op==3){if(!Net().IsHost()&&from==Net().HostId()&&r.Ok()){if(run>completedRun||(run==completedRun&&(int32_t)(token-completedToken)>0)){completedRun=run;completedToken=token;}if(client.run==run&&(int32_t)(token-client.token)>=0)client={};}return;}
     if(op==4){auto next=r.U32();if(!Net().IsHost()&&from==Net().HostId()&&r.Ok()&&run==StoryRunId())AdoptCooperativeStoryPhase(run,next);return;}
     if(op==5){auto revision=r.U32();auto reason=r.U8();auto kind=r.U8();auto entity=r.U16();
-        if(Net().IsHost()&&r.Ok()&&from<3&&Net().Peer(from)&&host.run==run&&host.token==token)
+        if(Net().IsHost()&&r.Ok()&&from<3&&Net().Peer(from)&&host.run==run&&host.token==token){
+            if((reason==8||reason==9)&&std::any_of(host.entities.begin(),host.entities.end(),[&](auto&e){return e.kind==kind&&e.id==entity;})){
+                if(kind==ENTITY_VEHICLE)Vehicles::Instance().ReannounceOne(entity);
+                if(kind==ENTITY_PED)Peds::Instance().ReannounceOne(entity);
+            }
             LOGI("Story blocked player=%u run=%llu phase=%u gate=%u opcode=%04X reason=%u entity=%u:%04X",from,(unsigned long long)run,revision,token,host.opcode,reason,kind,entity);return;}
+        return;}
     if(op!=1||Net().IsHost()||from!=Net().HostId())return;Gate g;g.run=run;g.token=token;g.opcode=r.U16();g.area=r.I8();auto p=r.Vec();g.point={p.x,p.y,p.z};auto count=r.U8();if(count>72)return;
     for(int i=0;i<count;++i){auto kind=r.U8();auto id=r.U16();if(kind<ENTITY_VEHICLE||kind>ENTITY_OBJECT)return;g.entities.push_back({kind,id});}g.refs=Net().EntityContext();
     if(!r.Ok()||!run||!token||(run==completedRun&&(int32_t)(token-completedToken)<=0)||run!=StoryRunId()||(client.run==run&&(int32_t)(token-client.token)<0))return;
@@ -96,8 +101,10 @@ bool AwaitCooperativeStage(void*script,int opcode,uint16_t source){
         std::set<std::pair<uint8_t,uint16_t>>included;
         auto add=[&](uint8_t kind,uint16_t id){if(id&&host.entities.size()<72&&included.insert({kind,id}).second)host.entities.push_back({kind,id,Net().EntityGeneration(kind,id)});};
         add(ENTITY_VEHICLE,source);
-        for(auto&[id,n]:Vehicles::Instance().All())if(Vehicles::Alive(n)&&(n.script||Vehicles::ScriptControlled(n.veh)||IsCooperativeRoleVehicle(n.veh))&&n.veh->AreaCode()==host.area&&(n.veh->GetPosition()-host.point).Length()<200){add(ENTITY_VEHICLE,id);if(auto*p=Peds::Instance().Find(n.veh->Driver()))add(ENTITY_PED,p->netId);}
-        for(auto&[id,n]:Peds::Instance().All())if(n.ped&&IsPedValid(n.ped)&&n.ped->CreatedBy()==PED_MISSION&&(n.ped->AreaCode()==host.area||n.ped->AreaCode()==13)&&(n.ped->GetPosition()-host.point).Length()<200)add(ENTITY_PED,id);
+        // Mirrors are marked MISSION by their protection code too. They do
+        // not become dependencies of the host's screenplay merely for that.
+        for(auto&[id,n]:Vehicles::Instance().All())if(Vehicles::Alive(n)&&((n.owner==Net().MyId()&&(n.script||Vehicles::ScriptControlled(n.veh)))||IsCooperativeRoleVehicle(n.veh))&&n.veh->AreaCode()==host.area&&(n.veh->GetPosition()-host.point).Length()<200){add(ENTITY_VEHICLE,id);if(auto*p=Peds::Instance().Find(n.veh->Driver()))add(ENTITY_PED,p->netId);}
+        for(auto&[id,n]:Peds::Instance().All())if(n.owner==Net().MyId()&&n.ped&&IsPedValid(n.ped)&&n.ped->CreatedBy()==PED_MISSION&&(n.ped->AreaCode()==host.area||n.ped->AreaCode()==13)&&(n.ped->GetPosition()-host.point).Length()<200)add(ENTITY_PED,id);
         std::vector<SyncAuditEntry>audit;core::CollectSyncAudit(audit);for(auto&e:audit)if(e.kind==AUDIT_OBJECT&&e.alive&&(e.area==host.area||e.area==13)&&(e.pos-host.point).Length()<200)add(ENTITY_OBJECT,e.id);
         SendGate();LOGI("Story stage opened token=%u opcode=%04X dependencies=%u",host.token,opcode,(unsigned)host.entities.size());return false;
     }

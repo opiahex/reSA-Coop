@@ -160,10 +160,16 @@ void __fastcall PlayHorn(void*audio,void*edx,bool horn,bool siren,bool fast,void
     auto*vehicle=params?Field<CVehicle*>(params,0x10):nullptr;
     auto*n=vehicle&&IsVehicleValid(vehicle)?Vehicles::Instance().Find(vehicle):nullptr;
     bool mirror=n&&Vehicles::Instance().IsMirror(*n);
-    if(Net().Online()&&n){if(mirror)horn=RemoteVehicleHorn(vehicle,horn);else CaptureVehicleHorn(vehicle,horn);}
+    if(Net().Online()&&n){
+        if(mirror){
+            siren=n->hasState&&(n->state.flags&VehicleState::F_SIREN);
+            fast=siren&&(n->state.flags&VehicleState::F_FAST_SIREN);
+            horn=!siren&&RemoteVehicleHorn(vehicle,horn);
+        }else CaptureVehicleHorn(vehicle,horn&&!siren);
+    }
     // GTA latches the horn flag even when the sound allocation failed. Retry
-    // an active remote horn once its sound bank/channel becomes available.
-    if(mirror&&horn&&!Field<void*>(audio,0x178))Field<uint8_t>(audio,0xBE)=0;
+    // an active horn once its sound bank/channel becomes available.
+    if(horn&&!Field<void*>(audio,0x178))Field<uint8_t>(audio,0xBE)=0;
     originalPlayHorn(audio,edx,horn,siren,fast,params);
     if(mirror){static std::map<uint16_t,std::pair<bool,uint64_t>>reported;auto&last=reported[n->netId];
         if(last.first!=horn||(horn&&NowMs()-last.second>1000)){last={horn,NowMs()};auto*sound=Field<void*>(audio,0x178);
@@ -1014,6 +1020,7 @@ void ApplyHydraulics(CVehicle* v, const VehicleState& st) {
 void Vehicles::ApplyMirror(NetVehicle& nv, float dt) {
     if (!nv.hasState) return;
     CVehicle* v = nv.veh;
+    v->Flags()=(v->Flags()&~128u)|((nv.state.flags&VehicleState::F_HIDDEN)?0u:128u);
     v->AreaCode()=nv.state.area;
     if(TrainingVehicleRestricted(v))v->DoorLock()=2;
     VehicleState st = nv.history.Size()?nv.history.At(NowMs(),[](const VehicleState&a,const VehicleState&b,float t){

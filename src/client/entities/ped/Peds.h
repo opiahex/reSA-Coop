@@ -9,6 +9,7 @@
 #include "shared/lib/core/Core.h"
 #include "shared/lib/sync/AnimationState.h"
 #include "shared/lib/sync/PedInteraction.h"
+#include "shared/lib/sync/SnapshotBuffer.h"
 
 namespace coop {
 
@@ -51,6 +52,8 @@ struct PedSyncState {
 
 // NPC known to both players. owner == my id: simulated here and announced; otherwise a mirror.
 struct NetPed {
+    struct Pose {uint32_t time=0;game::CVector pos,vel;float heading=0;};
+    SnapshotBuffer<Pose> poses;
     uint16_t netId = 0;
     game::CPed* ped = nullptr;  // mirror: nullptr until it could be spawned (model streaming, vehicle missing)
     int handle = -1;

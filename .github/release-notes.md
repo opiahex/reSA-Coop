@@ -1,47 +1,47 @@
-# reSA-Coop 0.2.27-3p
+# reSA-Coop 0.2.28-3p
 
 Кооператив на троих для GTA San Andreas 1.0 US. / Three-player co-op for GTA San Andreas 1.0 US.
 
-**Скачайте `reSA-Coop-v0.2.27-3p-win32.zip` из Assets. / Download the compiled `reSA-Coop-v0.2.27-3p-win32.zip` from Assets.**
+**Скачайте `reSA-Coop-v0.2.28-3p-win32.zip` из Assets. / Download the compiled `reSA-Coop-v0.2.28-3p-win32.zip` from Assets.**
 
-## Русский — исправления 0.2.27
+## Русский — исправления 0.2.28
 
-- Исправлено вытаскивание гостя из машины NPC: команда доходит до владельца персонажа и запускает штатную физическую реакцию GTA.
-- Событие выхода больше не перебивает анимацию угона и не возвращает жертву на водительское место запоздавшим пакетом.
-- Угонщик передаёт свою фазу анимации; сетевые копии не проводят независимый повторный угон. После завершения машина переходит к симулятору NPC.
-- Открывание и закрывание двери NPC передаются и тогда, когда машиной ещё владеет гость.
-- Исправлены вложенный выбор контекста полиции и продолжение старой погони за участником без розыска. Новая погоня проверяет личный розыск выбранной цели.
-- Диагностика записывает изменение личного розыска, его нативный источник и состояние при загрузке мира.
-- Результаты двенадцати испытаний автошколы и её завершение сохраняются в личном профиле гостя; меню школы не подхватывает медали хоста.
-- Сохраняются штатные награды навыка вождения: +30 за впервые полученное золото в испытании и +40 за первое завершение школы, без повторного начисления за тот же результат.
-- Профиль обновлён до версии 5. Старые профили сохраняют деньги, навыки и внешность; отсутствовавшие личные записи автошколы начинаются отдельно от медалей хоста. Общие сюжетные флаги мира за пределами школьного сценария сохраняются.
-- Протокол 38: обновить нужно всех клиентов и сервер.
+- Для Photo Opportunity передаются вертикальный диапазон и начальный сектор обзора прикреплённой камеры. Гости управляют своими камерами; соседние фотографы не перекрывают объектив.
+- Передаётся видимость сценарных машин, включая скрытую опору фотокамеры. Снимки гостей содержат масштаб приближения; отметка фотографирования расходуется один раз, как в одиночной игре.
+- Повторное включение управления в каждом кадре сценария больше не открывает новую сетевую паузу. Условия готовности не включают посторонние защищённые копии транспорта и NPC; отсутствующая зависимость запрашивается повторно.
+- Исправлено пересечение блокировок перемещения при переносе игрока и смене камеры. Позднее включение управления у хоста доходит до гостей после завершения сцены.
+- Дальние NPC в сценарных камерах получают походку и анимацию действия; движение между сетевыми отсчётами сглаживается по времени отправителя.
+- Разделены гудок, обычная сирена и ускоренная сирена. Состояние сирены не превращается в постоянный гудок; звук повторно запускается после временной недоступности аудиоканала.
+- Убрана ненужная синхронная загрузка модели телефона при его удалении из руки сетевого игрока.
+- Отложенные события урона от сетевой копии гостя больше не начисляют преступление локальному игроку. Угон полицейской машины учитывает контекст угонщика.
+- Асинхронная проверка сохранения больше не удаляет графические объекты текущего кадра. Обработка сценариев приостановлена на время переноса указателей загружаемого сохранения.
+- Протокол 39: обновите всех игроков и сервер. Личные профили версии 5 сохраняются.
 
-## English — 0.2.27 fixes
+## English — 0.2.28 fixes
 
-- Fixed NPCs dragging guests out of vehicles: the character owner receives the action and runs GTA's native physical response.
-- Exit acknowledgements no longer interrupt the carjack animation or let delayed driver snapshots put the victim back in the seat.
-- The carjacker replicates its animation phase; replicas do not independently repeat the theft. Vehicle authority transfers to the NPC simulator after completion.
-- NPC door opening/closing also replicates while the vehicle is still owned by a guest.
-- Fixed nested police player contexts and persistence of an old pursuit against an innocent participant. New pursuits validate the selected target's personal wanted level.
-- Diagnostics record personal wanted-level changes, their native source and the state loaded with the world.
-- Guests keep their twelve driving-school best scores and completion flag in their personal profile; school menus no longer inherit host medals.
-- Native driving-skill awards remain intact: +30 for first gold in a test and +40 for first school completion, without awarding the same result again.
-- Profile version 5 retains money, skills and appearance from older profiles. Previously unstored personal school records start separately from host medals. Shared story unlock flags are preserved outside the school interpreter.
-- Protocol 38 requires all clients and the server to update.
+- Photo Opportunity now replicates the attached camera's vertical limits and initial viewing sector. Guests control their own cameras; nearby photographers do not cover the lens.
+- Scripted vehicle visibility is replicated, including the photographic camera's hidden support. Guest photographs carry their zoom level; photograph evidence is consumed once, matching single-player behavior.
+- Per-frame control-enable commands no longer create another network barrier every frame. Readiness excludes unrelated protected vehicle/ped replicas and reannounces missing dependencies.
+- Fixed overlapping relocation/camera movement holds. A later host control-enable transition reaches guests after the scene ends.
+- Distant actors in scripted camera shots receive their gait and action animations; position samples are smoothed on the sender's timeline.
+- Separated the horn, regular siren and fast siren. Siren state no longer becomes a sustained horn; playback retries after a temporary sound-channel allocation failure.
+- Removed unnecessary synchronous cellphone-model loading when a replica puts the phone away.
+- Deferred damage events from a guest replica no longer charge the local player. Police-car theft uses the hijacker's player context.
+- Asynchronous save validation no longer deletes the current frame's render objects. Script execution is held while loaded save pointers are being relocated.
+- Protocol 39 requires every client and the server to update. Version 5 personal profiles are retained.
 
 ## Установка / Installation
 
-Распакуйте ZIP рядом с `gta_sa.exe`, сохранив свои настройки и `coop/server-data`. При необходимости установите ASI-загрузчик через `install.bat`; меню мода — F9. Отдельный `coop.dll` не нужен.
+Распакуйте ZIP рядом с `gta_sa.exe`, сохранив настройки и `coop/server-data`. При необходимости установите ASI-загрузчик через `install.bat`; меню мода — F9. Отдельный `coop.dll` не нужен.
 
-Extract the ZIP beside `gta_sa.exe`, preserving your settings and `coop/server-data`. Run `install.bat` if an ASI loader is needed; open F9 in-game. A separate `coop.dll` is not required.
+Extract the ZIP beside `gta_sa.exe`, preserving settings and `coop/server-data`. Run `install.bat` if an ASI loader is needed; open F9 in-game. A separate `coop.dll` is not required.
 
-**Протокол 38: обновите всех игроков и сервер. / Protocol 38: update every client and the server.**
+**Протокол 39: обновите всех игроков и сервер. / Protocol 39: update every client and the server.**
 
-[Полная накопленная история / Complete cumulative history](https://github.com/opiahex/reSA-Coop/blob/main/CHANGELOG.md).
+[Полная история изменений / Complete changelog](https://github.com/opiahex/reSA-Coop/blob/main/CHANGELOG.md).
 
-Разработка продолжается; весь сюжет и любые сочетания сторонних модов не проверены без исключений. Произвольные подэтапы SCM, любой переносимый груз при переподключении и все NPC вне загруженного мира не объявляются полностью поддержанными.
+Разработка продолжается; полное прохождение сюжета и произвольные сочетания сторонних модов требуют дальнейших проверок.
 
-Development continues; the entire campaign and arbitrary third-party mod combinations are not certified bug-free. Arbitrary SCM substages, every carried-object reconnect case and every NPC outside the loaded world are not claimed as fully supported.
+Development continues; full campaign playthroughs and arbitrary third-party mod combinations require further testing.
 
 SHA-256 — `SHA256SUMS.txt`. Игровые файлы и личные материалы не включены. / Game files and personal materials are not included.

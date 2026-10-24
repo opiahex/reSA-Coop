@@ -22,7 +22,7 @@ struct VehicleState {
     uint8_t lock = 0;
     int8_t area=0;
 
-    enum : uint8_t { F_ENGINE = 1, F_LIGHTS = 2, F_SIREN = 4, F_HORN = 8, F_HANDBRAKE = 16, F_WRECKED = 32 };
+    enum : uint8_t { F_ENGINE = 1, F_LIGHTS = 2, F_SIREN = 4, F_HORN = 8, F_HANDBRAKE = 16, F_WRECKED = 32, F_HIDDEN = 64, F_FAST_SIREN = 128 };
     // parts the driver moves; X_* says which this vehicle has
     uint8_t extras = 0;
     uint16_t misc = 0;  // X_MISC, CAutomobile::m_wMiscComponentAngle: Hydra nozzles, raised hydraulics, tow hoist, forks

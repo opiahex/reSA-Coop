@@ -71,6 +71,30 @@ bool AmbientCop(CPed*p){
     if(!p||p->PedType()!=PED_TYPE_COP||p->CreatedBy()!=1)return false;
     auto*n=Peds::Instance().Find(p);return !n||n->owner==Net().MyId();
 }
+// Damage events are cloned/informed to witnesses after the damage callback
+// returns. Restoring CWanted around that callback cannot suppress a later
+// copy's ReportCriminalEvent, which always charges FindPlayerWanted().
+using CrimeEventFn=void(__fastcall*)(void*,void*,CPed*);
+CrimeEventFn originalDamageCrime=nullptr;
+void __fastcall DamageCrime(void*event,void*edx,CPed*witness){
+    if(Net().Online()&&core::IsPlayerReady()){
+        auto*source=CallMethod<0x4ADA70,CEntity*>(event);
+        if(source&&source->IsPed()&&Players::Instance().FindByPed((CPed*)source)){
+            LOGD("Police replica damage crime suppressed source=%u witness=%d",Players::Instance().FindByPed((CPed*)source)->id,witness?GetPedRef(witness):-1);
+            return; // the shooter's game reports this crime once
+        }
+    }
+    originalDamageCrime(event,edx,witness);
+}
+using StolenCarFn=void(__fastcall*)(void*,void*,void*,void*,void*);
+StolenCarFn originalStolenCar=nullptr;
+void __fastcall StolenCopCar(void*handler,void*edx,void*event,void*active,void*simple){
+    auto*hijacker=Field<CPed*>(event,0x0C);
+    if(Net().Online()&&hijacker&&Players::Instance().FindByPed(hijacker)){
+        Context c((CPlayerPed*)hijacker);originalStolenCar(handler,edx,event,active,simple);return;
+    }
+    originalStolenCar(handler,edx,event,active,simple);
+}
 void WantedChange(void*w,uint32_t before,const char*source,void*caller){
     if(!w)return;
     auto*me=FindPlayerPed(0);if(!me||!IsPedValid(me)||!me->PlayerData()||me->Wanted()!=w)return;
@@ -150,6 +174,8 @@ class Police:public Module {
     }
     void OnInstallHooks()override{
         mem::HookFn(0x5DE160,&CopControl,&originalCop,"CCopPed::ProcessControl");
+        mem::HookFn(0x4B3440,&DamageCrime,&originalDamageCrime,"CEventDamage::ReportCriminalEvent personal offender");
+        mem::HookFn(0x4BB740,&StolenCopCar,&originalStolenCar,"CEventHandler::ComputeCopCarBeingStolenResponse personal offender");
         mem::HookFn(0x562470,&WantedLevel,&originalWanted,"CWanted::SetWantedLevel");
         mem::HookFn(0x562570,&WantedNoDrop,&originalNoDrop,"CWanted::SetWantedLevelNoDrop");
         mem::HookFn(0x561C90,&UpdateWanted,&originalUpdateWanted,"CWanted::UpdateWantedLevel");

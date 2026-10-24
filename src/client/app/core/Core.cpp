@@ -43,6 +43,14 @@ VoidFn g_origShutDownForRestart = nullptr;
 VoidFn g_origInitWhenRestarting = nullptr;
 bool g_restarting = false;  // between CGame::ShutDownForRestart and InitialiseWhenRestarting
 int g_initDepth = 0;        // inside CGame::InitialiseWhenRestarting
+int g_loadDepth=0;         // scripts are not executable while save pointers are being relocated
+using LoadFn=bool(__cdecl*)(bool*);LoadFn g_originalLoad=nullptr;
+bool __cdecl HookGenericLoad(bool*variablesLoaded){
+    ++g_loadDepth;
+    bool result=g_originalLoad(variablesLoaded);
+    --g_loadDepth;
+    return result;
+}
 
 uint32_t g_lastCommonFrame = 0xFFFFFFFF;
 bool g_pendingAutoConnect = false;
@@ -159,6 +167,7 @@ HRESULT WINAPI HookPresent(IDirect3DDevice9* dev, const RECT* src, const RECT* d
 
 void __cdecl HookShutDownForRestart() {
     LOGI("CGame::ShutDownForRestart");
+    g_restarting = g_initDepth == 0;
     if (g_gameStarted) {
         g_gameStarted = false;
         for (auto* m : Modules()) m->OnGameShutdown();
@@ -336,7 +345,7 @@ bool IsInGame() { return game::GameState() == game::GAME_STATE_IDLE; }
 
 bool IsPlayerReady() { return IsInGame() && game::FindPlayerPed(0) != nullptr; }
 
-bool IsRestarting() { return g_restarting; }
+bool IsRestarting() { return g_restarting||g_loadDepth>0; }
 
 bool IsOnMission() {
     int32_t off = game::Ref<int32_t>(0xA476AC);  // CTheScripts::OnAMissionFlag (offset in script space)
@@ -437,11 +446,14 @@ bool LoadSaveFile(const std::wstring& path) {
         return false;
     }
     const uintptr_t mm = game::addr::MenuManager;
-    // CGenericGameStorage::CheckSlotDataValid(slot) — reads the file through GenerateGameFilename
+    // CGenericGameStorage::CheckDataNotCorrupt(slot, filename) validates the redirected save.
     // The menu clears C_PcSave::error before a load. Our asynchronous load must do the same:
     // scanning an empty save slot leaves SLOT_INVALID, which makes even a correct checksum fail.
     game::Ref<int32_t>(0xC17034) = 0;
-    bool valid = game::Call<0x5D1380, bool>(flow::kRedirectSlot);
+    // CheckSlotDataValid also deletes every live RW object. That frontend
+    // side effect is unsafe here: this asynchronous request still returns to
+    // the current native game frame. Validate only the file/checksum now.
+    bool valid = game::Call<0x5D1170, bool>(flow::kRedirectSlot,g_redirectPath.c_str());
     if (!valid) {
         LOGE("Save file is not valid: %s", g_redirectPath.c_str());
         g_redirectPath.clear();
@@ -555,6 +567,7 @@ void Init(void* hModule) {
     mem::RedirectCallFn(0x53E86C, &HookDebugTextMenu, &g_origDebugTextMenu);  // FrontendIdle -> DebugDisplayTextBuffer
     mem::HookFn(0x6190A0, &HookGenerateGameFilename, &g_origGenerateGameFilename, "C_PcSave::GenerateGameFilename");
     mem::HookFn(0x53C550, &HookShutDownForRestart, &g_origShutDownForRestart, "CGame::ShutDownForRestart");
+    mem::HookFn(0x5D17B0,&HookGenericLoad,&g_originalLoad,"CGenericGameStorage::GenericLoad script relocation guard");
     mem::HookFn(0x53C680, &HookInitialiseWhenRestarting, &g_origInitWhenRestarting, "CGame::InitialiseWhenRestarting");
 
     for (auto* m : Modules()) {

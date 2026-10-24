@@ -673,7 +673,10 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
     bool story=script==g_currentScript&&Field<uint8_t>(script,0xDC)&&Replicating()&&!PersonalActivity(script);
     if(story&&(chainOp==0x05EB||chainOp==0x0705||chainOp==0x085E||chainOp==0x014E||chainOp==0x03C3||chainOp==0x01B4||chainOp==0x0715||(chainOp==0x01BD&&CooperativeStageArmed(script)))){
         uint32_t saved[32];memcpy(saved,(void*)0xA43C78,sizeof saved);alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);int count=chainOp==0x01B4||chainOp==0x0715?2:1;CallMethod<0x464080>(copy,count);int first=Ref<int32_t>(0xA43C78),second=Ref<int32_t>(0xA43C7C);memcpy((void*)0xA43C78,saved,sizeof saved);
-        bool gate=chainOp!=0x01B4||(first==0&&second==1);uint16_t source=0;
+        // Scripts such as SYN1 enable control in their per-frame loop. Only
+        // the transition out of a held scene needs a readiness barrier.
+        bool gate=chainOp!=0x01B4||(first==0&&second==1&&CooperativeStageArmed(script)&&GetPad(0)->DisablePlayerControls);
+        uint16_t source=0;
         if(chainOp==0x05EB||chainOp==0x0705||chainOp==0x085E||chainOp==0x0715)if(auto*v=GetVehicle(chainOp==0x0715?second:first))if(auto*n=Vehicles::Instance().EnsureNetworked(v))source=n->netId;
         bool relocated=g_processStoryPed&&FindPlayerPed(0)==g_processStoryPed&&!CutsceneRunning()&&
            (g_processStoryPed->AreaCode()!=g_processStoryArea||(StoryPosition(g_processStoryPed)-g_processStoryPosition).Length()>8);
@@ -718,11 +721,13 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
             LOGD("Story chain opcode=%04X actor=%d originalCJ=%d",chainOp,actor,cj);return result;
         }
     }
-    if(story&&chainOp==0x01BD){
+    if(story&&(chainOp==0x01BD||chainOp==0x0801)){
         alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);
         auto*ip=Field<uint8_t*>(copy,0x14);int32_t*out=nullptr;
         if(*ip==2||*ip==3){out=CallMethod<0x464790,int32_t*>(copy,0);if(out&&(uint8_t*)out>=copy&&(uint8_t*)out<copy+sizeof copy)out=(int32_t*)((uint8_t*)script+((uint8_t*)out-copy));}
-        auto result=g_objectCommands[Group](script,edx,opcode);if(out)*out=(int32_t)CooperativeStoryClock();return result;
+        auto result=g_objectCommands[Group](script,edx,opcode);
+        if(out){if(chainOp==0x01BD)*out=(int32_t)CooperativeStoryClock();else{float fov;if(CooperativePhotoFov(fov))memcpy(out,&fov,4);}}
+        return result;
     }
     if(story&&(chainOp==0x004E||chainOp==0x00D8)){CancelCooperativeStage(script);ClearCooperativeStoryScript(script);}
     if(story&&(chainOp==0x016A||chainOp==0x03CB||chainOp==0x04BB||chainOp==0x01B4)){
@@ -758,6 +763,7 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
         }else coop=CooperativeStoryCondition(op,params,script);
     }
     auto result=g_objectCommands[Group](script,edx,opcode);
+    if(story&&(chainOp==0x015A||chainOp==0x02EB))g_sceneScriptCamera=false;
     if(killOutput)*killOutput=std::clamp<int64_t>((int64_t)*killOutput+CooperativeGuestKills(killModel),0,1000000);
     if(coop){Field<uint8_t>(script,0xC5)=before;Field<int16_t>(script,0xD0)=logic;CallMethod<0x4859D0>(script,true);}
     if(object.create){int h=Ref<int32_t>(0xA43C78);auto*o=GetObject(h);if(o&&(object.model<0||o->ModelIndex()==object.model)){ShareMissionObject(h);if(story)ArmCooperativeStage(script);}}
@@ -1899,6 +1905,9 @@ struct ScriptCamera {
     bool wide = false;
 } g_scriptCamera;
 bool g_cameraSent = false, g_cameraApplied = false;
+bool g_warpHolding=false;
+bool g_sharedControlsPending=false;
+uint16_t g_lastCameraControls=0xFFFF;
 uint64_t g_cameraSentMs = 0;
 uint16_t g_cameraControls = 0;
 float g_cameraFov = 70;
@@ -1917,15 +1926,17 @@ void StopScriptCamera() {
     auto* me = FindPlayerPed(0);
     Cmd(0x02EB).Run();  // RESTORE_CAMERA_JUMPCUT
     Cmd(0x04BB).I(me->AreaCode()).Run();
-    Cmd(0x04D7).I(GetPedRef(me)).I(0).Run();
+    Cmd(0x04D7).I(GetPedRef(me)).I(g_warpHolding?1:0).Run();
     // SET_PLAYER_CONTROL creates the native safe/camera bits while this shared
     // camera is active. Do not restore those temporary bits from an earlier
     // cutscene over the host's subsequent control-enable command.
     auto sharedMask=(uint16_t)0xA1;
     GetPad(0)->DisablePlayerControls = (g_cameraControls&~sharedMask)|
         ((NowMs()-g_scriptCamera.recv<2000?g_scriptCamera.controls:0)&sharedMask);
+    g_sharedControlsPending=(GetPad(0)->DisablePlayerControls&sharedMask)!=0;
     uint32_t* fields[] = {&me->Flags(), &me->PhysicalFlags(), &me->PedFlags(), &me->PedFlags2(), &me->PedFlags3(), &me->PedFlags4()};
     for (size_t i = 0; i < 6; ++i) *fields[i] = (*fields[i] & ~g_cameraMask[i]) | (g_cameraFlags[i] & g_cameraMask[i]);
+    if(g_warpHolding)Cmd(0x04D7).I(GetPedRef(me)).I(1).Run();
     cam::Fov() = g_cameraFov;
     SetWideScreen(false);
     RestoreSceneHud();
@@ -1937,7 +1948,7 @@ struct StoryWarp {
 }g_storyWarp;
 uint32_t g_storyWarpSequence=0,g_storyWarpLatest=0;
 uint64_t g_lastWarpSent=0,g_lastWarpRun=0;CVector g_lastWarpPosition;int8_t g_lastWarpArea=0;
-bool g_warpHolding=false,g_warpFrozen=false;uint16_t g_warpControls=0;
+bool g_warpFrozen=false;uint16_t g_warpControls=0;
 void ReleaseStoryWarpHold(){
     if(g_warpHolding&&core::IsPlayerReady()){
         auto*me=FindPlayerPed(0);Cmd(0x04D7).I(GetPedRef(me)).I(g_warpFrozen).Run();
@@ -2002,7 +2013,7 @@ void ApplyStoryWarp(){
         next.pending=false;ReleaseStoryWarpHold();LOGI("Story warp %u vehicle ready",next.sequence);return;
     }
     if(!g_warpHolding){
-        g_warpControls=GetPad(0)->DisablePlayerControls;g_warpFrozen=(me->PhysicalFlags()&0x2000u)!=0;g_warpHolding=true;
+        g_warpControls=GetPad(0)->DisablePlayerControls;g_warpFrozen=!g_cameraApplied&&(me->PhysicalFlags()&0x2000u)!=0;g_warpHolding=true;
         if(ownCar){auto old=ownCar->GetPosition();Vehicles::Instance().RememberUsed(ownCar);Cmd(0x0362).I(GetPedRef(me)).F(old.x).F(old.y).F(old.z).Run();}
     }
     Cmd(0x04D7).I(GetPedRef(me)).I(1).Run();GetPad(0)->DisablePlayerControls=1;me->MoveSpeed()={};
@@ -2027,9 +2038,14 @@ void HostSendScriptCamera() {
     bool controlled = Ref<uint8_t>(addr::TheCamera + 0x2B) == 0;
     if (!controlled) g_sceneScriptCamera = false;
     void* mission = FindMissionScript();
-    bool active = g_sceneScriptCamera && controlled && !CutsceneRunning() && (!mission||!PersonalActivity(mission));
+    auto*me=FindPlayerPed(0);
+    // An attached camera is an interactive photographic viewpoint (SYN1),
+    // not a fixed scene camera. Each participant aims their own weapon.
+    bool photographing=me&&me->AttachedTo()&&me->ActiveWeapon().type==43&&!TheCameraWide();
+    bool active = g_sceneScriptCamera && controlled && !photographing && !CutsceneRunning() && (!mission||!PersonalActivity(mission));
     SetCooperativeStoryCamera(active);
-    if (!active && !g_cameraSent) return;
+    auto controls=GetPad(0)->DisablePlayerControls;
+    if (!active && !g_cameraSent&&controls==g_lastCameraControls) return;
     if (active == g_cameraSent && NowMs() - g_cameraSentMs < 50) return;
     Writer w(proto::G_GAME_EVENT);
     w.U8(4); w.U32((uint32_t)NowMs()); w.Bool(active);w.U16(GetPad(0)->DisablePlayerControls);
@@ -2041,7 +2057,7 @@ void HostSendScriptCamera() {
         w.U8(Ref<uint8_t>(0xBAA45D)); w.U8(Ref<uint8_t>(0xBAA3FB)); w.Bool(TheCameraWide());
     }
     Net().Send(active == g_cameraSent ? proto::CH_STATE : proto::CH_RELIABLE, w);
-    g_cameraSent = active; g_cameraSentMs = NowMs();
+    g_cameraSent = active; g_cameraSentMs = NowMs();g_lastCameraControls=controls;
 }
 void HandleGameEvent(uint8_t from, Reader& input) {
     Reader r = input;
@@ -2063,6 +2079,10 @@ void HandleGameEvent(uint8_t from, Reader& input) {
     g_cameraLatest = c.time;
     c.recv = NowMs(); g_scriptCamera = c;
     if (!c.active) StopScriptCamera();
+    if(!c.active&&g_sharedControlsPending&&NowMs()>=g_localActivityUntil&&!g_warpHolding&&g_csState==0){
+        GetPad(0)->DisablePlayerControls=(GetPad(0)->DisablePlayerControls&~0xA1u)|(c.controls&0xA1u);
+        if(!(c.controls&0xA1u))g_sharedControlsPending=false;
+    }
 }
 void UpdateScriptCamera() {
     if(NowMs()<g_localActivityUntil)return;
@@ -2677,6 +2697,7 @@ private:
         g_sceneScriptCamera = false; g_cameraLatest = 0;
         g_screenReceived = g_blackSince = 0; g_blackExpired = false;
         g_cameraApplied = g_cameraSent = false;
+        g_sharedControlsPending=false;g_lastCameraControls=0xFFFF;
         g_csState = 0;
         g_csStartRequested = g_sceneReadySent = g_startPending = false;
         g_startScript = nullptr;

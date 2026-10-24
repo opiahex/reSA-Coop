@@ -893,6 +893,7 @@ void Peds::HandleOwner(uint8_t from, Reader& r) {
     NetPed& np = it->second;
     np.owner = to;
     np.hasState = false;  // the next state comes from a different clock
+    np.poses.Clear();
     if (to != Net().MyId()) return;  // a third player keeps the same mirror instead of deleting it
     if (!IsAlive(np)) {
         // The old viewer may have streamed the physical copy out. Retain the
@@ -944,6 +945,7 @@ void Peds::HandleSync(uint8_t from, Reader& r) {
     np.state = st;
     np.hasState = true;
     np.recvMs = NowMs();
+    np.poses.Push({st.time,st.pos,st.vel,st.heading},np.recvMs);
 }
 
 void Peds::HandleAction(uint8_t from,Reader&r){
@@ -1164,6 +1166,11 @@ void Peds::ApplyMirror(NetPed& np) {
     float transit = 0.0005f * (Net().Rtt() + (peer ? peer->ping : 0));
     float age = std::min(0.2f, transit + (float)(now - np.recvMs) / 1000.0f);
     CVector target = st.pos + st.vel * age;
+    if(np.poses.Size()>1&&!(st.entityFlags&4))target=np.poses.At(now,[](const NetPed::Pose&a,const NetPed::Pose&b,float t){
+        auto pose=b;
+        if((b.pos-a.pos).Length()<8)pose.pos=a.pos+(b.pos-a.pos)*t;
+        return pose;
+    },[](NetPed::Pose&pose,float age,bool stale){if(!stale)pose.pos=pose.pos+pose.vel*age;}).pos;
     CVector cur = ped->GetPosition();
     CVector err = target - cur;
     if(st.entityFlags&4){
@@ -1180,6 +1187,16 @@ void Peds::ApplyMirror(NetPed& np) {
         SetEntityPosition(ped, target);
         ped->MoveSpeed() = {};
         ped->CurrentRotation() = ped->AimingRotation() = st.heading;
+        // Scripted shots often look far away from the local player. The
+        // transform still needs its gait/action; an early return here left
+        // distant actors sliding or taking tiny locally generated steps.
+        if(st.motion.Present()){
+            if(st.motion.group>=0&&st.motion.group<Ref<int32_t>(0xB4EA28))Field<int32_t>(ped,0x4D4)=st.motion.group;
+            ped->MoveState()=st.moveState;
+            anim::Replay(ped->RwObject(),st.motion,age);
+        }
+        if(st.animBlock!=kNoAnim){AnimationState action;action.block=st.animBlock;action.index=st.animIdx;action.flags=st.animFlags;action.time=st.animTime;action.speed=st.animSpeed;anim::Replay(ped->RwObject(),action,age);}
+        ReplayBoundAction(np,age);
         return;
     }
     if (d > 6.0f || std::fabs(err.z) > 4.0f) {
@@ -1387,12 +1404,13 @@ void Peds::OnPostProcess() {
         i=!p||!GetPed(i->second.target)||!CallStd<0x6182B0,bool>((int)i->second.arm,p)?handContacts.erase(i):std::next(i);
     }
     bool ready = Net().Online() && core::IsPlayerReady();
-    // Native SetMoveAnim recalculates mission-ped speed during ProcessControl. Restore the
-    // owner's rate afterwards so the rendered steps match its displacement and next frame.
+    // Native SetMoveAnim can replace a replica's gait with its local idle or
+    // walk clock during ProcessControl. Restore the owner's clock as well as
+    // its rate afterwards, before the next rendered frame.
     if (ready) for (auto& [id, np] : m_byId)
         if (np.owner != Net().MyId() && IsAlive(np) && !np.animFull && !np.extraFull &&
             !(np.state.flags & (PedSyncState::F_DEAD | PedSyncState::F_IN_VEHICLE | PedSyncState::F_ENTERING | PedSyncState::F_AIMING)))
-            if (void* a = anim::Find(np.ped->RwObject(), np.state.motion)) anim::Speed(a) = np.state.motion.speed;
+            anim::Replay(np.ped->RwObject(),np.state.motion,std::min(.2f,(NowMs()-np.recvMs)/1000.f));
     if (!ready || NowMs() - m_lastScan < 50) return;
     m_lastScan = NowMs();
     ScanOwned();

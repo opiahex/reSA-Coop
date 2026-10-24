@@ -27,6 +27,7 @@ std::map<void*,StoryParticipant> participants;
 struct Proof{int handle=-1;uint16_t model=0;uint64_t at=0,generation=0;int weapon=54;uint8_t player=255;uint64_t run=0;uint32_t phase=0;};
 std::map<uint32_t,Proof> photos;std::map<uint16_t,Proof> guestDamage;
 EventWindow seen[3];uint32_t sequence=0;uint64_t photoTaken=0;bool wasMission=false;uint64_t actionRun=0;uint32_t proofPhase=0,photoPhase=0;
+uint64_t photoViewAt=0;float photoViewFov=70;uint8_t photoViewPlayer=255;
 std::map<uint32_t,Proof> entityDamage;
 std::map<int,int> guestKills;
 std::set<std::tuple<uint16_t,uint64_t>> killed;
@@ -58,18 +59,23 @@ void ReportStoryHit(CPed*victim,uint8_t player,bool lethal,int weapon=54){
 }
 using PhotoFn=bool(__fastcall*)(CWeapon*,void*,CEntity*,const CVector*);PhotoFn originalPhoto=nullptr;
 bool __fastcall Photo(CWeapon*w,void*edx,CEntity*owner,const CVector*point){
-    struct Target{uint8_t kind;uint16_t id,model;int handle;bool before;};std::vector<Target> targets;
+    struct Target{uint8_t kind;uint16_t id,model;int handle;};std::vector<Target> targets;
     bool share=Net().Online()&&!Net().IsHost()&&core::IsPlayerReady()&&HostMissionRecent(0)&&owner==FindPlayerPed(0);
     if(share){
-        for(auto&[id,n]:Peds::Instance().All())if(n.ped&&GetPed(n.handle)==n.ped)targets.push_back({1,id,n.model,n.handle,Cmd(0x04C5).I(n.handle).Run()});
+        for(auto&[id,n]:Peds::Instance().All())if(n.ped&&GetPed(n.handle)==n.ped)targets.push_back({1,id,n.model,n.handle});
         std::vector<SyncAuditEntry> audit;core::CollectSyncAudit(audit);
-        for(auto&e:audit)if(e.kind==AUDIT_OBJECT)if(auto*o=SharedMissionObjectById(e.id)){int h=GetObjectRef(o);targets.push_back({2,e.id,o->ModelIndex(),h,Cmd(0x0833).I(h).Run()});}
+        for(auto&e:audit)if(e.kind==AUDIT_OBJECT)if(auto*o=SharedMissionObjectById(e.id)){int h=GetObjectRef(o);targets.push_back({2,e.id,o->ModelIndex(),h});}
     }
+    // 04C5/0833 consume their flags. A guest's photograph is an event of
+    // this exposure, so clear old replica flags first and consume only after
+    // the native camera has marked the visible targets of this exposure.
+    if(share)for(auto&t:targets)Cmd(t.kind==1?0x04C5:0x0833).I(t.handle).Run();
     bool ok=originalPhoto(w,edx,owner,point);
+    if(ok&&Net().IsHost()&&owner==FindPlayerPed(0)){photoViewAt=NowMs();photoViewPlayer=Net().MyId();photoViewFov=cam::Fov();}
     if(ok&&share){
         Writer packet(proto::G_STORY_ACTION);packet.U64(StoryRunId());packet.U32(CooperativeStoryPhase());if(++sequence==0)++sequence;packet.U32(sequence);packet.U8(1);
-        std::vector<Target> hit;for(auto&t:targets)if(!t.before&&Cmd(t.kind==1?0x04C5:0x0833).I(t.handle).Run()&&hit.size()<64)hit.push_back(t);
-        packet.U8((uint8_t)hit.size());packet.U64(StoryRunId());for(auto&t:hit){packet.U8(t.kind);packet.Entity(t.kind==1?ENTITY_PED:ENTITY_OBJECT,t.id);packet.U16(t.model);}Net().Send(proto::CH_RELIABLE,packet);
+        std::vector<Target> hit;for(auto&t:targets)if(Cmd(t.kind==1?0x04C5:0x0833).I(t.handle).Run()&&hit.size()<64)hit.push_back(t);
+        packet.U8((uint8_t)hit.size());packet.U64(StoryRunId());packet.F32(cam::Fov());for(auto&t:hit){packet.U8(t.kind);packet.Entity(t.kind==1?ENTITY_PED:ENTITY_OBJECT,t.id);packet.U16(t.model);}Net().Send(proto::CH_RELIABLE,packet);
         LOGI("Story photo sent token=%u targets=%u",sequence,(unsigned)hit.size());
     }
     return ok;
@@ -94,7 +100,7 @@ class StoryActions:public Module{
             entityDamage[(uint32_t(kind)<<16)|id]={n->handle,n->model,NowMs(),Net().EntityGeneration(kind,id),weapon,player,actionRun,packetPhase};return;
         }
         if(action!=1)return;
-        uint8_t count=r.U8();auto actionRun=r.U64();if(actionRun!=StoryRunId()||count>64)return;std::vector<std::tuple<uint8_t,uint16_t,uint16_t>> entries;
+        uint8_t count=r.U8();auto actionRun=r.U64();auto fov=r.F32();if(actionRun!=StoryRunId()||count>64||!std::isfinite(fov)||fov<5||fov>120)return;std::vector<std::tuple<uint8_t,uint16_t,uint16_t>> entries;
         for(int i=0;i<count;++i){uint8_t kind=r.U8();uint16_t id=r.U16(),model=r.U16();entries.emplace_back(kind,id,model);}
         if(!r.Ok()||from>=3||!Net().IsHost()||!HostReplicating()||!core::IsPlayerReady()||!seen[from].Accept(token))return;
         auto*p=Players::Instance().Get(from);if(!p||!p->hasState||NowMs()-p->stateRecvMs>1500)return;
@@ -104,16 +110,17 @@ class StoryActions:public Module{
             int8_t area=e?(kind==1?AreaOf((CPed*)e):e->AreaCode()):0;
             if(!e||e->ModelIndex()!=model||(area!=p->state.area&&area!=13)||(e->GetPosition()-p->state.pos).Length()>135)continue;
             int handle=kind==1?GetPedRef((CPed*)e):GetObjectRef((CObject*)e);photos[((uint32_t)kind<<16)|id]={handle,model,NowMs(),Net().EntityGeneration(kind==1?ENTITY_PED:ENTITY_OBJECT,id),54,from,actionRun,packetPhase};
+            photoViewAt=NowMs();photoViewFov=fov;photoViewPlayer=from;
             LOGI("Story photo accepted from %u kind=%u id=%u model=%u",from,kind,id,model);
         }
     });
  }
  void OnPostProcess()override{
     bool mission=Net().IsHost()?HostReplicating():HostMissionRecent(0);
-    if((wasMission&&!mission)||actionRun!=StoryRunId()){participants.clear();photos.clear();guestDamage.clear();entityDamage.clear();guestKills.clear();killed.clear();pendingHits.clear();photoTaken=0;}wasMission=mission;actionRun=StoryRunId();
+    if((wasMission&&!mission)||actionRun!=StoryRunId()){participants.clear();photos.clear();guestDamage.clear();entityDamage.clear();guestKills.clear();killed.clear();pendingHits.clear();photoTaken=photoViewAt=0;photoViewPlayer=255;}wasMission=mission;actionRun=StoryRunId();
     if(proofPhase!=CooperativeStoryPhase()){
         auto eraseOld=[](auto&proofs){for(auto i=proofs.begin();i!=proofs.end();)i=(i->second.run!=StoryRunId()||i->second.phase!=CooperativeStoryPhase())?proofs.erase(i):std::next(i);};
-        eraseOld(photos);eraseOld(guestDamage);eraseOld(entityDamage);if(photoPhase!=CooperativeStoryPhase())photoTaken=0;proofPhase=CooperativeStoryPhase();}
+        eraseOld(photos);eraseOld(guestDamage);eraseOld(entityDamage);if(photoPhase!=CooperativeStoryPhase()){photoTaken=photoViewAt=0;photoViewPlayer=255;}proofPhase=CooperativeStoryPhase();}
     for(auto i=participants.begin();i!=participants.end();){auto*p=Players::Instance().Get(i->second.player);auto*n=Vehicles::Instance().Find(i->second.vehicle);
         i=(!p||!p->ped||p->ped->Health()<=0||(i->second.vehicle&&(!n||!Vehicles::Alive(*n)||Net().EntityGeneration(ENTITY_VEHICLE,i->second.vehicle)!=i->second.generation)))?participants.erase(i):std::next(i);
     }
@@ -122,7 +129,7 @@ class StoryActions:public Module{
  }
  void OnPeerLeave(uint8_t id)override{if(id<3)seen[id]={};for(auto i=participants.begin();i!=participants.end();)i=i->second.player==id?participants.erase(i):std::next(i);}
  void OnPeerResync(uint8_t id)override{OnPeerLeave(id);}
- void OnGameShutdown()override{participants.clear();guestKills.clear();killed.clear();pendingHits.clear();photos.clear();guestDamage.clear();entityDamage.clear();photoTaken=0;wasMission=false;for(auto&w:seen)w={};}
+ void OnGameShutdown()override{participants.clear();guestKills.clear();killed.clear();pendingHits.clear();photos.clear();guestDamage.clear();entityDamage.clear();photoTaken=photoViewAt=0;photoViewPlayer=255;wasMission=false;for(auto&w:seen)w={};}
  void OnSessionEnd()override{OnGameShutdown();sequence=0;}
 }actions;
 struct Reg{Reg(){core::RegisterModule(&actions);}}reg;
@@ -237,10 +244,14 @@ bool CooperativeStoryCondition(int opcode,const int32_t*p,void*script){
         uint8_t kind=opcode==0x04C5?1:2;CEntity*e=kind==1?(CEntity*)GetPed(p[0]):(CEntity*)GetObject(p[0]);if(!e)return false;
         uint16_t id=0;if(kind==1){if(auto*n=Peds::Instance().Find((CPed*)e))id=n->netId;}else id=SharedMissionObjectId((CObject*)e);
         auto i=photos.find(((uint32_t)kind<<16)|id);bool accepted=id&&i!=photos.end()&&i->second.run==StoryRunId()&&i->second.phase==CooperativeStoryPhase()&&i->second.handle==p[0]&&i->second.model==e->ModelIndex()&&i->second.generation==Net().EntityGeneration(kind==1?ENTITY_PED:ENTITY_OBJECT,id);
-        if(accepted&&script)participants[script]={i->second.player,0,0,NowMs(),Field<void*>(script,0x10),Field<uint64_t>(script,8),5,StoryRunId()};return accepted;
+        if(accepted){if(script)participants[script]={i->second.player,0,0,NowMs(),Field<void*>(script,0x10),Field<uint64_t>(script,8),5,StoryRunId()};photos.erase(i);}return accepted;
     }else if(opcode==0x04DC&&photoTaken){photoTaken=0;return true;}
     return false;
 }
 void ClearCooperativeStoryScript(void*script){participants.erase(script);}
+bool CooperativePhotoFov(float&fov){
+    if(!Net().IsHost()||!HostReplicating()||photoViewPlayer>=3||photoViewPlayer==Net().MyId()||!photoViewAt||NowMs()-photoViewAt>1000)return false;
+    fov=photoViewFov;return true;
+}
 
 }

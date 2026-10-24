@@ -24,11 +24,12 @@ VehicleState VehicleState::Capture(game::CVehicle* v) {
     s.brake = v->BrakePedal();
     s.health = v->Health();
     s.flags = (v->EngineOn() ? F_ENGINE : 0) | (v->LightsOn() ? F_LIGHTS : 0) | (v->SirenOn() ? F_SIREN : 0) |
-              (v->Status() == 5 ? F_WRECKED : 0) | (v->HandbrakeOn() ? F_HANDBRAKE : 0);
+              (v->Status() == 5 ? F_WRECKED : 0) | (v->HandbrakeOn() ? F_HANDBRAKE : 0) | (!v->IsVisible() ? F_HIDDEN : 0);
     s.wheels=WheelState::Capture(v);
     if(s.wheels.count)s.extras|=X_WHEELS;
     bool localDriver = v->Driver() == game::FindPlayerPed(0);
-    if (localDriver ? game::GetPad(0)->NewState.ShockButtonL != 0 : game::Field<uint32_t>(v, 0x514) != 0) s.flags |= F_HORN;
+    if (localDriver ? game::GetPad(0)->NewState.ShockButtonL != 0 : game::Field<uint32_t>(v, 0x514) != 0)
+        s.flags |= v->SirenOn() ? F_FAST_SIREN : F_HORN;
     int type = v->VehicleSubClass();
     if (type <= game::VEHICLE_TYPE_PLANE || type == game::VEHICLE_TYPE_TRAILER) {  // CAutomobile and its subclasses
         s.extras |= X_MISC;

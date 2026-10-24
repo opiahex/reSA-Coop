@@ -342,6 +342,16 @@ TakePhotoFn g_origTakePhoto = nullptr;
 bool __fastcall HookTakePhotograph(void* weapon, void* edx, CEntity* owner, CVector* point) {
     return !g_inRemoteContext && g_origTakePhoto(weapon, edx, owner, point);
 }
+using PedRenderFn=void(__fastcall*)(CPed*,void*);PedRenderFn originalPedRender=nullptr;
+void __fastcall PhotoPedRender(CPed*ped,void*edx){
+    auto*me=core::IsPlayerReady()?FindPlayerPed(0):nullptr;
+    // The screenplay puts all photographers on one invisible support. A
+    // nearby companion's body must not cover another participant's lens.
+    if(me&&ped!=me&&Players::Instance().FindByPed(ped)&&me->ActiveWeapon().type==43&&
+       cam::Mode()==46&&me->AttachedTo()&&ped->AttachedTo()==me->AttachedTo()&&
+       (ped->GetPosition()-me->GetPosition()).Length()<6)return;
+    originalPedRender(ped,edx);
+}
 
 using GetInfoFn = CPlayerInfo*(__fastcall*)(CPlayerPed*, void*);
 GetInfoFn g_origGetPlayerInfo = nullptr;
@@ -376,7 +386,7 @@ void __fastcall HookVehicleAudioService(void* audio, void* edx) {
     bool remote = driver && driver->PedType() == PED_TYPE_PLAYER1 && driver != FindPlayerPed(0);
     if (veh) if (auto* nv = Vehicles::Instance().Find(veh); nv && Vehicles::Instance().IsMirror(*nv) && nv->hasState) {
         if(nv->state.extras&VehicleState::X_WHEELS)nv->renderedWheels.Apply(veh);
-        bool horn = RemoteVehicleHorn(veh,false);
+        bool horn = nv->hasState&&(nv->state.flags&VehicleState::F_SIREN)?(nv->state.flags&VehicleState::F_FAST_SIREN)!=0:RemoteVehicleHorn(veh,false);
         static std::map<uint16_t,bool> horns;
         if (horn != horns[nv->netId]) { horns[nv->netId]=horn; LOGI("Vehicle %04X horn %s in native audio service",nv->netId,horn?"on":"off"); }
         int type = veh->VehicleSubClass();
@@ -713,6 +723,7 @@ void Players::OnInstallHooks() {
                 "CPlayerPed::GetPlayerInfoForThisPlayerPed");
     mem::HookFn(0x706970, &HookGetRealTimeShadow, &g_origGetShadow, "CRealTimeShadowManager::GetRealTimeShadow");
     mem::HookFn(0x502280, &HookVehicleAudioService, &g_origVehicleAudio, "CAEVehicleAudioEntity::Service");
+    mem::HookFn(0x5E7680,&PhotoPedRender,&originalPedRender,"CPed::Render shared photographic viewpoint");
     mem::HookFn(0x58FAE0, &HookHudDraw, &g_origHudDraw, "CHud::Draw");
     mem::RedirectCallFn(0x60F595, &HookGroupBehaviour, &g_origGroupBehaviour);  // CPlayerPed::ProcessControl
     mem::RedirectCallFn(0x74278B, &HookTakePhotograph, &g_origTakePhoto);      // CWeapon::Fire, the camera
@@ -1214,7 +1225,7 @@ void Players::ApplyState(RemotePlayer& rp) {
     // a phone call (CTaskComplexUseMobilePhone): the phone is put in the hand as a weapon's model, and the weapon's
     // comes back after it (CPed__removeCellphone); the animations go with Anims
     bool phone = (st.flags & OnFootState::F_PHONE) != 0;
-    if (phone != (Field<int32_t>(ped, 0x740) == kCellphone) && LoadModelNow(kCellphone)) {
+    if (phone != (Field<int32_t>(ped, 0x740) == kCellphone) && (!phone||LoadModelNow(kCellphone))) {
         if (phone) {
             CallMethod<0x5E5ED0>(ped, kCellphone);  // CPed::AddWeaponModel
         } else {
