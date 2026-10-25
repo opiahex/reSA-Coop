@@ -6,4 +6,19 @@ namespace coop {
 void ApplyStoryMissionWeapon(uint8_t operation,int weapon,int ammo,bool inHand);
 void RestoreStoryMissionWeapons();
 void PersonalStoryWeapon(int slot,int&weapon,int&ammo);
+// Snapshot for a role's eventual release. Resolve a story-selected loan back
+// to the personal selection that preceded it; do not change the current weapon.
+int PersonalStoryWeaponSelection();
+// Native attached-gunner setup grants its own ammunition; native detach
+// writes an old turret-ammo snapshot back. Neither is a personal pickup.
+class StoryNativeInventoryScope {
+public:
+    StoryNativeInventoryScope();
+    explicit StoryNativeInventoryScope(int weapon);
+    ~StoryNativeInventoryScope();
+    StoryNativeInventoryScope(const StoryNativeInventoryScope&)=delete;
+    StoryNativeInventoryScope&operator=(const StoryNativeInventoryScope&)=delete;
+private:
+    uint32_t token=0;
+};
 }

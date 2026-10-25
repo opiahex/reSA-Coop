@@ -1022,7 +1022,7 @@ void ApplyHydraulics(CVehicle* v, const VehicleState& st) {
 // alternating native attachment physics with delayed world-space snapshots.
 bool ApplyTrainBinding(NetVehicle&nv,const VehicleState&st){
     auto*v=nv.veh;auto*parent=st.train.Valid()?ResolveTrainAttachment(st.train):nullptr;
-    if(parent&&!Net().EntityLink(ENTITY_VEHICLE,nv.netId,ENTITY_TRAIN,st.train.id,st.train.owner))parent=nullptr;
+    if(parent&&!Net().EntityLink(ENTITY_VEHICLE,nv.netId,ENTITY_TRAIN,st.train.id))parent=nullptr;
     if(nv.trainAttached&&v->AttachedTo()!=parent){if(v->AttachedTo())CallMethod<0x5442F0>(v,0.f,0.f,0.f,false);nv.trainAttached=false;}
     if(st.train.Valid()&&!parent){
         if(!nv.trainCollisionHeld){nv.trainCollisionHeld=true;nv.trainHadCollision=(v->Flags()&1)!=0;}

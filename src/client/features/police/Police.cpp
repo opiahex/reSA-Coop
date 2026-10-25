@@ -122,6 +122,7 @@ void __fastcall CopControl(CPed*p,void*edx){
 using IntelFn=void(__fastcall*)(void*,void*);IntelFn originalIntel=nullptr;
 void __fastcall Intelligence(void*intel,void*edx){
     auto*p=Field<CPed*>(intel,0);
+    ObservePoliceRopeIntelligence(p);
     if(!AmbientCop(p))return originalIntel(intel,edx);
     Context c(SelectTarget(p));originalIntel(intel,edx);
 }
@@ -187,6 +188,10 @@ class Police:public Module {
         mem::HookFn(0x5DE0D0,&CopDestructor,&originalDestructor,"CCopPed::~CCopPed");
     }
 }feature;struct Reg{Reg(){core::RegisterModule(&feature);}}reg;
+}
+void ProcessPolicePedIntelligence(game::CPed*ped){
+    if(ped&&game::IsPedValid(ped)&&ped->Intelligence()&&originalIntel)
+        Intelligence(ped->Intelligence(),nullptr);
 }
 void GeneratePoliceAwareTraffic(void(*generate)()){
     Context c(SelectTarget(nullptr,true));generate();

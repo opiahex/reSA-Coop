@@ -11,6 +11,8 @@ bool HostMissionRecent(uint64_t graceMs);
 // host: its mission (or the mission's trigger) runs and a partner is there to see it
 bool HostReplicating();
 bool LocalSchoolActivity();
+// Local activities retain their own camera and post effects.
+bool LocalStoryPresentationBlocked();
 
 // the script (CRunningScript) whose commands run right now, or null
 void* CurrentScript();

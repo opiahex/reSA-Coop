@@ -257,7 +257,7 @@ bool ApplyInteraction(NetPed&np,float age){
     else if(state.parentKind==4)parent=SharedMissionObjectById(state.parentId);
     else if(state.parentKind==5)parent=ResolveTrainAttachment(state.train);
     if(state.parentKind&&state.parentKind!=3){uint8_t kind=state.parentKind==1?ENTITY_VEHICLE:state.parentKind==2?ENTITY_PED:state.parentKind==5?ENTITY_TRAIN:ENTITY_OBJECT;
-        if(!Net().EntityLink(ENTITY_PED,np.netId,kind,state.parentId,state.parentKind==5?state.train.owner:255)){parent=nullptr;if(np.interactionAttached&&ped->AttachedTo()){CallMethod<0x5E7EC0>(ped);np.interactionAttached=false;}}
+        if(!Net().EntityLink(ENTITY_PED,np.netId,kind,state.parentId)){parent=nullptr;if(np.interactionAttached&&ped->AttachedTo()){CallMethod<0x5E7EC0>(ped);np.interactionAttached=false;}}
     }
     if(parent&&parent!=ped){
         if(ped->AttachedTo()!=parent){

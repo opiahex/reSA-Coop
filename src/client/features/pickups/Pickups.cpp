@@ -22,6 +22,7 @@
 #include "entities/mission/Mission.h"
 #include "shared/api/story-coop/StoryCoop.h"
 #include "shared/api/story-stage/StoryStage.h"
+#include "shared/api/story-scripts/StoryScripts.h"
 #include "shared/api/net-session/Session.h"
 #include "shared/game/Game.h"
 #include "shared/game/Script.h"
@@ -279,8 +280,8 @@ GenerateFn g_origGenerate = nullptr;
 bool Announced(int type, int model) {
     if (g_applying || !flow::InSharedWorld() || !core::IsPlayerReady() || PlayerInFocus() != 0) return false;  // the remote
     if (!Shared((uint8_t)type, model)) return false;                                  // player's drops are its game's
-    if (void* script = CurrentScript())  // a script: only the host's mission is not run by both games
-        return Net().IsHost() && Field<uint8_t>(script, 0xDC) && HostReplicating();  // CRunningScript::m_bIsMission
+    if (void* script = CurrentScript())
+        return Net().IsHost() && HostReplicating() && IsSharedStoryScript(script);
     return true;  // the engine: loot, a dropped jetpack, gang war rewards
 }
 void SendCreate(uintptr_t p) {
@@ -301,7 +302,7 @@ int __cdecl HookGenerateNewOne(float x, float y, float z, uint32_t model, int ty
     if (handle >= 0 && !g_applying && Net().Online() && Net().IsHost() && HostReplicating() &&
         Shared((uint8_t)type, (int)model) && !OrdinarySupply((int)model) &&
         ((type & 0xFF) == PU_ONCE_FOR_MISSION || (type & 0xFF) == PU_ONCE || (type&0xFF)==PU_FLOATINGPACKAGE || (type&0xFF)==PU_FLOATINGPACKAGE_FLOATING)) {
-        if (void* script = CurrentScript(); script && !game::script::Running()) g_story.insert(handle);
+        if (void* script = CurrentScript(); script && !game::script::Running() && IsSharedStoryScript(script)) g_story.insert(handle);
     }
     if (handle >= 0 && !g_story.count(handle) && Announced(type & 0xFF, (int)model)) {
         SendCreate(Pickup(handle & 0xFFFF));

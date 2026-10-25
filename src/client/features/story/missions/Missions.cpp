@@ -26,6 +26,7 @@
 #include "shared/api/story-scripts/StoryScripts.h"
 #include "shared/api/story-loadout/StoryLoadout.h"
 #include "shared/api/story-coop/StoryCoop.h"
+#include "shared/api/story-rc/StoryRC.h"
 #include "shared/api/story-stage/StoryStage.h"
 #include "shared/lib/sync/StoryPosition.h"
 #include "shared/lib/sync/StoryContinuation.h"
@@ -737,6 +738,7 @@ CommandsFn g_objectCommands[27]{};
 template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int opcode){
     const int chainOp=opcode&0x7FFF;
     bool story=script==g_currentScript&&SharedStoryScript(script)&&Replicating();
+    if(story)ObserveCooperativeRCMissionScript(script);
     if(story&&(chainOp==0x05EB||chainOp==0x0705||chainOp==0x085E||chainOp==0x014E||chainOp==0x03C3||chainOp==0x01B4||chainOp==0x0715||(chainOp==0x01BD&&CooperativeStageArmed(script)))){
         uint32_t saved[32];memcpy(saved,(void*)0xA43C78,sizeof saved);alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);int count=chainOp==0x01B4||chainOp==0x0715?2:1;CallMethod<0x464080>(copy,count);int first=Ref<int32_t>(0xA43C78),second=Ref<int32_t>(0xA43C7C);memcpy((void*)0xA43C78,saved,sizeof saved);
         // Scripts such as SYN1 enable control in their per-frame loop. Only
@@ -787,6 +789,18 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
             LOGD("Story chain opcode=%04X actor=%d originalCJ=%d",chainOp,actor,cj);return result;
         }
     }
+    if(story&&chainOp==0x02E3){
+        alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);
+        uint32_t saved[32];memcpy(saved,(void*)0xA43C78,sizeof saved);
+        CallMethod<0x464080>(copy,1);int car=Ref<int32_t>(0xA43C78);
+        memcpy((void*)0xA43C78,saved,sizeof saved);int32_t*out=nullptr;
+        auto*ip=Field<uint8_t*>(copy,0x14);
+        if(*ip==2||*ip==3){out=CallMethod<0x464790,int32_t*>(copy,0);
+            if(out&&(uint8_t*)out>=copy&&(uint8_t*)out<copy+sizeof copy)out=(int32_t*)((uint8_t*)script+((uint8_t*)out-copy));}
+        auto result=g_objectCommands[Group](script,edx,opcode);
+        float speed;if(out&&CooperativeStoryContactSpeed(script,car,speed))memcpy(out,&speed,4);
+        return result;
+    }
     if(story&&(chainOp==0x01BD||chainOp==0x0801)){
         alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);
         auto*ip=Field<uint8_t*>(copy,0x14);int32_t*out=nullptr;
@@ -809,8 +823,8 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
         if(chainOp==0x0318)MarkCooperativeStoryPassed();
     }
     auto object=ReadStoryObject(script,opcode);
-    uint8_t before=Field<uint8_t>(script,0xC5);int16_t logic=Field<int16_t>(script,0xD0);bool coop=story&&chainOp==0x09C8;int32_t*killOutput=nullptr;int killModel=-1;
-    int op=opcode&0x7FFF;int count=(op==0x00A3||op==0x02D6||(op>=0x00EC&&op<=0x00EE))?6:(op==0x00A4||(op>=0x00FE&&op<=0x0100))?8:(op==0x0480||op==0x00E1||op==0x0179||op==0x023B||op==0x031E||op==0x051C||op==0x08FF||op==0x09ED||op==0x06B7||op==0x02D8||op==0x0737||op==0x0364||op==0x031D||op==0x00DB||op==0x00DD||op==0x051A||op==0x0298||op==0x0897)?2:(op==0x04C5||op==0x0833||op==0x054E||op==0x0467||op==0x0468||op==0x054F||op==0x0900||op==0x0366||op==0x0297||op==0x00DF)?1:0;
+    uint8_t before=Field<uint8_t>(script,0xC5);int16_t logic=Field<int16_t>(script,0xD0);bool coop=story&&chainOp==0x09C8;bool rcOverride=false,rcValue=false;int32_t*killOutput=nullptr;int killModel=-1;
+    int op=opcode&0x7FFF;int count=(op==0x00A3||op==0x02D6||(op>=0x00EC&&op<=0x00EE))?6:(op==0x00A4||op==0x04E6||(op>=0x00FE&&op<=0x0100))?8:(op==0x0480||op==0x00E1||op==0x0179||op==0x023B||op==0x031E||op==0x051C||op==0x08FF||op==0x09ED||op==0x06B7||op==0x02D8||op==0x0737||op==0x0364||op==0x031D||op==0x00DB||op==0x00DD||op==0x051A||op==0x0298||op==0x0897)?2:(op==0x04C5||op==0x0833||op==0x054E||op==0x0467||op==0x0468||op==0x054F||op==0x0900||op==0x0366||op==0x0297||op==0x00DF||op==0x02CC)?1:0;
     if((count||op==0x04DC)&&script==g_currentScript&&SharedStoryScript(script)&&Replicating()){
         alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);uint32_t saved[32];memcpy(saved,(void*)0xA43C78,sizeof saved);
         int32_t params[10]{};if(count){CallMethod<0x464080>(copy,count);memcpy(params,(void*)0xA43C78,count*4);}memcpy((void*)0xA43C78,saved,sizeof saved);
@@ -826,7 +840,7 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
                 if(killOutput&&(uint8_t*)killOutput>=copy&&(uint8_t*)killOutput<copy+sizeof(copy))
                     killOutput=(int32_t*)((uint8_t*)script+((uint8_t*)killOutput-copy));
                 killModel=params[1];}
-        }else coop=CooperativeStoryCondition(op,params,script);
+        }else{rcOverride=CooperativeRCCondition(script,op,params,rcValue);if(!rcOverride)coop=CooperativeStoryCondition(op,params,script);}
     }
     int mapParams[6]{};bool mapEdit=story&&(chainOp==0x0363||chainOp==0x088D||chainOp==0x03B6);
     if(mapEdit){alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);uint32_t saved[32];memcpy(saved,(void*)0xA43C78,sizeof saved);CallMethod<0x464080>(copy,6);memcpy(mapParams,(void*)0xA43C78,sizeof mapParams);memcpy((void*)0xA43C78,saved,sizeof saved);}
@@ -838,7 +852,7 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
     if(mapEdit)RecordStoryMapCommand(chainOp,mapParams);
     if(story&&(chainOp==0x015A||chainOp==0x02EB))g_sceneScriptCamera=false;
     if(killOutput)*killOutput=std::clamp<int64_t>((int64_t)*killOutput+CooperativeGuestKills(killModel),0,1000000);
-    if(coop){Field<uint8_t>(script,0xC5)=before;Field<int16_t>(script,0xD0)=logic;CallMethod<0x4859D0>(script,true);}
+    if(rcOverride||coop){Field<uint8_t>(script,0xC5)=before;Field<int16_t>(script,0xD0)=logic;CallMethod<0x4859D0>(script,rcOverride?rcValue:true);}
     if(object.create){int h=Ref<int32_t>(0xA43C78);auto*o=GetObject(h);if(o&&(object.model<0||o->ModelIndex()==object.model)){ShareMissionObject(h);if(story)ArmCooperativeStage(script);}}
     return result;
 }
@@ -2145,6 +2159,7 @@ void StopScriptCamera() {
     cam::Fov() = g_cameraFov;
     SetWideScreen(false);
     RestoreSceneHud();
+    RestoreCooperativeRoleCamera();
 }
 struct StoryWarp {
     bool pending=false,prepared=false;uint32_t sequence=0,phase=0;uint64_t received=0,run=0,loaded=0,warned=0;
@@ -2251,7 +2266,15 @@ void HostSendScriptCamera() {
     // An attached camera is an interactive photographic viewpoint (SYN1),
     // not a fixed scene camera. Each participant aims their own weapon.
     bool photographing=me&&me->AttachedTo()&&me->ActiveWeapon().type==43&&!TheCameraWide();
-    bool active = g_sceneScriptCamera && controlled && !photographing && !CutsceneRunning() && (!mission||!PersonalActivity(mission));
+    // An RC pilot owns this chase camera just like a driver owns theirs.
+    // Fixed introductions still use a different native mode and remain shared.
+    bool remoteView=false;
+    if(me&&!GetPad(0)->DisablePlayerControls&&!TheCameraWide()&&cam::Mode()==18&&Cmd(0x0241).I(0).Run()){
+        int remote=-1;Cmd(0x0484).I(0).Out(&remote).Run();auto*vehicle=GetVehicle(remote);
+        remoteView=vehicle&&IsVehicleValid(vehicle)&&vehicle->Health()>0&&
+                   (vehicle->AreaCode()==me->AreaCode()||vehicle->AreaCode()==13);
+    }
+    bool active = g_sceneScriptCamera && controlled && !photographing && !remoteView && !CutsceneRunning() && (!mission||!PersonalActivity(mission));
     SetCooperativeStoryCamera(active);
     auto controls=GetPad(0)->DisablePlayerControls;
     if (!active && !g_cameraSent&&controls==g_lastCameraControls) return;
@@ -3233,6 +3256,10 @@ bool LocalSchoolActivity() {
     if(g_schoolFlag)return true;
     auto*script=FindMissionScript();
     return script&&IsSchoolScriptName(Field<char[8]>(script,0x08));
+}
+
+bool LocalStoryPresentationBlocked() {
+    return g_personalFlag||LocalSchoolActivity()||NowMs()<g_localActivityUntil||PersonalActivity(g_currentScript);
 }
 
 void* CurrentScript() { return g_currentScript; }

@@ -173,12 +173,12 @@ enum MsgId : uint8_t {
     G_TYRE_HIT = 163, // reliable native bullet wheel hit; the current vehicle owner punctures once
     G_SIM_FILES = 164, // diagnostic simulation file digests; no file contents are transferred
     G_OBJ_CARRY = 165, // host arbitration and versioned pose of one shared mission object
-    G_STORY_ACTION = 166, // native guest photo evidence and cooperative actor conditions
+    G_STORY_ACTION = 166, // native guest action/contact evidence and cooperative actor conditions
 
     G_STORY_STAGE = 169, // native mission-stage dependency readiness
     G_INTERACTION = 170, // exclusive native activity leases
     G_STEALTH = 171, // owner validates a real native guest knife action
-    G_STORY_COOP = 168, // mission roles, run snapshots and once-paid reward receipts
+    G_STORY_COOP = 168, // mission roles, RC cargo actions, run snapshots and reward receipts
     G_PED_ACTION = 167, // reliable revisioned NPC action/sequence transition
 
     G_VEH_HORN = 172, // reliable native horn edges and active heartbeat
@@ -186,7 +186,7 @@ enum MsgId : uint8_t {
     G_NPC_CARJACK = 174, // authoritative NPC pull-out -> victim's native seat exit
     G_NPC_CAR_DOOR = 175, // NPC-owned native door animation, including guest-owned vehicles
     G_HELI_SHOT = 176, // authoritative helicopter gun round, generation + sequence
-    G_STORY_WORLD = 177, // host map/IPL edits and shared campaign counters
+    G_STORY_WORLD = 177, // host map/IPL edits, campaign counters; op7 run/phase/area darkness
     G_POLICE_RULES = 178, // nearby host gang-war and story police policy
     G_PROJECTILE_FLIGHT = 179, // authoritative guided flight/target/retirement
     G_VOICE = 200,            // unreliable: voice frame

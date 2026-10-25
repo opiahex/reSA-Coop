@@ -9,6 +9,8 @@
 #include "shared/api/mission-objects/SharedObject.h"
 #include "shared/api/net-session/Session.h"
 #include "shared/api/story-actions/StoryActions.h"
+#include "shared/api/story-rc/StoryRC.h"
+#include "shared/api/story-loadout/StoryLoadout.h"
 #include "shared/lib/sync/StoryCoopPolicy.h"
 #include "shared/lib/sync/StoryContinuation.h"
 #include "shared/lib/core/Core.h"
@@ -26,7 +28,7 @@
 #include "shared/ui/chat/Chat.h"
 namespace coop {namespace {
 using namespace game;using game::script::Cmd;
-enum:uint8_t{SNAPSHOT=1,REWARD=2,RECEIPT=3,LEAVE_ROLE=4};
+enum:uint8_t{SNAPSHOT=1,REWARD=2,RECEIPT=3,LEAVE_ROLE=4,MAGNET_INPUT=5};
 struct Role {uint32_t assignment=0;uint64_t objectGeneration=0,driverGeneration=0;uint8_t player=255,mode=0;uint16_t vehicle=0,source=0,driver=0;uint64_t generation=0,sourceGeneration=0;int handle=-1,driverHandle=-1;bool combat=true;uint16_t object=0;CVector offset;uint16_t angle=0;float range=0,vertical=0,viewHeading=0,viewRange=0;int weapon=0;};
 struct Enemy {uint64_t generation=0,changed=0,hit=0;uint8_t target=255,aggressor=255;int opcode=0;};
 struct Credit {uint64_t token=0;int32_t money=0;std::string name;uint64_t sent=0;};
@@ -53,6 +55,7 @@ std::set<uint64_t> awaitingProfile;
 StoryRewardLedger ledger;
 uint64_t lastNoise[3]{};
 uint8_t localMode=0;bool savedCollision=true;
+int localRemoteHandle=-1;uint16_t localRemoteVehicle=0;uint64_t localRemoteGeneration=0;
 float savedAttachedHeading=0,savedAttachedRange=0;bool savedAttachedView=false;
 int localRoleHandle=-1;int savedRoleState=0,savedRoleActiveWeapon=0;
 CWeapon savedRoleWeapon{};int roleWeaponType=28,roleAmmoAdded=0;bool roleWeaponSaved=false;
@@ -69,9 +72,37 @@ void LoadOutbox(){
 CPed* Player(uint8_t id){if(id==Net().MyId())return core::IsPlayerReady()?FindPlayerPed(0):nullptr;auto*p=Players::Instance().Get(id);return p&&p->hasState&&NowMs()-p->stateRecvMs<1500?p->ped:nullptr;}
 bool Participant(uint8_t id){auto*p=Player(id);return p&&IsPedValid(p)&&p->Health()>0;}
 uint8_t PlayerId(CPed*p){if(p==FindPlayerPed(0))return Net().MyId();auto*rp=Players::Instance().FindByPed(p);return rp?rp->id:255;}
+int NativeRemoteHandle(){int handle=-1;if(Cmd(0x0241).I(0).Run())Cmd(0x0484).I(0).Out(&handle).Run();return handle;}
+bool NativeRemoteIs(const Role&r){auto*n=Vehicles::Instance().Find(r.vehicle);return n&&Vehicles::Alive(*n)&&r.generation&&Net().EntityGeneration(ENTITY_VEHICLE,r.vehicle)==r.generation&&NativeRemoteHandle()==n->handle;}
 bool ScenePoint(const CVector& p) {
     return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z) &&
            std::fabs(p.x) <= 20000 && std::fabs(p.y) <= 20000 && std::fabs(p.z) <= 5000;
+}
+bool SideGunnerOffset(CEntity*parent,const CVector&native,uint8_t player,int weapon,CVector&out){
+    if(!parent||!parent->IsVehicle()||weapon<22||weapon>38||std::fabs(native.x)<.6f||
+       ((CVehicle*)parent)->VehicleSubClass()!=VEHICLE_TYPE_HELI||!parent->Matrix())return false;
+    // A lateral offset towards the middle puts a left-door gunner inside the
+    // cockpit. Keep the native side and facing; separate players fore/aft.
+    out=native;out.y+=(player==1?-1.f:1.f)*1.2f;
+    auto*model=CallMethod<0x535300,void*>(parent);auto*matrix=parent->Matrix();
+    if(!model||!Field<void*>(model,0x2C))return true;
+    auto lo=Field<CVector>(model,0),hi=Field<CVector>(model,0xC);
+    if(!ScenePoint(lo)||!ScenePoint(hi)||hi.x<=lo.x||hi.y-lo.y<1.f||hi.x-lo.x>100)return true;
+    out.y=std::clamp(out.y,lo.y+.5f,hi.y-.5f);
+    struct Line{CVector start;float size0;CVector end;float size1;};
+    struct Point{CVector position;float pad;CVector normal;float pad2;uint8_t tail[12];};
+    static_assert(sizeof(Line)==0x20&&sizeof(Point)==0x2C);
+    auto world=[&](CVector p){return matrix->pos+matrix->right*p.x+matrix->forward*p.y+matrix->up*p.z;};
+    bool left=native.x<0;
+    for(float height:{-.5f,.2f,.8f}){
+        CVector from{left?lo.x-1.f:hi.x+1.f,out.y,native.z+height},to{0,out.y,native.z+height};
+        Line ray{world(from),0,world(to),0};Point hit{};float fraction=1;
+        if(!Call<0x417950,bool>(&ray,matrix,model,&hit,&fraction,false,false))continue;
+        float surface=(hit.position-matrix->pos).Dot(matrix->right);
+        if(!std::isfinite(surface))continue;
+        out.x=left?std::min(out.x,surface-.45f):std::max(out.x,surface+.45f);
+    }
+    return true;
 }
 CEntity* RoleParent(const Role& r) {
     if (r.object) {
@@ -88,6 +119,8 @@ struct AircraftHold {
     uint32_t assignment = 0, flags = 0;
     uint16_t vehicle = 0;
     CVector offset;
+    uint64_t releasePending=0;
+    uint32_t releaseSourceTime=0;
 };
 std::array<AircraftHold, 3> aircraftHolds;
 constexpr uint32_t kAircraftHoldMask = 0x2002; // DontApplySpeed and ApplyGravity
@@ -101,9 +134,15 @@ void ReleaseAircraftHold(AircraftHold& hold, const Role* role = nullptr) {
         if (role) {
             auto* source = Vehicles::Instance().Find(role->source);
             if (source && Vehicles::Alive(*source) && role->sourceGeneration == Net().EntityGeneration(ENTITY_VEHICLE, role->source)) {
-                car->MoveSpeed() = source->veh->MoveSpeed(); car->TurnSpeed() = source->veh->TurnSpeed();
-                car->SetEngineOn(source->veh->EngineOn());
                 if (car->VehicleSubClass() == VEHICLE_TYPE_PLANE) Cmd(0x0745).I(n->handle).Run();
+                // Mirrors deliberately suppress their native physics. Their
+                // received owner state carries the actual flight velocity.
+                if(source->owner!=Net().MyId()&&source->hasState&&NowMs()-source->recvMs<1500){
+                    car->MoveSpeed()=source->state.vel*(1.f/50.f);car->TurnSpeed()=source->state.turn*(1.f/50.f);
+                    car->SetEngineOn((source->state.flags&VehicleState::F_ENGINE)!=0);
+                }else{
+                    car->MoveSpeed()=source->veh->MoveSpeed();car->TurnSpeed()=source->veh->TurnSpeed();car->SetEngineOn(source->veh->EngineOn());
+                }
             }
         }
         LOGD("Story aircraft hold released vehicle=%04X", hold.vehicle);
@@ -127,6 +166,13 @@ void UpdateAircraftHolds() {
             ReleaseAircraftHold(hold);
         if (!valid) continue;
         bool held = mandatoryCamera || !role.combat;
+        if(held)hold.releasePending=0;
+        else if(hold.run&&source->owner!=Net().MyId()){
+            // The reliable control event may precede the first state captured
+            // after the native flight script unfreezes and accelerates it.
+            if(!hold.releasePending){hold.releasePending=NowMs();hold.releaseSourceTime=source->state.time;}
+            if(source->state.time==hold.releaseSourceTime&&NowMs()-hold.releasePending<250)held=true;
+        }
         if (!held) { if (hold.run) ReleaseAircraftHold(hold, &role); continue; }
         auto* car = n->veh; auto* basis = source->veh->Matrix();
         if (!hold.run) {
@@ -156,9 +202,19 @@ void UpdateAircraftHolds() {
 void ReleaseLocalRole(){
     ReleaseAircraftHolds();
     if(savedAttachedView){Ref<float>(0xA4449C)=savedAttachedHeading;Ref<float>(0xA44498)=savedAttachedRange;savedAttachedView=false;}
-    if(localMode==3&&core::IsPlayerReady()&&Cmd(0x0241).I(0).Run())Cmd(0x04DB).Run();
+    if(localMode==3&&core::IsPlayerReady()){
+        int current=NativeRemoteHandle();
+        bool owned=current==localRemoteHandle&&localRemoteVehicle&&localRemoteGeneration&&Net().EntityGeneration(ENTITY_VEHICLE,localRemoteVehicle)==localRemoteGeneration;
+        if(current>=0&&!owned){
+            // The player selected another native RC vehicle. Releasing the
+            // old assignment must preserve that controller and its camera.
+            localRoleHandle=-1;localRoleRun=0;localMode=0;localAssignment=0;roleWeaponSaved=false;
+            localRemoteHandle=-1;localRemoteVehicle=0;localRemoteGeneration=0;return;
+        }
+        if(owned)Cmd(0x04DB).Run();
+    }
     if(core::IsPlayerReady()&&localRoleHandle>=0){auto*me=FindPlayerPed(0);
-        if(GetPedRef(me)==localRoleHandle){if(me->AttachedTo())Cmd(0x0465).I(localRoleHandle).Run();
+        if(GetPedRef(me)==localRoleHandle){if(me->AttachedTo()){StoryNativeInventoryScope inventory;Cmd(0x0465).I(localRoleHandle).Run();}
             if(roleWeaponSaved){auto&weapon=me->Weapons()[4];
                 if(weapon.type==roleWeaponType){if(savedRoleWeapon.type==roleWeaponType)weapon.ammoTotal=std::max(0,weapon.ammoTotal-roleAmmoAdded);
                     else{Cmd(0x0555).I(localRoleHandle).I(roleWeaponType).Run();if(savedRoleWeapon.type)Cmd(0x01B2).I(localRoleHandle).I(savedRoleWeapon.type).I(savedRoleWeapon.ammoTotal).Run();}}}
@@ -167,6 +223,7 @@ void ReleaseLocalRole(){
             if(localMode==4){auto&flags=Field<uint32_t>(me,0x1C);flags=(flags&~1u)|(savedCollision?1u:0u);}
             if(!mandatoryCamera)Cmd(0x02EB).Run();if(!mandatoryCamera)Cmd(0x01B4).I(0).I(1).Run();Cmd(0x0619).I(localRoleHandle).I(localMode==4?savedCollision:1).Run();}}
     localRoleHandle=-1;localRoleRun=0;localMode=0;localAssignment=0;roleWeaponSaved=false;
+    localRemoteHandle=-1;localRemoteVehicle=0;localRemoteGeneration=0;
 }
 bool HumanIn(CVehicle*car,uint8_t excluding=255){auto human=[&](CPed*p){auto id=PlayerId(p);return id<3&&id!=excluding;};bool occupied=human(car->Driver());for(int i=0;i<car->MaxPassengers();++i)occupied|=human(car->Passengers()[i]);return occupied;}
 void RetireRole(Role&r,bool deleteNative,uint8_t excluding=255){
@@ -239,13 +296,24 @@ void UpdateEnemies(){
             e.target=selected;e.changed=now;LOGI("Story enemy %04X chose participant %u",n->netId,selected);}
     }
 }
-bool SpawnPoint(CVehicle*source,uint8_t player,CVector&point){
+bool SpawnPoint(CVehicle*source,uint8_t player,CVector&point,bool remote=false){
     if(!source->Matrix())return false;const bool air=source->VehicleSubClass()==VEHICLE_TYPE_PLANE||source->VehicleSubClass()==VEHICLE_TYPE_HELI;
     for(int attempt=0;attempt<8;++attempt){auto*m=source->Matrix();float side=((player+attempt)&1)?1.f:-1.f;
         CVector right{m->right.x,m->right.y,0},forward{m->forward.x,m->forward.y,0};
         float rl=right.Length(),fl=forward.Length();if(rl<.1f||fl<.1f)return false;right=right*(1.f/rl);forward=forward*(1.f/fl);
         auto p=m->pos+right*(side*(5.f+(attempt/2)*3.f))-forward*(4.f+player*3.f);
-        if(air){p=m->pos+right*(side*(24.f+(attempt/2)*14.f))-forward*(25.f+player*14.f);
+        if(remote){
+            // RC courses have narrow paths and an interior floor. Aircraft
+            // formation spacing can put a miniature helicopter off the table.
+            constexpr float offsets[8][2]={{3,0},{-3,0},{0,3},{0,-3},{3,3},{-3,3},{3,-3},{-3,-3}};
+            auto choice=(attempt+(player==2?1:0))%8;
+            p=m->pos+right*offsets[choice][0]+forward*offsets[choice][1];
+            bool atSource=false;float sourceFloor=Call<0x5696C0,float>(m->pos.x,m->pos.y,m->pos.z+3.f,&atSource,(CEntity**)nullptr);
+            if(atSource&&m->pos.z-sourceFloor<5.f){
+                bool ground=false;float floor=Call<0x5696C0,float>(p.x,p.y,p.z+5.f,&ground,(CEntity**)nullptr);
+                if(!ground||std::fabs(floor-sourceFloor)>2.f)continue;p.z=floor+std::max(.7f,m->pos.z-sourceFloor);
+            }else p.z+=.5f;
+        }else if(air){p=m->pos+right*(side*(24.f+(attempt/2)*14.f))-forward*(25.f+player*14.f);
             // N.O.E.'s aircraft starts by the hangars. The usable apron is in
             // front of it; putting guests behind it places planes by the wall.
             if(!_stricmp(missionName.c_str(),"DESERT6")&&source->ModelIndex()==476)
@@ -256,21 +324,21 @@ bool SpawnPoint(CVehicle*source,uint8_t player,CVector&point){
                 if(!ground||std::fabs(floor-sourceFloor)>2.f)continue;p.z=floor+std::max(.8f,m->pos.z-sourceFloor);
             }else p.z+=3.f;
         }else{bool ground=false;p.z=Call<0x5696C0,float>(p.x,p.y,p.z+8.f,&ground,(CEntity**)nullptr)+.7f;if(!ground)continue;}
-        bool blocked=false;auto*pool=VehiclePool();for(int i=0;pool&&i<pool->size;++i)if(pool->byteMap[i]>=0){auto*v=(CVehicle*)(pool->objects+(size_t)i*kVehiclePoolElemSize);if((v->GetPosition()-p).Length()<(air?15.f:4.f)){blocked=true;break;}}
+        bool blocked=false;auto*pool=VehiclePool();for(int i=0;pool&&i<pool->size;++i)if(pool->byteMap[i]>=0){auto*v=(CVehicle*)(pool->objects+(size_t)i*kVehiclePoolElemSize);if((v->AreaCode()==source->AreaCode()||v->AreaCode()==13||source->AreaCode()==13)&&(v->GetPosition()-p).Length()<(remote?2.5f:air?15.f:4.f)){blocked=true;break;}}
         if(!blocked){point=p;return true;}}
     return false;
 }
 bool CreateRole(CVehicle*source,uint8_t player,uint8_t mode){
     const bool gunner=mode==2;
-    auto*src=Vehicles::Instance().EnsureNetworked(source);if(!src)return false;CVector p;if(!SpawnPoint(source,player,p)){
+    auto*src=Vehicles::Instance().EnsureNetworked(source);if(!src)return false;CVector p;if(!SpawnPoint(source,player,p,mode==3)){
         static uint64_t reported=0;if(NowMs()-reported>3000){reported=NowMs();LOGI("Story vehicle offer waiting player=%u source=%04X reason=clear-spawn-point",player,src->netId);}return false;}
     auto previousComponents=Ref<uint16_t>(0x8A6458);for(int i=0;i<2;++i)Ref<int8_t>(0x8A6458+i)=Field<int8_t>(source,0x438+i);
     int h=-1;Cmd(0x00A5).I(source->ModelIndex()).F(p.x).F(p.y).F(p.z).Out(&h).Run();Ref<uint16_t>(0x8A6458)=previousComponents;auto*car=GetVehicle(h);if(!car)return false;
     Cmd(0x0175).I(h).F(mode==1&&!_stricmp(missionName.c_str(),"DESERT6")&&source->ModelIndex()==476?90.f:source->GetHeading()*57.29578f).Run();
-    memcpy((uint8_t*)car+0x434,(uint8_t*)source+0x434,4);car->DoorLock()=0;car->Health()=1000;car->SetEngineOn(true);
+    memcpy((uint8_t*)car+0x434,(uint8_t*)source+0x434,4);car->DoorLock()=0;car->Health()=1000;car->SetEngineOn(true);car->AreaCode()=source->AreaCode();
     car->SetStreamingDontDelete(true);auto*n=Vehicles::Instance().EnsureNetworked(car);if(!n){Cmd(0x00A6).I(h).Run();return false;}
     Vehicles::Instance().CloneAppearance(source,car);
-    if(mode==3||mode==5){WorldRemove(car);if(source->Matrix()&&car->Matrix()){*car->Matrix()=*source->Matrix();car->Matrix()->pos=p;}else car->SetPositionRaw(p);CallMethod<0x446F90>(car);CallMethod<0x532B00>(car);WorldAdd(car);car->MoveSpeed()=source->MoveSpeed();car->TurnSpeed()=source->TurnSpeed();if(car->VehicleSubClass()==VEHICLE_TYPE_HELI)Field<float>(car,0x84C)=Field<float>(source,0x84C);}
+    if(mode==3||mode==5){WorldRemove(car);if(source->Matrix()&&car->Matrix()){auto*matrix=car->Matrix();auto*basis=source->Matrix();matrix->right=basis->right;matrix->forward=basis->forward;matrix->up=basis->up;matrix->pos=p;}else car->SetPositionRaw(p);CallMethod<0x446F90>(car);CallMethod<0x532B00>(car);WorldAdd(car);car->MoveSpeed()=source->MoveSpeed();car->TurnSpeed()=source->TurnSpeed();if(car->VehicleSubClass()==VEHICLE_TYPE_HELI)Field<float>(car,0x84C)=Field<float>(source,0x84C);}
     Role role;role.player=player;role.mode=mode;role.combat=mode!=5||(GetPad(0)->DisablePlayerControls==0&&!mandatoryCamera);role.vehicle=n->netId;role.source=src->netId;role.handle=h;
     role.generation=Net().EntityGeneration(ENTITY_VEHICLE,n->netId);role.sourceGeneration=Net().EntityGeneration(ENTITY_VEHICLE,src->netId);
     if(gunner){
@@ -312,6 +380,13 @@ void NativeAllySeats(){
     }
 }
 void HostRoles(bool preparing=false){
+    static uint64_t attachmentReported=0;
+    if(active&&Net().IsHost()&&core::IsPlayerReady())if(auto*me=FindPlayerPed(0);me&&me->AttachedTo()&&NowMs()-attachmentReported>2000){
+        attachmentReported=NowMs();auto*p1=Players::Instance().Get(1);auto*p2=Players::Instance().Get(2);auto*parent=me->AttachedTo();
+        LOGD("Story attachment role source=%p type=%u model=%u matrix=%d inVehicle=%d cutscene=%u age=%llu peers=%u,%u health=%.0f,%.0f stateAge=%llu,%llu modes=%u,%u",
+             parent,parent->Type(),parent->ModelIndex(),parent->Matrix()!=nullptr,me->InVehicle(),Ref<uint8_t>(0xB5F851),(unsigned long long)(NowMs()-started),Participant(1),Participant(2),p1&&p1->ped?p1->ped->Health():-1.f,p2&&p2->ped?p2->ped->Health():-1.f,
+             (unsigned long long)(p1?NowMs()-p1->stateRecvMs:0),(unsigned long long)(p2?NowMs()-p2->stateRecvMs:0),roles[1].mode,roles[2].mode);
+    }
     if(!active||!Net().IsHost()||(!preparing&&NowMs()-started<1500)||Ref<uint8_t>(0xB5F851))return;
     auto*me=FindPlayerPed(0);
     bool flightControls = GetPad(0)->DisablePlayerControls == 0 && !mandatoryCamera;
@@ -334,12 +409,12 @@ void HostRoles(bool preparing=false){
         if(parent->IsVehicle()){if(auto*n=Vehicles::Instance().EnsureNetworked((CVehicle*)parent))vehicle=n->netId;}
         else if(parent->IsObject()){ShareMissionObject(GetObjectRef((CObject*)parent));object=SharedMissionObjectId((CObject*)parent);}
         if(vehicle||object){bool change=false;for(auto&r:roles)change|=r.mode&&(r.mode!=4||r.vehicle!=vehicle||r.object!=object);if(change){RetireRoles(true);allocated.clear();}
-            for(uint8_t id=0;id<3;++id)if(id!=Net().MyId()&&Participant(id)&&!roles[id].mode&&!DeclinedSource(id,vehicle,vehicle?Net().EntityGeneration(ENTITY_VEHICLE,vehicle):Net().EntityGeneration(ENTITY_OBJECT,object),object)){Role r;r.player=id;r.mode=4;r.vehicle=vehicle;r.object=object;r.source=vehicle;r.generation=vehicle?Net().EntityGeneration(ENTITY_VEHICLE,vehicle):0;r.offset=Field<CVector>(me,0x76C);r.offset.x+=(id==1?1.f:-1.f)*(me->ActiveWeapon().type==43?2.5f:1.5f);r.angle=Field<uint16_t>(me,0x778);r.range=Field<float>(me,0x77C);r.vertical=Field<float>(me,0x780);r.viewHeading=Ref<float>(0xA4449C);r.viewRange=Ref<float>(0xA44498);r.weapon=me->ActiveWeapon().type;r.objectGeneration=object?Net().EntityGeneration(ENTITY_OBJECT,object):0;r.sourceGeneration=vehicle?r.generation:r.objectGeneration;r.assignment=++roleCounter;roles[id]=r;Snapshot();}
+            for(uint8_t id=0;id<3;++id)if(id!=Net().MyId()&&Participant(id)&&!roles[id].mode&&!DeclinedSource(id,vehicle,vehicle?Net().EntityGeneration(ENTITY_VEHICLE,vehicle):Net().EntityGeneration(ENTITY_OBJECT,object),object)){Role r;r.player=id;r.mode=4;r.vehicle=vehicle;r.object=object;r.source=vehicle;r.generation=vehicle?Net().EntityGeneration(ENTITY_VEHICLE,vehicle):0;r.offset=Field<CVector>(me,0x76C);if(!SideGunnerOffset(parent,r.offset,id,me->ActiveWeapon().type,r.offset))r.offset.x+=(id==1?1.f:-1.f)*(me->ActiveWeapon().type==43?2.5f:1.5f);r.angle=Field<uint16_t>(me,0x778);r.range=Field<float>(me,0x77C);r.vertical=me->ActiveWeapon().type==43?Field<float>(me,0x780):0.f;r.viewHeading=Ref<float>(0xA4449C);r.viewRange=Ref<float>(0xA44498);r.weapon=me->ActiveWeapon().type;r.objectGeneration=object?Net().EntityGeneration(ENTITY_OBJECT,object):0;r.sourceGeneration=vehicle?r.generation:r.objectGeneration;r.assignment=++roleCounter;roles[id]=r;Snapshot();}
             return;}
     }
     int remote=-1;bool rc=Cmd(0x0241).I(0).Run();if(rc)Cmd(0x0484).I(0).Out(&remote).Run();
     auto*car=rc?GetVehicle(remote):me->VehicleIfIn();if(!car&&me->AttachedTo()&&me->AttachedTo()->IsVehicle())car=(CVehicle*)me->AttachedTo();
-    if(!car||!IsVehicleValid(car)||me->AreaCode()!=0||car->Health()<=0){
+    if(!car||!IsVehicleValid(car)||(!rc&&me->AreaCode()!=0)||car->Health()<=0||(car->AreaCode()!=me->AreaCode()&&car->AreaCode()!=13)){
         bool gunner=false;for(auto&r:roles)gunner|=r.mode>=2;if(gunner){if(!gunnerAbsent)gunnerAbsent=NowMs();if(NowMs()-gunnerAbsent>1500){RetireRoles(true);Snapshot();}}return;}
     auto*src=Vehicles::Instance().EnsureNetworked(car);if(!src)return;
     if(rc){bool changed=false;for(auto&r:roles)changed|=r.mode&&(r.mode!=3||r.source!=src->netId);if(changed){RetireRoles(true);allocated.clear();}
@@ -391,24 +466,24 @@ void LocalRole(){
     if(declinedAssignment&&declinedAssignment==r.assignment){DeclineLocalRole();return;}
     if(localRoleRun==run&&localAssignment==r.assignment&&localMode){
         auto*me=FindPlayerPed(0);auto*n=Vehicles::Instance().Find(r.vehicle);
-        bool left=(localMode==2||localMode==5)?(!me->InVehicle()||!n||me->Vehicle()!=n->veh):localMode==3?!Cmd(0x0241).I(0).Run():localMode==4?!me->AttachedTo():false;
+        bool left=(localMode==2||localMode==5)?(!me->InVehicle()||!n||me->Vehicle()!=n->veh):localMode==3?!NativeRemoteIs(r):localMode==4?!me->AttachedTo():false;
         if(left&&me->Health()>0){DeclineLocalRole();return;}}
     if(r.mode==3||r.mode==4||r.mode==5){auto*me=FindPlayerPed(0);auto*n=Vehicles::Instance().Find(r.vehicle);CEntity*parent=RoleParent(r);
         if(me->Health()<=0||!parent)return;
-        if(localRoleRun==run&&localMode==r.mode){if(r.mode==3&&Cmd(0x0241).I(0).Run())return;if(r.mode==4&&me->AttachedTo()==parent)return;if(r.mode==5)return;}
+        if(localRoleRun==run&&localMode==r.mode){if(r.mode==3&&NativeRemoteIs(r)){if(r.combat&&!mandatoryCamera&&cam::Mode()!=18)RestoreCooperativeRoleCamera();return;}if(r.mode==4&&me->AttachedTo()==parent)return;if(r.mode==5)return;}
         if(r.mode==3&&(!n||n->owner!=Net().MyId()))return;
-        if(localRoleRun)ReleaseLocalRole();savedRoleState=me->PedState();savedRoleActiveWeapon=me->ActiveWeapon().type;savedCollision=(Field<uint32_t>(me,0x1C)&1u)!=0;localRoleHandle=GetPedRef(me);localMode=r.mode;
+        if(localRoleRun)ReleaseLocalRole();savedRoleState=me->PedState();savedRoleActiveWeapon=PersonalStoryWeaponSelection();savedCollision=(Field<uint32_t>(me,0x1C)&1u)!=0;localRoleHandle=GetPedRef(me);localMode=r.mode;
         if(me->InVehicle()){auto p=me->GetPosition();Cmd(0x0362).I(localRoleHandle).F(p.x+2).F(p.y).F(p.z).Run();}
-        if(r.mode==3)Cmd(0x0715).I(0).I(n->handle).Run();
+        if(r.mode==4){savedAttachedHeading=Ref<float>(0xA4449C);savedAttachedRange=Ref<float>(0xA44498);savedAttachedView=true;}
+        if(r.mode==3){localRemoteHandle=n->handle;localRemoteVehicle=r.vehicle;localRemoteGeneration=r.generation;Cmd(0x0715).I(0).I(n->handle).Run();}
         else if(r.mode==5)Cmd(0x036A).I(localRoleHandle).I(n->handle).Run();
-        else if(r.weapon==43){
+        else {StoryNativeInventoryScope inventory(r.weapon);if(r.weapon==43){
             // 0858 stores the attached camera's yaw and sweep in SCM globals,
             // separately from CPed's horizontal/vertical attachment limits.
-            savedAttachedHeading=Ref<float>(0xA4449C);savedAttachedRange=Ref<float>(0xA44498);savedAttachedView=true;
             CallMethod<0x5E7E60>(me,parent,r.offset,r.angle,r.range,r.vertical,r.weapon);
-            Cmd(0x0858).I(0).F(r.viewHeading*57.2957795f).F(r.viewRange*57.2957795f).Run();
         }
-        else CallMethod<0x5E7CB0,CEntity*>(me,parent,r.offset,r.angle,r.range,r.weapon);
+        else CallMethod<0x5E7CB0,CEntity*>(me,parent,r.offset,r.angle,r.range,r.weapon);}
+        if(r.mode==4)Cmd(0x0858).I(0).F(r.viewHeading*57.2957795f).F(r.viewRange*57.2957795f).Run();
         Cmd(0x01B4).I(0).I(mandatoryCamera||(r.mode==5&&!r.combat)?0:1).Run();localRoleRun=run;localAssignment=r.assignment;LOGI("Story native role ready mode=%u vehicle=%04X object=%04X",r.mode,r.vehicle,r.object);return;}
     if(r.mode!=2){if(localRoleRun)ReleaseLocalRole();
         if(r.mode==1&&roleBlips[Net().MyId()]<0)if(auto*n=Vehicles::Instance().Find(r.vehicle);n&&Vehicles::Alive(*n)){
@@ -421,7 +496,7 @@ void LocalRole(){
     if(n->veh->Passengers()[0]&&n->veh->Passengers()[0]!=me)return;
     if(localRoleRun)ReleaseLocalRole();
     int h=GetPedRef(me);if(me->InVehicle())Cmd(0x0362).I(h).F(n->veh->GetPosition().x+2).F(n->veh->GetPosition().y).F(n->veh->GetPosition().z+1).Run();
-    localRoleHandle=h;savedRoleState=me->PedState();savedRoleActiveWeapon=me->ActiveWeapon().type;savedRoleWeapon=me->Weapons()[4];roleWeaponType=savedRoleWeapon.type?savedRoleWeapon.type:28;roleWeaponSaved=true;
+    localRoleHandle=h;savedRoleState=me->PedState();savedRoleActiveWeapon=PersonalStoryWeaponSelection();savedRoleWeapon=me->Weapons()[4];roleWeaponType=savedRoleWeapon.type?savedRoleWeapon.type:28;roleWeaponSaved=true;
     Cmd(0x02EB).Run();
     // This is a real passenger, not an on-foot turret attached above the bike.
     // Native seating supplies the same pose, parent and seat to every observer.
@@ -439,6 +514,7 @@ class CooperativeStory:public Module{
  const char*Name()const override{return "CooperativeStory";}
  void OnInstallHooks()override{Net().SetHandler(proto::G_STORY_COOP,[](uint8_t from,Reader&r){
     auto op=r.U8();auto token=r.U64();
+    if(op==MAGNET_INPUT){ReceiveCooperativeRCMagnet(from,token,r);return;}
     if(op==LEAVE_ROLE){auto assignment=r.U32();if(!r.Ok()||!Net().IsHost()||from>=3||!active||token!=run||roles[from].assignment!=assignment||!Net().Peer(from))return;
         auto old=roles[from];declined[from]={old.source,old.object,old.sourceGeneration};RetireRole(roles[from],true);Snapshot();LOGI("Story role voluntarily released player=%u assignment=%u",from,assignment);return;}
     if(op==RECEIPT){if(Net().IsHost()&&r.Ok()){auto before=outbox.size();for(auto i=outbox.begin();i!=outbox.end();)i=i->token==token&&i->name==Net().PeerName(from)?outbox.erase(i):std::next(i);if(before!=outbox.size())SaveOutbox();}return;}
@@ -446,7 +522,7 @@ class CooperativeStory:public Module{
     if(op==REWARD){auto target=r.U8();auto money=r.I32();if(!r.Ok()||target!=Net().MyId()||money<=0||money>10000000)return;
         if(pendingCredits.size()<64&&!std::any_of(pendingCredits.begin(),pendingCredits.end(),[&](auto&c){return c.token==token;}))pendingCredits.push_back({token,money});return;}
     if(op!=SNAPSHOT)return;auto revision=r.U32();auto nextPhase=r.U32();bool nextActive=r.Bool();auto name=r.Str(16);bool nextCamera=r.Bool();std::array<Role,3> incoming;
-    for(uint8_t id=0;id<3;++id){auto&v=incoming[id];v.player=id;v.mode=r.U8();v.assignment=r.U32();v.vehicle=r.U16();v.source=r.U16();v.driver=r.U16();v.combat=r.Bool();v.generation=Net().ExpectedEntityGeneration(ENTITY_VEHICLE,v.vehicle);v.sourceGeneration=Net().ExpectedEntityGeneration(ENTITY_VEHICLE,v.source);v.object=r.U16();v.objectGeneration=Net().ExpectedEntityGeneration(ENTITY_OBJECT,v.object);v.driverGeneration=Net().ExpectedEntityGeneration(ENTITY_PED,v.driver);auto offset=r.Vec();v.offset={offset.x,offset.y,offset.z};v.angle=r.U16();v.range=r.F32();v.vertical=r.F32();v.viewHeading=r.F32();v.viewRange=r.F32();v.weapon=r.U8();if(!std::isfinite(v.viewHeading)||!std::isfinite(v.viewRange)||std::fabs(v.viewHeading)>7||std::fabs(v.viewRange)>7||v.mode>5||v.weapon>46||!std::isfinite(v.vertical)||std::fabs(v.vertical)>3.2f||!std::isfinite(v.range)||v.offset.Length()>100)return;}
+    for(uint8_t id=0;id<3;++id){auto&v=incoming[id];v.player=id;v.mode=r.U8();v.assignment=r.U32();v.vehicle=r.U16();v.source=r.U16();v.driver=r.U16();v.combat=r.Bool();v.generation=Net().ExpectedEntityGeneration(ENTITY_VEHICLE,v.vehicle);v.sourceGeneration=Net().ExpectedEntityGeneration(ENTITY_VEHICLE,v.source);v.object=r.U16();v.objectGeneration=Net().ExpectedEntityGeneration(ENTITY_OBJECT,v.object);v.driverGeneration=Net().ExpectedEntityGeneration(ENTITY_PED,v.driver);auto offset=r.Vec();v.offset={offset.x,offset.y,offset.z};v.angle=r.U16();v.range=r.F32();v.vertical=r.F32();v.viewHeading=r.F32();v.viewRange=r.F32();v.weapon=r.U8();if(!std::isfinite(v.viewHeading)||!std::isfinite(v.viewRange)||std::fabs(v.viewHeading)>7||std::fabs(v.viewRange)>7||v.mode>5||v.weapon>46||!std::isfinite(v.vertical)||(v.weapon==43?std::fabs(v.vertical)>3.2f:v.vertical!=0.f)||!std::isfinite(v.range)||v.offset.Length()>100){static uint64_t rejected=0;if(NowMs()-rejected>2000){rejected=NowMs();LOGW("Story role snapshot rejected player=%u mode=%u weapon=%d vertical=%.6g range=%.6g view=%.6g,%.6g offset=%.3f,%.3f,%.3f",id,v.mode,v.weapon,v.vertical,v.range,v.viewHeading,v.viewRange,v.offset.x,v.offset.y,v.offset.z);}return;}}
     std::map<uint16_t,AllySeat>incomingSeats;auto seats=r.U8();if(seats>32)return;for(int i=0;i<seats;++i){AllySeat a;a.ped=r.U16();a.vehicle=r.U16();a.seat=r.I8();a.pedGeneration=Net().ExpectedEntityGeneration(ENTITY_PED,a.ped);a.vehicleGeneration=Net().ExpectedEntityGeneration(ENTITY_VEHICLE,a.vehicle);a.until=NowMs()+6000;if(a.seat<0||a.seat>7)return;incomingSeats[a.ped]=a;}
     if(!r.Ok()||(receivedRun==token&&receivedRevision&&(int32_t)(revision-receivedRevision)<=0))return;
     if(receivedRun&&token<receivedRun)return;
@@ -456,7 +532,9 @@ class CooperativeStory:public Module{
     if(run!=token||!nextActive){ReleaseLocalRole();for(auto&b:roleBlips){if(b>=0&&core::IsPlayerReady())Cmd(0x0164).I(b).Run();b=-1;}if(active)ReleaseStoryCargo();}
     if(nextActive&&!nextCamera&&Net().MyId()<3&&incoming[Net().MyId()].mode>0&&incoming[Net().MyId()].combat){
         ReleaseStoryScriptCamera();if(roles[Net().MyId()].mode==2&&!roles[Net().MyId()].combat&&localRoleRun)Cmd(0x01B4).I(0).I(1).Run();}
+    bool releaseRemoteCamera=mandatoryCamera&&!nextCamera&&nextActive;
     receivedRun=run=token;receivedRevision=revision;rolePhase=nextPhase;active=nextActive;missionName=name;roles=incoming;mandatoryCamera=nextCamera;allySeats=std::move(incomingSeats);AdoptCooperativeStoryPhase(token,nextPhase);
+    if(releaseRemoteCamera)RestoreCooperativeRoleCamera();
     LOGD("Story role snapshot run=%llu revision=%u active=%d",(unsigned long long)run,revision,active);
  });}
  void OnPreProcess()override{if(Net().Online()&&core::IsPlayerReady())UpdateAircraftHolds();}
@@ -500,7 +578,7 @@ void ResyncCooperativeStory(uint8_t player){if(!Net().IsHost())return;Snapshot()
 bool LocalCooperativeRoleReady(){
     if(!active||Net().IsHost()||Net().MyId()>=3)return true;
     auto& r=roles[Net().MyId()]; if(r.mode==0||r.mode==1||r.assignment==declinedAssignment)return true;
-    if(r.mode==3)return localRoleRun==run&&localMode==3&&Cmd(0x0241).I(0).Run();
+    if(r.mode==3)return localRoleRun==run&&localAssignment==r.assignment&&localMode==3&&NativeRemoteIs(r);
     auto* parent=RoleParent(r); auto* me=FindPlayerPed(0);
     if(r.mode==4)return parent&&me&&localRoleRun==run&&localAssignment==r.assignment&&localMode==4&&me->AttachedTo()==parent;
     return parent&&me&&me->InVehicle()&&me->Vehicle()==parent;
@@ -518,12 +596,50 @@ bool LocalCooperativeRelocationReady(uint16_t sourceVehicle,int8_t area,const CV
            (source->veh->GetPosition()-point).Length()<128;
 }
 bool StoryRoleOwnsCamera(){return active&&!Net().IsHost()&&Net().MyId()<3&&roles[Net().MyId()].mode>0&&!mandatoryCamera&&roles[Net().MyId()].combat;}
+bool RestoreCooperativeRoleCamera(){
+    if(Net().IsHost()||!active||!core::IsPlayerReady()||Net().MyId()>=3||mandatoryCamera||MenuActive()||
+       Ref<uint8_t>(addr::UserPause)||Ref<uint8_t>(addr::CodePause)||LocalStoryTransitionPending())return false;
+    const auto&role=roles[Net().MyId()];auto*me=FindPlayerPed(0);
+    if(role.mode!=3||!role.combat||!me||me->Health()<=0||localRoleRun!=run||
+       localAssignment!=role.assignment||localMode!=3||role.assignment==declinedAssignment||!NativeRemoteIs(role))return false;
+    auto*car=Vehicles::Instance().Find(role.vehicle);if(!car||!Vehicles::Alive(*car)||car->veh->Health()<=0)return false;
+    auto controls=GetPad(0)->DisablePlayerControls;if(controls&~0x20u)return false;
+    Cmd(0x0158).I(car->handle).I(18).I(1).Run(); // native POINT_CAMERA_AT_CAR; no RC reassignment
+    if(controls==0x20)Cmd(0x01B4).I(0).I(1).Run();return true;
+}
 void SetCooperativeStoryCamera(bool mandatory){if(!Net().IsHost()||mandatoryCamera==mandatory)return;mandatoryCamera=mandatory;if(run)Snapshot();}
 uint8_t CooperativeReservedSeats(CVehicle*car){if(!active||!car)return 0;auto*n=Vehicles::Instance().Find(car);if(!n)return 0;uint8_t mask=0;
     for(auto&[id,a]:allySeats)if(a.vehicle==n->netId&&a.vehicleGeneration==Net().EntityGeneration(ENTITY_VEHICLE,a.vehicle)&&NowMs()<a.until){auto*p=GetPed(Peds::Instance().HandleOf(a.ped));if(p&&p->Health()>0&&a.pedGeneration==Net().EntityGeneration(ENTITY_PED,a.ped))mask|=(uint8_t)(1u<<a.seat);}return mask;
 }
 uint8_t LocalStoryRoleMode(){return active&&Net().MyId()<3?roles[Net().MyId()].mode:0;}
 bool IsCooperativeRemoteVehicle(CVehicle*car,uint8_t player){if(!active||player>=3||roles[player].mode!=3)return false;auto*n=Vehicles::Instance().Find(roles[player].vehicle);return n&&Vehicles::Alive(*n)&&n->veh==car&&Net().EntityGeneration(ENTITY_VEHICLE,n->netId)==roles[player].generation;}
+bool CooperativeRemoteMission(const char*name){return active&&name&&!_stricmp(missionName.c_str(),name);}
+bool CooperativeRemoteRole(uint8_t player,StoryRemoteRole&out){
+    out={};if(!Net().Online()||!active||!run||player>=3||!core::IsPlayerReady())return false;
+    auto*me=FindPlayerPed(0);if(!me||me->Health()<=0)return false;
+    NetVehicle*nativeSource=nullptr;
+    if(Net().IsHost()){
+        if(!Cmd(0x0241).I(0).Run())return false;int handle=-1;Cmd(0x0484).I(0).Out(&handle).Run();
+        auto*car=GetVehicle(handle);if(!car||!IsVehicleValid(car)||car->Health()<=0)return false;
+        nativeSource=Vehicles::Instance().Find(car);if(!nativeSource||!Vehicles::Alive(*nativeSource))return false;
+        if(player==Net().MyId()){
+            out.run=run;out.phase=CooperativeStoryPhase();out.player=player;
+            out.vehicle=out.source=nativeSource->netId;
+            out.vehicleGeneration=out.sourceGeneration=Net().EntityGeneration(ENTITY_VEHICLE,nativeSource->netId);
+            out.car=out.sourceCar=car;return out.vehicleGeneration!=0;
+        }
+    }else if(rolePhase!=CooperativeStoryPhase())return false;
+    const auto&r=roles[player];if(r.mode!=3||!r.assignment||!r.generation||!r.sourceGeneration)return false;
+    if(player==Net().MyId()&&r.assignment==declinedAssignment)return false;
+    if(player==Net().MyId()&&(localRoleRun!=run||localAssignment!=r.assignment||localMode!=3||!NativeRemoteIs(r)))return false;
+    auto*car=Vehicles::Instance().Find(r.vehicle);auto*source=Vehicles::Instance().Find(r.source);
+    if(!car||!source||!Vehicles::Alive(*car)||!Vehicles::Alive(*source)||car->veh->Health()<=0||source->veh->Health()<=0||
+       Net().EntityGeneration(ENTITY_VEHICLE,r.vehicle)!=r.generation||Net().EntityGeneration(ENTITY_VEHICLE,r.source)!=r.sourceGeneration||
+       car->veh->AreaCode()!=source->veh->AreaCode()||(nativeSource&&nativeSource!=source))return false;
+    out.run=run;out.phase=CooperativeStoryPhase();out.assignment=r.assignment;out.player=player;
+    out.vehicle=r.vehicle;out.source=r.source;out.vehicleGeneration=r.generation;out.sourceGeneration=r.sourceGeneration;
+    out.car=car->veh;out.sourceCar=source->veh;return true;
+}
 CPed* CooperativeRemoteController(CVehicle*car){if(!car||!active)return nullptr;for(auto&r:roles)if(r.mode==3){if(IsCooperativeRemoteVehicle(car,r.player))return Player(r.player);auto*n=Vehicles::Instance().Find(r.source);if(n&&Vehicles::Alive(*n)&&n->veh==car&&Net().EntityGeneration(ENTITY_VEHICLE,n->netId)==r.sourceGeneration)return Player(Net().HostId());}return nullptr;}
 bool IsCooperativeRoleVehicle(CVehicle*car){for(auto&r:roles)if(r.vehicle)if(auto*n=Vehicles::Instance().Find(r.vehicle);n&&Vehicles::Alive(*n)&&n->veh==car)return true;return false;}
 void CooperativeStoryShot(uint8_t player,int weapon,const CVector&start,const CVector&end){

@@ -13,6 +13,8 @@
 #include "shared/api/net-session/Session.h"
 #include "shared/api/story-world/StoryWorld.h"
 #include "shared/api/story-scripts/StoryScripts.h"
+#include "shared/api/story-coop/StoryCoop.h"
+#include "shared/api/story-stage/StoryStage.h"
 #include "shared/game/Script.h"
 #include "shared/lib/core/Core.h"
 #include "shared/lib/memory/Memory.h"
@@ -20,7 +22,7 @@
 #include "common/lib/util/Util.h"
 namespace coop {namespace {
 using namespace game;using game::script::Cmd;
-enum:uint8_t{MAP=1,IPL=2,PROGRESS=3,SNAPSHOT_BEGIN=4,SNAPSHOT_END=5,REQUEST=6};
+enum:uint8_t{MAP=1,IPL=2,PROGRESS=3,SNAPSHOT_BEGIN=4,SNAPSHOT_END=5,REQUEST=6,DARKNESS=7};
 struct MapEdit{int op=0;CVector at;float radius=0;int model=0,value=0;};
 std::vector<MapEdit> edits;std::map<std::string,uint8_t> ipls;
 std::set<std::string> appliedFarIpls;
@@ -42,6 +44,95 @@ void SendProgress(){
     if(progressSent&&values==sentProgress&&NowMs()-sentAt<3000)return;
     sentProgress=values;progressSent=true;sentAt=NowMs();Writer w(proto::G_STORY_WORLD);w.U8(PROGRESS);w.U32(++revision);for(auto v:values)w.U32(v);Net().Send(proto::CH_RELIABLE,w);
 }
+
+struct DarknessState {
+    uint64_t run=0;
+    uint32_t phase=0,revision=0;
+    int8_t area=0;
+    CVector anchor;
+    bool enabled=false;
+    uint8_t alpha=170;
+};
+DarknessState darkness;
+uint32_t darknessRevision=0;
+uint64_t darknessSent=0,darknessReceived=0;
+bool haveDarkness=false,darknessBorrowed=false,darknessSavedEnabled=false;
+int32_t darknessSavedAlpha=170;
+using DarknessFn=void(__cdecl*)(bool,int32_t);
+DarknessFn originalDarkness=nullptr;
+bool NativeDarkness(){return Ref<uint8_t>(0xC402C4)!=0;}
+int32_t NativeDarknessAlpha(){return Ref<int32_t>(0x8D5204);}
+void SendDarkness(){
+    if(!haveDarkness)return;
+    Writer w(proto::G_STORY_WORLD);w.U8(DARKNESS);w.U64(darkness.run);w.U32(darkness.phase);w.U32(darkness.revision);
+    w.I8(darkness.area);w.Vec({darkness.anchor.x,darkness.anchor.y,darkness.anchor.z});w.Bool(darkness.enabled);w.U8(darkness.alpha);
+    Net().Send(proto::CH_RELIABLE,w);darknessSent=NowMs();
+}
+void RestoreDarkness(){
+    if(!darknessBorrowed)return;
+    // A local script or another native effect may have replaced the loan.
+    // Restore only the filter that is still ours, leaving its other effects alone.
+    if(NativeDarkness()&&NativeDarknessAlpha()==darkness.alpha)
+        originalDarkness(darknessSavedEnabled,darknessSavedAlpha);
+    darknessBorrowed=false;
+}
+void ClearDarkness(){
+    RestoreDarkness();darkness={};haveDarkness=false;
+    darknessRevision=0;darknessSent=darknessReceived=0;
+}
+void __cdecl ScriptDarkness(bool enabled,int32_t alpha){
+    originalDarkness(enabled,alpha);
+    if(!Net().Online())return;
+    if(!Net().IsHost()){
+        // An explicit local command supersedes the borrowed filter. Personal
+        // activities must keep the setting they just selected when we leave.
+        if(darknessBorrowed){
+            darknessSavedEnabled=NativeDarkness();darknessSavedAlpha=NativeDarknessAlpha();darknessBorrowed=false;
+        }
+        return;
+    }
+    auto*script=CurrentScript();auto*me=core::IsPlayerReady()?FindPlayerPed(0):nullptr;
+    if(!me||!StoryRunId()||!IsSharedStoryScript(script)||LocalStoryPresentationBlocked())return;
+    darkness.run=StoryRunId();darkness.phase=CooperativeStoryPhase();darkness.area=me->AreaCode();darkness.anchor=me->GetPosition();
+    darkness.enabled=NativeDarkness();darkness.alpha=(uint8_t)std::clamp(NativeDarknessAlpha(),0,255);
+    if(++darknessRevision==0)++darknessRevision;darkness.revision=darknessRevision;haveDarkness=true;
+    SendDarkness();
+    LOGI("Story darkness sent run=%llu phase=%u enabled=%u alpha=%u area=%d",(unsigned long long)darkness.run,darkness.phase,darkness.enabled,darkness.alpha,darkness.area);
+}
+void ReceiveDarkness(Reader&r){
+    DarknessState value;value.run=r.U64();value.phase=r.U32();value.revision=r.U32();value.area=r.I8();auto at=r.Vec();
+    value.anchor={at.x,at.y,at.z};value.enabled=r.Bool();value.alpha=r.U8();
+    if(!r.Ok()||!value.run||!value.revision||value.area<0||value.area>18||
+       !std::isfinite(at.x)||!std::isfinite(at.y)||!std::isfinite(at.z)||value.anchor.Length()>25000||
+       (darknessRevision&&(int32_t)(value.revision-darknessRevision)<0))return;
+    // A resync can carry the same revision after the cooperative role snapshot.
+    // It refreshes availability without replacing the saved personal setting.
+    if(darknessBorrowed&&(value.run!=darkness.run||value.alpha!=darkness.alpha))RestoreDarkness();
+    darkness=value;darknessRevision=value.revision;darknessReceived=NowMs();haveDarkness=true;
+}
+void UpdateDarkness(){
+    if(Net().Online()&&Net().IsHost()){
+        if(!haveDarkness)return;
+        if(!core::IsPlayerReady()||!StoryRunId()||StoryRunId()!=darkness.run){
+            darkness.enabled=false;if(++darknessRevision==0)++darknessRevision;darkness.revision=darknessRevision;SendDarkness();haveDarkness=false;return;
+        }
+        // The global native filter may now belong to a personal activity.
+        // Only an owned story command may change the shared setting.
+        auto phase=CooperativeStoryPhase();
+        if(phase!=darkness.phase){
+            darkness.phase=phase;
+            if(++darknessRevision==0)++darknessRevision;darkness.revision=darknessRevision;SendDarkness();
+        }else if(NowMs()-darknessSent>=1000)SendDarkness();
+        return;
+    }
+    auto*me=core::IsPlayerReady()?FindPlayerPed(0):nullptr;
+    bool applies=originalDarkness&&Net().Online()&&flow::InHostWorld()&&me&&me->Health()>0&&haveDarkness&&darkness.enabled&&
+        StoryRunId()==darkness.run&&CooperativeStoryPhase()==darkness.phase&&NowMs()-darknessReceived<3000&&
+        me->AreaCode()==darkness.area&&(me->GetPosition()-darkness.anchor).Length()<160&&!LocalStoryPresentationBlocked();
+    if(!applies){RestoreDarkness();return;}
+    if(!darknessBorrowed){darknessSavedEnabled=NativeDarkness();darknessSavedAlpha=NativeDarknessAlpha();darknessBorrowed=true;}
+    if(!NativeDarkness()||NativeDarknessAlpha()!=darkness.alpha)originalDarkness(true,darkness.alpha);
+}
 using IplFn=void(__cdecl*)(int);IplFn originalIpl[3]{};
 template<int Op>void __cdecl ScriptIpl(int slot){
     originalIpl[Op](slot);auto*s=CurrentScript();
@@ -54,6 +145,7 @@ void Receive(uint8_t from,Reader&r){
     auto op=r.U8();
     if(op==REQUEST){if(Net().IsHost()&&from<3&&Net().Peer(from))Snapshot();return;}
     if(from!=Net().HostId()||Net().IsHost())return;
+    if(op==DARKNESS){ReceiveDarkness(r);return;}
     if(op==SNAPSHOT_BEGIN){auto rev=r.U32();auto count=r.U32();if(!r.Ok())return;edits.clear();ipls.clear();snapshotOpen=true;haveSnapshot=false;snapshotRevision=rev;snapshotExpected=count;snapshotCount=0;return;}
     if(op==SNAPSHOT_END){auto rev=r.U32();if(r.Ok()&&snapshotOpen&&rev==snapshotRevision&&snapshotCount==snapshotExpected){receivedMapRevision=rev;haveSnapshot=true;snapshotOpen=false;LOGI("Story map snapshot ready revision=%u records=%u",rev,snapshotCount);}return;}
     if(op==MAP){auto rev=r.U32();MapEdit e;e.op=r.U16();auto p=r.Vec();e.at={p.x,p.y,p.z};e.radius=r.F32();e.model=r.I32();e.value=r.I32();if(!r.Ok()||!Valid(e))return;Remember(e);receivedMapRevision=rev;if(snapshotOpen)++snapshotCount;appliedAt=0;LOGI("Story map edit received op=%04X model=%d",e.op,e.model);}
@@ -69,6 +161,7 @@ void Snapshot(){
     Writer begin(proto::G_STORY_WORLD);begin.U8(SNAPSHOT_BEGIN);begin.U32(mapRevision);begin.U32((uint32_t)(edits.size()+ipls.size()));Net().Send(proto::CH_RELIABLE,begin);
     for(auto&e:edits)Send(e);for(auto&[name,op]:ipls)SendIpl(name,op);
     Writer end(proto::G_STORY_WORLD);end.U8(SNAPSHOT_END);end.U32(mapRevision);Net().Send(proto::CH_RELIABLE,end);
+    SendDarkness();
 }
 bool ApplyIpls(){
     bool ready=true;
@@ -100,11 +193,13 @@ class StoryWorld:public Module{
     const char*Name()const override{return "StoryWorld";}
     void OnInstallHooks()override{
         Net().SetHandler(proto::G_STORY_WORLD,&Receive);
+        mem::HookFn(0x701170,&ScriptDarkness,&originalDarkness,"CPostEffects::ScriptDarknessFilterSwitch");
         mem::RedirectCallFn(0x46B6ED,&ScriptIpl<0>,&originalIpl[0]);
         mem::RedirectCallFn(0x46B715,&ScriptIpl<1>,&originalIpl[1]);
         mem::RedirectCallFn(0x46B73D,&ScriptIpl<2>,&originalIpl[2]);
     }
     void OnPostProcess()override{
+        UpdateDarkness();
         if(!Net().Online()||!core::IsPlayerReady()||!flow::InHostWorld())return;
         if(Net().IsHost()){if(NowMs()-sentAt>500)SendProgress();return;}
         if(haveProgress){memcpy((void*)(0xB79000+(146-120)*4),progress.data(),12);memcpy((void*)0xB79380,progress.data()+3,8);}
@@ -114,7 +209,8 @@ class StoryWorld:public Module{
     void OnPeerResync(uint8_t)override{if(Net().IsHost()){Snapshot();progressSent=false;}}
 
     void OnPeerJoin(uint8_t)override{progressSent=false;}
-    void OnGameShutdown()override{mapRevision=receivedMapRevision=0;snapshotOpen=haveSnapshot=false;requestedAt=0;edits.clear();ipls.clear();appliedFarIpls.clear();haveProgress=progressSent=false;receivedRevision=0;sentAt=appliedAt=0;}
+    void OnGameShutdown()override{ClearDarkness();mapRevision=receivedMapRevision=0;snapshotOpen=haveSnapshot=false;requestedAt=0;edits.clear();ipls.clear();appliedFarIpls.clear();haveProgress=progressSent=false;receivedRevision=0;sentAt=appliedAt=0;}
+    void OnHostChanged(uint8_t)override{ClearDarkness();}
     void OnSessionEnd()override{OnGameShutdown();revision=0;}
 }feature;struct Reg{Reg(){core::RegisterModule(&feature);}}reg;
 }

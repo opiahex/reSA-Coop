@@ -338,8 +338,10 @@ struct Reg {
 bool DescribeTrainAttachment(game::CVehicle*vehicle,TrainAttachment&out){
     out={};if(!Net().Online()||!core::IsPlayerReady()||!vehicle||!game::IsVehicleValid(vehicle)||!vehicle->IsTrain())return false;
     auto find=[&](game::CVehicle*engine,uint8_t owner,uint16_t id,uint64_t generation){
-        for(uint8_t carriage=0;carriage<16&&engine&&game::IsVehicleValid(engine);engine=NextCarriage(engine),++carriage)
-            if(engine==vehicle){out={id,owner,carriage,generation};return out.Valid();}return false;
+        for(uint8_t carriage=0;carriage<16&&engine&&game::IsVehicleValid(engine);engine=NextCarriage(engine),++carriage){
+            if(engine==vehicle){out={id,owner,carriage,generation};return out.Valid();}
+        }
+        return false;
     };
     for(auto&[key,c]:g_copies)if(IsEngine(c.engine)&&GetVehicleRef(c.engine)==c.handle&&find(c.engine,(uint8_t)(key>>16),(uint16_t)key,c.generation))return true;
     for(auto&[engine,kind]:g_kinds){

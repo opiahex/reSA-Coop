@@ -70,7 +70,15 @@ std::map<uint32_t,uint64_t> g_nativeCargo;
 uint64_t g_pushSent=0;uint32_t g_pushSequence=0;
 
 bool Alive(const NetObject& no) { return no.obj && IsObjectValid(no.obj) && GetObjectRef(no.obj) == no.handle; }
-bool Broken(CObject* o) { return !o->IsVisible() && !(o->Flags() & 1); }  // smashed: no rendering, no collision
+bool Broken(CObject* o) {
+    if(o->IsVisible()||(o->Flags()&1u))return false;
+    // Story scripts also hide collisionless attachment/camera supports. Only
+    // native destruction state distinguishes those from a smashed object.
+    // Smash-completely models have no bIsBroken bit: ObjectDamage deletes
+    // their RW object and sets health to zero instead.
+    auto damageFlags=Field<uint32_t>(o,0x140);
+    return (damageFlags&0x460u)!=0||(!o->RwObject()&&Field<float>(o,0x154)<=0);
+}
 uint8_t ObjectFlags(CObject*o){return (o->IsVisible()?1:0)|((o->Flags()&1u)?2:0);}
 void ApplyFlags(CObject*o,uint8_t f){o->Flags()=(o->Flags()&~129u)|((f&1)?128u:0)|((f&2)?1u:0);}
 Quat RotationOf(CObject* o) { return o->Matrix() ? Quat::FromMatrix(*o->Matrix()) : Quat{}; }
@@ -442,7 +450,9 @@ void HostScan() {
 
 // partner: break the copy as the host's object broke (the same damage path shows the same shards)
 void BreakCopy(NetObject& no, uint8_t weapon) {
-    if (!Alive(no) || Broken(no.obj)) return;
+    if (!Alive(no)) return;
+    no.broken = true;
+    if (Broken(no.obj)) return;
     CVector p = no.obj->GetPosition(), d{0, 0, 1};
     g_applying = true;
     CallMethod<0x5A0D90>(no.obj, 10000.0f, &p, &d, (CEntity*)nullptr, (int)weapon);  // CObject::ObjectDamage
@@ -759,14 +769,28 @@ bool ProcessSharedCargoContact(CargoContactFn original,CPhysical*a,void*edx,CPhy
     if(!object||!car)return false;
     auto&map=Net().IsHost()?g_owned:g_mirrors;auto*n=FindByObject(map,object);auto*v=Vehicles::Instance().Find(car);
     if(!n||!v)return false;
-    if(n->motion.simulator==Net().MyId()&&n->motion.supportVehicle==v->netId){n->cargoTouch=NowMs();return false;}
-    if(!PhysicalCargo(*n)||n->motion.simulator!=255)return false;
+    auto*player=FindPlayerPed(0);
+    bool localDriver=v->owner==Net().MyId()&&player&&car->Driver()==player&&player->VehicleIfIn()==car;
+    auto nativeContact=[&](){
+        handled=true;
+        bool result=original(a,edx,b,point,x,y);
+        // ApplyCollision's return describes its impulse response, not the
+        // recorded touch. StoryActions verifies the candidate with native
+        // IS_VEHICLE_TOUCHING_OBJECT after this frame's physics completes.
+        if(localDriver)RecordStoryVehicleObjectContact(car,object);
+        return result;
+    };
+    // Static mission targets still participate in native vehicle touching
+    // predicates. They need a contact receipt even when no cargo impulse or
+    // simulation lease is involved.
+    if(n->motion.simulator==Net().MyId()&&n->motion.supportVehicle==v->netId){n->cargoTouch=NowMs();return localDriver?nativeContact():false;}
+    if(!PhysicalCargo(*n)||n->motion.simulator!=255)return localDriver?nativeContact():false;
     if(!Net().IsHost()&&v->owner==Net().MyId()&&NowMs()-n->cargoAsk>500){
         Writer w(proto::G_OBJ_CARRY);w.U64(StoryRunId());w.U32(CooperativeStoryPhase());w.U8(CARGO_CLAIM);w.Entity(ENTITY_OBJECT,n->netId);w.U32(n->motion.revision);w.Entity(ENTITY_VEHICLE,v->netId);Net().Send(proto::CH_RELIABLE,w);n->cargoAsk=NowMs();
     }
     if(Net().IsHost()){
-        if(v->owner==Net().MyId())return false;
-        auto before=object->MoveSpeed();handled=true;bool result=original(a,edx,b,point,x,y);
+        if(v->owner==Net().MyId())return localDriver?nativeContact():false;
+        auto before=object->MoveSpeed();bool result=nativeContact();
         if((object->MoveSpeed()-before).Length()>.00001f)g_nativeCargo[((uint32_t)v->netId<<16)|n->netId]=NowMs();return result;
     }
     if(v->owner!=Net().MyId())return false;
@@ -774,7 +798,7 @@ bool ProcessSharedCargoContact(CargoContactFn original,CPhysical*a,void*edx,CPhy
     // it again after the calculation; the host applies the resulting impulse.
     auto flags=object->Flags();auto physical=object->PhysicalFlags();auto before=object->MoveSpeed(),turn=object->TurnSpeed();
     object->Flags()&=~4u;object->PhysicalFlags()&=~0x2000u;
-    handled=true;bool result=original(a,edx,b,point,x,y);
+    bool result=nativeContact();
     auto move=(object->MoveSpeed()-before)*50.f,spin=(object->TurnSpeed()-turn)*50.f;
     object->Flags()=(object->Flags()&~4u)|(flags&4u);object->PhysicalFlags()=(object->PhysicalFlags()&~0x2000u)|(physical&0x2000u);
     object->MoveSpeed()=before;object->TurnSpeed()=turn;
