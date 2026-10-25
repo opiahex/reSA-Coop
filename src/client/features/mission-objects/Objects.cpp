@@ -50,6 +50,7 @@ struct NetObject {
     bool broken = false;
     uint8_t flags=3;
     bool adopted = false;  // partner: its world had this object already (the host's world brought it)
+    bool trainParentHeld = false;
     uint64_t sentMs = 0;
     ObjectMotion motion;
     uint64_t lease=0,claimSent=0,claimBegan=0,claimDeniedUntil=0,cargoTouch=0,cargoAsk=0;
@@ -110,6 +111,7 @@ NetObject* FindByObject(std::map<uint16_t, NetObject>& m, CObject* o) {
     return nullptr;
 }
 
+void CaptureMotion(NetObject&n);
 void TrackObject(int handle){
     auto*o=GetObject(handle);
     if(!o||FindByObject(g_owned,o))return;
@@ -123,7 +125,7 @@ void TrackObject(int handle){
     no.area = o->AreaCode();
     no.broken = Broken(o);
     no.flags=ObjectFlags(o);
-    no.motion.dynamic=!(o->Flags()&4u);
+    CaptureMotion(no);
     no.sentMs = NowMs();
     Net().BeginEntity(ENTITY_OBJECT,no.netId);g_owned[no.netId] = no;
     SendCreate(no);
@@ -139,9 +141,13 @@ void* Holding(CPed*p,CObject*o){
 Quat Product(const Quat&a,const Quat&b){return {a.w*b.x+a.x*b.w+a.y*b.z-a.z*b.y,a.w*b.y-a.x*b.z+a.y*b.w+a.z*b.x,a.w*b.z+a.x*b.y-a.y*b.x+a.z*b.w,a.w*b.w-a.x*b.x-a.y*b.y-a.z*b.z};}
 void CaptureMotion(NetObject&n){
     auto*o=n.obj;n.motion.velocity=o->MoveSpeed();n.motion.turn=o->TurnSpeed();
-    n.motion.dynamic=!(o->Flags()&4u);n.motion.parentKind=0;n.motion.parentId=0;
+    n.motion.dynamic=!(o->Flags()&4u);n.motion.parentKind=0;n.motion.parentId=0;n.motion.train={};
     auto*parent=o->AttachedTo();
-    if(parent&&parent->IsVehicle()){if(auto*v=Vehicles::Instance().EnsureNetworked((CVehicle*)parent)){n.motion.parentKind=1;n.motion.parentId=v->netId;}}
+    if(parent&&parent->IsVehicle()){
+        auto*vehicle=(CVehicle*)parent;
+        if(vehicle->IsTrain()){if(DescribeTrainAttachment(vehicle,n.motion.train)){n.motion.parentKind=5;n.motion.parentId=n.motion.train.id;}}
+        else if(auto*v=Vehicles::Instance().EnsureNetworked(vehicle)){n.motion.parentKind=1;n.motion.parentId=v->netId;}
+    }
     else if(parent&&parent->IsPed()){
         if(parent==FindPlayerPed(0)){n.motion.parentKind=3;n.motion.parentId=Net().MyId();}
         else if(auto*p=Players::Instance().FindByPed((CPed*)parent)){n.motion.parentKind=3;n.motion.parentId=p->id;}
@@ -157,7 +163,8 @@ void CaptureMotion(NetObject&n){
     }
 }
 CPhysical* Parent(const ObjectMotion&m,uint16_t object){
-    if(m.parentKind&&m.parentKind!=3){uint8_t kind=m.parentKind==1?ENTITY_VEHICLE:m.parentKind==2?ENTITY_PED:ENTITY_OBJECT;if(!Net().EntityLink(ENTITY_OBJECT,object,kind,m.parentId))return nullptr;}
+    if(m.parentKind&&m.parentKind!=3){uint8_t kind=m.parentKind==1?ENTITY_VEHICLE:m.parentKind==2?ENTITY_PED:m.parentKind==5?ENTITY_TRAIN:ENTITY_OBJECT;if(!Net().EntityLink(ENTITY_OBJECT,object,kind,m.parentId))return nullptr;}
+    if(m.parentKind==5)return ResolveTrainAttachment(m.train);
     if(m.parentKind==1){auto*v=Vehicles::Instance().Find(m.parentId);return v&&Vehicles::Alive(*v)?v->veh:nullptr;}
     if(m.parentKind==2)return GetPed(Peds::Instance().HandleOf(m.parentId));
     if(m.parentKind==3){if(m.parentId==Net().MyId())return FindPlayerPed(0);auto*p=Players::Instance().Get((uint8_t)m.parentId);return p?p->ped:nullptr;}
@@ -184,12 +191,21 @@ void ApplyMotion(NetObject&n,bool simulator=false){
     if(!Alive(n))return;auto*o=n.obj;
     if((n.motion.holder==Net().MyId()&&Holding(FindPlayerPed(0),o))||(!simulator&&n.motion.simulator==Net().MyId()))return;
     if(n.motion.parentKind){
-        uint8_t kind=n.motion.parentKind==1?ENTITY_VEHICLE:n.motion.parentKind==2?ENTITY_PED:ENTITY_OBJECT;
-        if(n.motion.parentKind!=3&&!Net().EntityLink(ENTITY_OBJECT,n.netId,kind,n.motion.parentId)){if(o->AttachedTo())Cmd(0x0682).I(n.handle).F(0).F(0).F(0).I(0).Run();return;}
-        auto*parent=Parent(n.motion,n.netId);if(!parent)return; // retain the relation while its dependency streams
+        auto*parent=Parent(n.motion,n.netId);
+        if(!parent){
+            if(o->AttachedTo())Cmd(0x0682).I(n.handle).F(0).F(0).F(0).I(0).Run();
+            // Keep the relationship while the native consist streams. Solid
+            // cargo must not remain floating at an outdated world position.
+            if(n.motion.parentKind==5){ApplyFlags(o,0);n.trainParentHeld=true;}
+            return;
+        }
+        if(n.trainParentHeld){if(!n.broken)ApplyFlags(o,n.flags);n.trainParentHeld=false;}
         if(o->AttachedTo()!=parent){if(o->AttachedTo())Cmd(0x0682).I(n.handle).F(0).F(0).F(0).I(0).Run();CallMethod<0x54D690>(o,parent,&n.motion.offset,&n.motion.rotation);}
         Field<CVector>(o,0x100)=n.motion.offset;Field<CVector>(o,0x10C)=n.motion.euler;Field<Quat>(o,0x118)=n.motion.rotation;AttachedPosition(o,nullptr);
-    }else if(o->AttachedTo())Cmd(0x0682).I(n.handle).F(0).F(0).F(0).I(0).Run();
+    }else{
+        if(o->AttachedTo())Cmd(0x0682).I(n.handle).F(0).F(0).F(0).I(0).Run();
+        if(n.trainParentHeld){if(!n.broken)ApplyFlags(o,n.flags);n.trainParentHeld=false;}
+    }
     if(simulator){Cmd(0x0550).I(n.handle).I(n.motion.dynamic?0:1).Run();o->MoveSpeed()=n.motion.velocity;o->TurnSpeed()=n.motion.turn;}
 }
 enum:uint8_t{CLAIM=1,GRANT=2,CARRY_POSE=3,RELEASE=4,DENY=5,PUSH=6,CARGO_CLAIM=7,CARGO_POSE=8,CARGO_RELEASE=9};
@@ -406,7 +422,8 @@ void HostScan() {
                          std::fabs(rot.w - no.rot.w);
             auto previous=no.motion;
             if(no.motion.simulator==255&&(no.motion.holder==255||no.motion.holder==Net().MyId()))CaptureMotion(no);
-            bool discrete=no.area!=no.obj->AreaCode()||no.flags!=ObjectFlags(no.obj)||previous.parentKind!=no.motion.parentKind||previous.parentId!=no.motion.parentId||previous.revision!=no.motion.revision;
+            bool discrete=no.area!=no.obj->AreaCode()||no.flags!=ObjectFlags(no.obj)||previous.parentKind!=no.motion.parentKind||previous.parentId!=no.motion.parentId||previous.revision!=no.motion.revision||
+                previous.train.owner!=no.motion.train.owner||previous.train.carriage!=no.motion.train.carriage||previous.train.generation!=no.motion.train.generation;
             if ((discrete||(pos - no.pos).Length() > 0.02f || turn > 0.01f||NowMs()-no.sentMs>1000) && NowMs() - no.sentMs >= 100) {
                 no.pos = pos;
                 no.rot = rot;
@@ -491,7 +508,7 @@ void CreatePending() {
         bool broken = no.broken;
         no.broken = false;
         NetObject& copy = g_mirrors[no.netId] = no;
-        if (broken) BreakCopy(copy, 0);
+        if (broken) BreakCopy(copy, 0);else ApplyMotion(copy);
         LOGI("Mission object %04X (model %d) %s", no.netId, no.model, no.adopted ? "found here" : "copied");
     }
 }
@@ -588,9 +605,9 @@ public:
                 if(Alive(copy)&&copy.model==no.model){
                     if((int32_t)(no.motion.revision-copy.motion.revision)<0)return;
                     copy.pos=no.pos;copy.rot=no.rot;copy.area=no.area;copy.flags=no.flags;copy.motion=no.motion;
-                    copy.obj->AreaCode()=no.area;if(copy.motion.holder!=Net().MyId()&&copy.motion.simulator!=Net().MyId())Place(copy.obj,no.pos,no.rot);ApplyMotion(copy);
+                    copy.obj->AreaCode()=no.area;if(copy.motion.holder!=Net().MyId()&&copy.motion.simulator!=Net().MyId())Place(copy.obj,no.pos,no.rot);
                     if(no.broken)BreakCopy(copy,0);else ApplyFlags(copy.obj,no.flags);
-                    copy.broken=no.broken;return;
+                    copy.broken=no.broken;ApplyMotion(copy);return;
                 }
                 DeleteCopy(it->second);
                 g_mirrors.erase(it);

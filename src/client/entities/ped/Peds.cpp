@@ -191,7 +191,7 @@ void CaptureInteraction(NetPed&np,PedSyncState&s){
         }
     }
     if(auto*parent=ped->AttachedTo();parent&&parent!=ped){
-        if(parent->IsVehicle()){if(auto*n=Vehicles::Instance().EnsureNetworked((CVehicle*)parent)){out.parentKind=1;out.parentId=n->netId;}}
+        if(parent->IsVehicle()){if(((CVehicle*)parent)->IsTrain()){if(DescribeTrainAttachment((CVehicle*)parent,out.train)){out.parentKind=5;out.parentId=out.train.id;}}else if(auto*n=Vehicles::Instance().EnsureNetworked((CVehicle*)parent)){out.parentKind=1;out.parentId=n->netId;}}
         else if(parent->IsPed()){
             if(parent==FindPlayerPed(0)){out.parentKind=3;out.parentId=Net().MyId();}
             else if(auto*n=Players::Instance().FindByPed((CPed*)parent)){out.parentKind=3;out.parentId=n->id;}
@@ -218,7 +218,7 @@ void CaptureInteraction(NetPed&np,PedSyncState&s){
     for(int i=0;i<PedInteraction::LayerCount;++i)if(candidates[i]){out.layers[i]=anim::Capture(candidates[i]);out.weights[i]=std::clamp(weights[i],0.f,1.f);}
     out.leader=CooperativeAllyLeader(ped,np.state.interaction.leader);
     uint32_t signature=2166136261u;auto mix=[&](uint32_t value){signature=(signature^value)*16777619u;};
-    mix(out.leader);for(unsigned i=0;i<out.depth;++i)mix(out.chain[i]);mix((uint8_t)out.sequenceStep);mix(out.sequenceRepeat);mix(out.partnerKind);mix(out.partnerId);mix(s.animBlock);mix(s.animIdx);
+    mix(out.leader);for(unsigned i=0;i<out.depth;++i)mix(out.chain[i]);mix((uint8_t)out.sequenceStep);mix(out.sequenceRepeat);mix(out.partnerKind);mix(out.partnerId);mix(out.parentKind);mix(out.parentId);if(out.parentKind==5){mix(out.train.owner);mix(out.train.carriage);mix((uint32_t)out.train.generation);mix((uint32_t)(out.train.generation>>32));}mix(s.animBlock);mix(s.animIdx);
     for(auto&layer:out.layers){mix(layer.block);mix(layer.index);}
     bool restart=np.actionBlock==s.animBlock&&np.actionIndex==s.animIdx&&s.animTime+.15f<np.actionTime;
     np.actionRevision=std::max(np.actionRevision,np.state.interaction.revision);
@@ -255,8 +255,9 @@ bool ApplyInteraction(NetPed&np,float age){
     else if(state.parentKind==2)parent=GetPed(Peds::Instance().HandleOf(state.parentId));
     else if(state.parentKind==3){if(state.parentId==Net().MyId())parent=FindPlayerPed(0);else if(auto*p=Players::Instance().Get((uint8_t)state.parentId))parent=p->ped;}
     else if(state.parentKind==4)parent=SharedMissionObjectById(state.parentId);
-    if(state.parentKind&&state.parentKind!=3){uint8_t kind=state.parentKind==1?ENTITY_VEHICLE:state.parentKind==2?ENTITY_PED:ENTITY_OBJECT;
-        if(!Net().EntityLink(ENTITY_PED,np.netId,kind,state.parentId)){parent=nullptr;if(np.interactionAttached&&ped->AttachedTo()){CallMethod<0x5E7EC0>(ped);np.interactionAttached=false;}}
+    else if(state.parentKind==5)parent=ResolveTrainAttachment(state.train);
+    if(state.parentKind&&state.parentKind!=3){uint8_t kind=state.parentKind==1?ENTITY_VEHICLE:state.parentKind==2?ENTITY_PED:state.parentKind==5?ENTITY_TRAIN:ENTITY_OBJECT;
+        if(!Net().EntityLink(ENTITY_PED,np.netId,kind,state.parentId,state.parentKind==5?state.train.owner:255)){parent=nullptr;if(np.interactionAttached&&ped->AttachedTo()){CallMethod<0x5E7EC0>(ped);np.interactionAttached=false;}}
     }
     if(parent&&parent!=ped){
         if(ped->AttachedTo()!=parent){

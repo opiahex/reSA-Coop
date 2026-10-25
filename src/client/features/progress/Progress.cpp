@@ -1,3 +1,4 @@
+#include "shared/api/story-loadout/StoryLoadout.h"
 #include "shared/lib/sync/ModelRequests.h"
 // Separate progression and looks.
 //  * the host progresses in its own save; the partner keeps a profile on the server (money, every stat:
@@ -41,7 +42,7 @@ using namespace game;
 using game::script::Cmd;
 
 constexpr uint32_t kProfileMagic = 0x46504353;  // "SCPF"
-constexpr uint16_t kProfileVersion = 5;  // 5: personal driving-school records; older profiles remain readable
+constexpr uint16_t kProfileVersion = 6;  // 6: personal service-job completion; older profiles remain readable
 constexpr uintptr_t kStatsBlock = 0xB79000;  // CStats::StatTypesInt + StatTypesFloat
 constexpr size_t kStatsSize = 0x4C8;
 // stats the world owns, not the player (CStats::StatTypesInt, id - 120): the profile keeps the values of the world it was
@@ -62,6 +63,55 @@ bool ReadDrivingRecords(Reader&r,bool stored){
     if(stored){if(r.U32()!=0x4C4F4F48)return false;for(auto&value:values)value=r.I32();
         for(size_t i=0;i<values.size();++i)if(values[i]<0||values[i]>(i?100:1))return false;}
     if(!r.Ok())return false;g_driving=values;g_drivingReady=true;return true;
+}
+
+constexpr std::array<uint16_t,3> kJobGlobals={5948,5952,5956}; // paramedic, vigilante, firefighter
+using JobRecords=std::array<uint8_t,kJobGlobals.size()>;
+JobRecords ReadJobGlobals(){
+    JobRecords values{};
+    for(size_t i=0;i<values.size();++i){int value=Ref<int32_t>(addr::ScriptSpace+kJobGlobals[i]);values[i]=value==1||value==2;}
+    return values;
+}
+void PutJobGlobals(const JobRecords&values){
+    // 1 is the pending completion notification in the two service scripts;
+    // restore their settled value, rather than replaying that notification.
+    for(size_t i=0;i<values.size();++i)Ref<int32_t>(addr::ScriptSpace+kJobGlobals[i])=values[i]?(i==1?1:2):0;
+}
+constexpr std::array<int,6> kJobStats={151,152,153,157,158,159};
+struct JobBaseline {
+    JobRecords completed{};std::array<int32_t,kJobStats.size()> stats{};
+    float maxHealthStat=569.f;uint8_t maxHealth=100,maxArmour=100,fireproof=0;
+};
+JobBaseline ownJobs;
+void CaptureOwnJobs(){
+    ownJobs.completed=ReadJobGlobals();
+    for(size_t i=0;i<kJobStats.size();++i)ownJobs.stats[i]=Ref<int32_t>(kStatsBlock+(kJobStats[i]-120)*4);
+    ownJobs.maxHealthStat=Ref<float>(kStatsBlock+0x380+24*4);
+    ownJobs.maxHealth=PlayerInfos()[0].maxHealth;ownJobs.maxArmour=PlayerInfos()[0].maxArmour;
+    ownJobs.fireproof=Field<uint8_t>(&PlayerInfos()[0],0x14E);
+}
+void InitialJobBaseline(bool reset=false){
+    // CStats::Init and CPlayerInfo::Clear supply these fresh-game defaults.
+    // If the player joined from their own game, retain its earned benefits.
+    const auto&initial=reset?JobBaseline{}:ownJobs;
+    PutJobGlobals(initial.completed);
+    for(size_t i=0;i<kJobStats.size();++i)Ref<int32_t>(kStatsBlock+(kJobStats[i]-120)*4)=initial.stats[i];
+    Ref<float>(kStatsBlock+0x380+24*4)=initial.maxHealthStat;
+    PlayerInfos()[0].maxHealth=initial.maxHealth;PlayerInfos()[0].maxArmour=initial.maxArmour;
+    Field<uint8_t>(&PlayerInfos()[0],0x14E)=initial.fireproof;
+}
+void WriteJobRecords(Writer&w){w.U32(0x53424F4A);for(auto value:ReadJobGlobals())w.U8(value);}
+bool ReadJobRecords(Reader&r,JobRecords&values){
+    if(r.U32()!=0x53424F4A)return false;
+    for(auto&value:values){value=r.U8();if(value>1)return false;}
+    return r.Ok();
+}
+JobRecords LegacyJobRecords(const std::vector<uint8_t>&stats,uint8_t maxArmour,bool fireproof){
+    auto integer=[&](int id){int32_t value=0;memcpy(&value,stats.data()+(id-120)*4,sizeof value);return value;};
+    float maxHealth=0;memcpy(&maxHealth,stats.data()+0x380+24*4,sizeof maxHealth);
+    // Use only the saved player's own completed level and native benefit.
+    // The newly loaded host's SCM flags cannot establish personal completion.
+    return {uint8_t(integer(158)>=12&&maxHealth>=1000.f),uint8_t(integer(157)>=12&&maxArmour>=150),uint8_t(integer(159)>=12&&fireproof)};
 }
 
 void RebuildPlayer(CPlayerPed* ped, bool keepDescFatMuscle) { Call<0x5A82C0>(ped, keepDescFatMuscle); }  // CClothes::RebuildPlayer
@@ -143,8 +193,9 @@ std::vector<uint8_t> CaptureProfile() {
     w.U8(NUM_WEAPON_SLOTS);
     for (int i = 0; i < NUM_WEAPON_SLOTS; ++i) {
         const CWeapon& wpn = me->Weapons()[i];
-        w.U8((uint8_t)wpn.type);
-        w.I32(wpn.ammoTotal);
+        int type=wpn.type,ammo=wpn.ammoTotal;PersonalStoryWeapon(i,type,ammo);
+        w.U8((uint8_t)type);
+        w.I32(ammo);
     }
     w.U8(me->FightingStyle());
     w.U8(info.maxHealth);
@@ -158,6 +209,7 @@ std::vector<uint8_t> CaptureProfile() {
     w.U8(LookIsOwn());
     WriteStoryRewardHistory(w);
     WriteDrivingRecords(w);
+    WriteJobRecords(w);
     return w.Buffer();
 }
 
@@ -182,8 +234,11 @@ bool ApplyProfile(const std::vector<uint8_t>& blob, bool& lookOwn) {
     uint8_t own = version >= 3 ? r.U8() : 0;
     if(version>=4&&!ReadStoryRewardHistory(r))return false;
     if(!ReadDrivingRecords(r,version>=5))return false;
+    JobRecords jobs{};
+    if(version>=6&&!ReadJobRecords(r,jobs))return false;
     if(version<5)LOGI("Legacy profile has no personal driving-school records; initialized separately from host (skills retained)");
     if (!r.Ok() || stats.size() != kStatsSize || clothes.size() != kClothesSize) return false;
+    if(version<6){jobs=LegacyJobRecords(stats,maxArmour,version>=2&&perks[2]!=0);LOGI("Legacy personal service-job completion restored from saved benefits");}
     lookOwn = own != 0;
 
     CPlayerPed* me = FindPlayerPed(0);
@@ -215,6 +270,7 @@ bool ApplyProfile(const std::vector<uint8_t>& blob, bool& lookOwn) {
         uint8_t* own = (uint8_t*)&info + 0x14C;
         own[0] = perks[0], own[1] = perks[1], own[2] = perks[2], own[5] = perks[3], own[6] = perks[4];
     }
+    PutJobGlobals(jobs);
     return true;
 }
 
@@ -315,6 +371,7 @@ public:
         m_profile.clear();
         g_looks.clear();
         ResetDrivingRecords();
+        m_jobRecords={};
     }
     void OnPeerJoin(uint8_t) override { ResendAppearance(); }
     void OnPeerResync(uint8_t) override { ResendAppearance(); }
@@ -335,6 +392,7 @@ public:
         if (core::IsPlayerReady() && !g_foreignGame) {  // a game of its own: the look it brings along
             const auto* d = (const uint8_t*)FindPlayerPed(0)->ClothesDesc();
             g_ownLook.assign(d, d + kClothesSize);
+            CaptureOwnJobs();
         }
         if (!Net().Online() || !core::IsPlayerReady()) return;
         CPlayerPed* me = FindPlayerPed(0);
@@ -347,6 +405,7 @@ public:
             m_applied = true;
             bool own = false;
             if (m_profile.empty()) {
+                InitialJobBaseline(m_reset);
                 g_driving={};g_drivingReady=true;
                 ui::TheChat().AddSystem(m_reset ? TR("Хост начал новую игру. Деньги, оружие и навыки у вас тоже начинаются заново.",
                                                      "The host started a new game. Your money, weapons and skills start over too.")
@@ -360,6 +419,7 @@ public:
                 ui::TheChat().AddSystem(TR("Загружены ваши деньги, навыки и внешность.", "Your money, skills and look are loaded."));
             } else {
                 LOGW("Profile rejected (bad format), starting from the world's state");
+                InitialJobBaseline();
                 g_driving={};g_drivingReady=true;
             }
             g_lookOwn = own || WearOwnLook(m_profile.empty());
@@ -367,6 +427,11 @@ public:
             StoryProfileReady(true);
             m_saved = m_profile;
             m_lastSaveMs = now;
+            m_jobRecords=ReadJobGlobals();
+        }
+        if(!Net().IsHost()&&hostWorld&&m_applied){
+            auto jobs=ReadJobGlobals();
+            if(jobs!=m_jobRecords){m_jobRecords=jobs;SaveNow(true);LOGI("Personal service-job completion saved: ambulance=%u vigilante=%u firefighter=%u",jobs[0],jobs[1],jobs[2]);}
         }
 
         if (m_quietUntil && Ref<uint8_t>(0xB5F851)) m_quietUntil = std::max(m_quietUntil, now + 3000);  // a cutscene: later
@@ -457,6 +522,7 @@ public:
 
 private:
     std::vector<uint8_t> m_profile, m_saved, m_sentLook, m_sentStats;
+    JobRecords m_jobRecords{};
     uint32_t m_pendingCrc=0;
     bool m_profileReceived = false, m_applied = false;
     bool m_resetPending = false, m_reset = false;  // a new game emptied the profile: applied in the next world

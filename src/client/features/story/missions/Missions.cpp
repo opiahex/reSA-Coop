@@ -23,6 +23,8 @@
 
 #include "features/story/missions/Missions.h"
 #include "shared/api/story-actions/StoryActions.h"
+#include "shared/api/story-scripts/StoryScripts.h"
+#include "shared/api/story-loadout/StoryLoadout.h"
 #include "shared/api/story-coop/StoryCoop.h"
 #include "shared/api/story-stage/StoryStage.h"
 #include "shared/lib/sync/StoryPosition.h"
@@ -96,6 +98,11 @@ bool SharedSceneOwnsScreen();
 bool PersonalActivity(void* script) {
     if (!script) return false;
     const char* name = Field<char[8]>(script, 0x08);
+    // A newly allocated thread has not executed SCRIPT_NAME yet.
+    if (!_strnicmp(name, "noname", 7)) {
+        const auto* ip = Field<const uint8_t*>(script, 0x14);
+        if (ip && Field<uint16_t>(ip, 0) == 0x03A4 && ip[2] == 9) name = (const char*)ip + 3;
+    }
     static const char* const own[] = {"none", "dual", "shtr", "grav", "otb", "pool2", "lowr", "zero5", "truck", "boat", "blood", "tria", "bcour", "stunt", "oddveh", "taxiodd", "ambulan", "firetru", "copcar", "pimp", "freight", "trainsl",
         "trace", "hotr", "kicks", "kicksta", "bloodr", "dskool", "bskool", "bschoo", "psch", "bikes",
         "gym", "gymls", "gymsf", "gymlv", "shoot", "shrange", "trucks", "quarry", "quarrys", "burgjb", "valet_l", "mtbiker", "cprace", "bbchal", "barb", "tatto", "blackj", "roulete", "bandit", "vidpok", "wheelo"};
@@ -103,6 +110,73 @@ bool PersonalActivity(void* script) {
     for(auto prefix:prefixes)if(!_strnicmp(name,prefix,strlen(prefix)))return true;
     for (const char* activity : own) if (!_strnicmp(name, activity, 8)) return true;
     return false;
+}
+
+// Main SCM helpers do not have m_bIsMission set. Ownership comes from the
+// native thread that spawned them, and lasts only for that cooperative run.
+struct StoryThread {
+    uint64_t run = 0, birth = 0, parentBirth = 0;
+    void* parent = nullptr;
+    const uint8_t* base = nullptr;
+    bool bound = false;
+};
+std::map<void*, StoryThread> g_storyThreads;
+uint64_t g_storyThreadBirth = 0;
+
+void ForgetStoryThread(void* script) {
+    if (!g_storyThreads.erase(script)) return;
+    CancelCooperativeStage(script);
+    ClearCooperativeStoryScript(script);
+}
+void ClearStoryThreads() {
+    while (!g_storyThreads.empty()) ForgetStoryThread(g_storyThreads.begin()->first);
+}
+void PruneStoryThreads() {
+    const auto run = StoryRunId();
+    for (auto i = g_storyThreads.begin(); i != g_storyThreads.end();) {
+        auto* script = i->first;
+        const auto& entry = i->second;
+        bool stale = !run || entry.run != run || PersonalActivity(script) ||
+                     !Field<uint8_t>(script, 0xC4) ||
+                     (entry.bound && entry.base != Field<const uint8_t*>(script, 0x10));
+        ++i;
+        if (stale) ForgetStoryThread(script);
+    }
+}
+bool SharedStoryScript(void* script) {
+    if (!script || !Net().Online() || !Net().IsHost() || PersonalActivity(script)) return false;
+    auto i = g_storyThreads.find(script);
+    if (i == g_storyThreads.end() || !StoryRunId() || i->second.run != StoryRunId()) return false;
+    if (!Field<uint8_t>(script, 0xC4) && script != g_currentScript) return false;
+    const auto* base = Field<const uint8_t*>(script, 0x10);
+    if (i->second.bound && i->second.base != base) return false;
+    return true;
+}
+void BindStoryThread(void* script) {
+    auto i = g_storyThreads.find(script);
+    if (i != g_storyThreads.end() && !i->second.bound) {
+        i->second.base = Field<const uint8_t*>(script, 0x10);
+        i->second.bound = true;
+    }
+}
+void TrackStoryRoot(void* script) {
+    if (!StoryRunId()) return;
+    auto i = g_storyThreads.find(script);
+    if (i == g_storyThreads.end() || i->second.run != StoryRunId()) {
+        g_storyThreads[script] = {StoryRunId(), ++g_storyThreadBirth, 0, nullptr,
+                                 Field<const uint8_t*>(script, 0x10), true};
+    }
+}
+using ScriptLifeFn = void(__fastcall*)(void*, void*);
+ScriptLifeFn g_origScriptInit = nullptr, g_origScriptShutdown = nullptr;
+void __fastcall HookScriptInit(void* script, void* edx) {
+    // Init also runs for restored/indexed threads and for a reused pool slot.
+    ForgetStoryThread(script);
+    g_origScriptInit(script, edx);
+}
+void __fastcall HookScriptShutdown(void* script, void* edx) {
+    g_origScriptShutdown(script, edx);
+    ForgetStoryThread(script);
 }
 
 // Gym scripts use the same held action key to enter equipment and to cancel
@@ -289,11 +363,13 @@ void RestoreSceneHud() {
     g_savedHud = false;
 }
 
-bool Replicating() { return Net().Online() && Net().IsHost() && !Net().Peers().empty() && !PersonalActivity(g_currentScript) && (g_active || g_sharedScene || CutsceneRunning() || HostOnMission()); }
+bool Replicating() { return Net().Online() && Net().IsHost() && !Net().Peers().empty() && (!g_currentScript || SharedStoryScript(g_currentScript)) && (g_active || g_sharedScene || CutsceneRunning() || HostOnMission()); }
 
 // ---------------------------------------------------------------- partner: no mission triggers
 void ScriptFaded(int16_t dir, float seconds);
-enum : uint8_t { WEAPON_GIVE = 1, WEAPON_TAKE = 2 };
+enum : uint8_t { WEAPON_GIVE = 1, WEAPON_TAKE = 2, WEAPON_FINAL = 3 };
+std::set<int> g_hostMissionWeapons;
+uint64_t g_hostWeaponRun = 0;
 
 // What the host's mission does to its CJ's weapons (GIVE_WEAPON_TO_CHAR $PLAYER_ACTOR, REMOVE_WEAPON_FROM_CHAR) the
 // partner gets as well: the spray can of "Tagging Up Turf", the guns some missions hand out. Seen as the change of CJ's
@@ -304,14 +380,20 @@ struct WeaponSlots {
         for (int i = 0; i < NUM_WEAPON_SLOTS; ++i) type[i] = p->Weapons()[i].type, ammo[i] = p->Weapons()[i].ammoTotal;
     }
 };
-void SendMissionWeapon(uint8_t op, int weapon, int ammo, bool inHand) {
+void SendMissionWeapon(uint8_t op, int weapon, int ammo, bool inHand, uint8_t to = proto::kServerId) {
+    const auto run = StoryRunId();
+    if (!run) return;
+    if (g_hostWeaponRun != run) { g_hostMissionWeapons.clear(); g_hostWeaponRun = run; }
+    if (op == WEAPON_GIVE || op == WEAPON_TAKE) g_hostMissionWeapons.insert(weapon);
     Writer w(proto::G_MISSION_WEAPON);
+    w.U64(run);
+    w.U8(to);
     w.U8(op);
     w.U8((uint8_t)weapon);
     w.I32(ammo);
     w.U8(inHand);
     Net().Send(proto::CH_RELIABLE, w);
-    LOGI("Mission weapon %d %s (%d)", weapon, op == WEAPON_GIVE ? "given" : "taken", ammo);
+    LOGI("Mission weapon %d %s (%d)", weapon, op == WEAPON_GIVE ? "given" : op == WEAPON_TAKE ? "taken" : "settled", ammo);
 }
 // The count goes as it is now, not what was added: missions lower it too (Emmet's pistol 30000 for the practice and 10
 // after it, the spray can given again with 1000 at the end), and the partner kept the big one (no number on the HUD).
@@ -337,7 +419,12 @@ void __fastcall HookScriptProcess(void* script, void* edx) {
     void* prev = g_currentScript;
     g_currentScript = script;
     bool personal=PersonalActivity(script);
-    if(Net().IsHost()&&Net().Online()&&!personal&&Field<uint8_t>(script,0xDC)&&!StoryRunId())BeginCooperativeStory(std::string(Field<char[8]>(script,8),strnlen(Field<char[8]>(script,8),8)));
+    if (Net().IsHost() && Net().Online() && !personal && Field<uint8_t>(script, 0xDC)) {
+        if (!StoryRunId()) BeginCooperativeStory(std::string(Field<char[8]>(script, 8), strnlen(Field<char[8]>(script, 8), 8)));
+        TrackStoryRoot(script);
+    }
+    BindStoryThread(script);
+    const bool shared = SharedStoryScript(script);
     if(personal&&script==g_localActivityScript&&!Net().IsHost()){
         if(!SharedSceneOwnsScreen()&&(GetPad(0)->DisablePlayerControls||Fading()||Ref<uint8_t>(addr::TheCamera+0x2B)==0))g_localActivityUntil=NowMs()+500;
         else g_localActivityScript=nullptr;
@@ -350,7 +437,7 @@ void __fastcall HookScriptProcess(void* script, void* edx) {
     bool fading = Fading();
     int16_t dir = FadeDirection();
     float seconds = FadeDuration();
-    CPlayerPed* cj = Field<uint8_t>(script, 0xDC) && Net().IsHost() && Replicating() ? FindPlayerPed(0) : nullptr;  // m_bIsMission
+    CPlayerPed* cj = shared && Replicating() ? FindPlayerPed(0) : nullptr;
     CVector positionBefore=cj?StoryPosition(cj):CVector{};
     auto*previousStoryPed=g_processStoryPed;auto previousStoryPosition=g_processStoryPosition;auto previousStoryArea=g_processStoryArea;
     g_processStoryPed=cj;g_processStoryPosition=positionBefore;g_processStoryArea=cj?cj->AreaCode():0;
@@ -397,7 +484,7 @@ void __fastcall HookScriptProcess(void* script, void* edx) {
         g_personalFlag = core::IsOnMission() && PersonalActivity(script);
         g_schoolFlag = core::IsOnMission() && IsSchoolScriptName(Field<char[8]>(script,0x08));
     }
-    if (cj && FindPlayerPed(0) == cj) {
+    if (cj && !PersonalActivity(script) && FindPlayerPed(0) == cj) {
         SendWeaponChanges(weapons,cj);
         // Physics does not run inside Process: a large displacement here came
         // from this shared story script, rather than ordinary player movement.
@@ -405,7 +492,7 @@ void __fastcall HookScriptProcess(void* script, void* edx) {
     }
     g_processStoryPed=previousStoryPed;g_processStoryPosition=previousStoryPosition;g_processStoryArea=previousStoryArea;
     // a fade that started during this script's commands is the script's (DO_FADE)
-    bool sharedScript = Field<uint8_t>(script, 0xDC) && !PersonalActivity(script);
+    bool sharedScript = shared && !PersonalActivity(script);
     if (sharedScript && Net().IsHost()) {
         bool controlled=Ref<uint8_t>(addr::TheCamera+0x2B)==0;
         if(controlled&&!CutsceneRunning()&&(!controlledBefore||(cam::Source()-cameraBefore).Length()>.01f||(cam::Front()-frontBefore).Length()>.001f))g_sceneScriptCamera=true;
@@ -426,7 +513,7 @@ using ClearAreaFn = void(__cdecl*)(CVector*, float, uint8_t);
 ClearAreaFn g_origClearArea = nullptr;
 void __cdecl HookScriptClearArea(CVector* at, float radius, uint8_t flag) {  // CWorld::ClearExcitingStuffFromArea
     g_origClearArea(at, radius, flag);
-    if (!g_currentScript || !Field<uint8_t>(g_currentScript, 0xDC) || !Net().IsHost() || !Replicating()) return;
+    if (!SharedStoryScript(g_currentScript) || !Replicating()) return;
     std::vector<uint16_t> ids = Vehicles::Instance().ClearMirrors(*at, radius);
     if (ids.empty()) return;
     if (ids.size() > 255) ids.resize(255);
@@ -437,43 +524,18 @@ void __cdecl HookScriptClearArea(CVector* at, float radius, uint8_t flag) {  // 
     LOGI("CLEAR_AREA at %.0f %.0f, radius %.0f: %zu cars of the other players cleared", at->x, at->y, radius, ids.size());
 }
 
-std::set<int> g_missionWeapons;  // partner: what the host's mission gave (only those it takes back)
-std::map<int, std::pair<int, int>> g_replaced;  // partner: its own weapon a given one pushed out of the slot (type, ammo)
-// The partner takes the host's mission state only while playing the host's world: one still in its own game (waiting
-// for the world, or for the host's prologue) got the host's cutscenes, texts, weapons and rewards in it.
+// The partner takes the host's inventory changes only for the current story run.
 void HandleMissionWeapon(uint8_t from, Reader& r) {
+    uint64_t run = r.U64();
+    uint8_t target = r.U8();
     uint8_t op = r.U8();
     int weapon = r.U8();
     int ammo = r.I32();
     bool inHand = r.U8() != 0;
-    if (!r.Ok() || from != Net().HostId() || Net().IsHost() || !core::IsPlayerReady() || !flow::InHostWorld() || weapon <= 0 || weapon > 46) return;
-    CPlayerPed* me = FindPlayerPed(0);
-    int h = GetPedRef(me);
-    auto give = [&](int type, int count) {
-        int model = -1;
-        Cmd(0x0781).I(type).Out(&model).Run();  // GET_WEAPONTYPE_MODEL
-        if (model > 0) LoadModelNow(model);
-        Cmd(0x01B2).I(h).I(type).I(std::clamp(count, 1, 99999)).Run();  // GIVE_WEAPON_TO_CHAR
-    };
-    if (op == WEAPON_GIVE) {
-        WeaponSlots was;
-        was.Take(me);
-        give(weapon, ammo);
-        Cmd(0x017B).I(h).I(weapon).I(std::clamp(ammo, 1, 99999)).Run();  // SET_CHAR_AMMO: the host's count, not ours + it
-        if (inHand) Cmd(0x01B9).I(h).I(weapon).Run();  // SET_CURRENT_CHAR_WEAPON
-        // a slot holds one weapon: the partner's own one is put back later, one of the same kind too (its ammo was
-        // overwritten with the mission's, and taking the mission's took the partner's own gun)
-        for (int i = 0; i < NUM_WEAPON_SLOTS; ++i)
-            if (was.type[i] > 0 && me->Weapons()[i].type == weapon && !g_replaced.count(weapon))
-                g_replaced[weapon] = {was.type[i], was.ammo[i]};
-        g_missionWeapons.insert(weapon);
-    } else if (g_missionWeapons.erase(weapon)) {
-        Cmd(0x0555).I(h).I(weapon).Run();  // REMOVE_WEAPON_FROM_CHAR
-        if (auto it = g_replaced.find(weapon); it != g_replaced.end()) {
-            give(it->second.first, it->second.second);
-            g_replaced.erase(it);
-        }
-    }
+    if (!r.Ok() || from != Net().HostId() || Net().IsHost() || !core::IsPlayerReady() || !flow::InHostWorld() ||
+        !run || run != StoryRunId() || (target != proto::kServerId && target != Net().MyId()) || op < WEAPON_GIVE || op > WEAPON_FINAL || weapon <= 0 || weapon > 46 ||
+        ammo < (op == WEAPON_FINAL ? -1 : 0)) return;
+    ApplyStoryMissionWeapon(op, weapon, ammo, inHand);
 }
 
 bool InArea(const Area& a, const CVector& p, float slack) {
@@ -534,7 +596,7 @@ LocateCheck ReadLocate(void* script, uint16_t opcode) {
     bool two = opcode >= 0x00EC && opcode <= 0x00F1;
     bool three = opcode >= 0x00FE && opcode <= 0x0103;
     LocateCheck check;
-    if ((!two && !three) || script != g_currentScript || !Net().IsHost() || !Field<uint8_t>(script,0xDC) || Field<uint8_t>(script,0xD2)) return check;
+    if ((!two && !three) || script != g_currentScript || !SharedStoryScript(script) || Field<uint8_t>(script,0xD2)) return check;
     // LocateCharCommand collects the actor and coordinates in separate batches,
     // overwriting ScriptParams. Read its native parameter stream on a script copy.
     alignas(16) uint8_t copy[0xE0]; memcpy(copy,script,sizeof copy);
@@ -655,7 +717,7 @@ ObjectCommand ReadStoryObject(void*script,int opcode){
     bool create=opcode==0x0107||opcode==0x029B;
     bool closest=opcode==0x0363; // coordinate-based object visibility used by story scripts
     if(!create&&!closest&&!ObjectOperand(opcode))return value;
-    if(script!=g_currentScript||!Field<uint8_t>(script,0xDC)||!Replicating())return value;
+    if(script!=g_currentScript||!SharedStoryScript(script)||!Replicating())return value;
     value.create=create;
     alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);
     uint32_t saved[32];memcpy(saved,(void*)0xA43C78,sizeof saved);CallMethod<0x464080>(copy,closest?6:1);
@@ -674,7 +736,7 @@ ObjectCommand ReadStoryObject(void*script,int opcode){
 CommandsFn g_objectCommands[27]{};
 template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int opcode){
     const int chainOp=opcode&0x7FFF;
-    bool story=script==g_currentScript&&Field<uint8_t>(script,0xDC)&&Replicating()&&!PersonalActivity(script);
+    bool story=script==g_currentScript&&SharedStoryScript(script)&&Replicating();
     if(story&&(chainOp==0x05EB||chainOp==0x0705||chainOp==0x085E||chainOp==0x014E||chainOp==0x03C3||chainOp==0x01B4||chainOp==0x0715||(chainOp==0x01BD&&CooperativeStageArmed(script)))){
         uint32_t saved[32];memcpy(saved,(void*)0xA43C78,sizeof saved);alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);int count=chainOp==0x01B4||chainOp==0x0715?2:1;CallMethod<0x464080>(copy,count);int first=Ref<int32_t>(0xA43C78),second=Ref<int32_t>(0xA43C7C);memcpy((void*)0xA43C78,saved,sizeof saved);
         // Scripts such as SYN1 enable control in their per-frame loop. Only
@@ -748,8 +810,8 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
     }
     auto object=ReadStoryObject(script,opcode);
     uint8_t before=Field<uint8_t>(script,0xC5);int16_t logic=Field<int16_t>(script,0xD0);bool coop=story&&chainOp==0x09C8;int32_t*killOutput=nullptr;int killModel=-1;
-    int op=opcode&0x7FFF;int count=(op==0x00A3||op==0x02D6||(op>=0x00EC&&op<=0x00EE))?6:(op==0x00A4||(op>=0x00FE&&op<=0x0100))?8:(op==0x0480||op==0x00E1||op==0x0179||op==0x023B||op==0x031E||op==0x051C||op==0x08FF||op==0x09ED||op==0x06B7||op==0x02D8||op==0x0737||op==0x0364||op==0x031D||op==0x00DB||op==0x00DD||op==0x051A||op==0x0298)?2:(op==0x04C5||op==0x0833||op==0x054E||op==0x0467||op==0x0468||op==0x054F||op==0x0900||op==0x0366||op==0x0297||op==0x00DF)?1:0;
-    if((count||op==0x04DC)&&script==g_currentScript&&Field<uint8_t>(script,0xDC)&&Replicating()&&!PersonalActivity(script)){
+    int op=opcode&0x7FFF;int count=(op==0x00A3||op==0x02D6||(op>=0x00EC&&op<=0x00EE))?6:(op==0x00A4||(op>=0x00FE&&op<=0x0100))?8:(op==0x0480||op==0x00E1||op==0x0179||op==0x023B||op==0x031E||op==0x051C||op==0x08FF||op==0x09ED||op==0x06B7||op==0x02D8||op==0x0737||op==0x0364||op==0x031D||op==0x00DB||op==0x00DD||op==0x051A||op==0x0298||op==0x0897)?2:(op==0x04C5||op==0x0833||op==0x054E||op==0x0467||op==0x0468||op==0x054F||op==0x0900||op==0x0366||op==0x0297||op==0x00DF)?1:0;
+    if((count||op==0x04DC)&&script==g_currentScript&&SharedStoryScript(script)&&Replicating()){
         alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);uint32_t saved[32];memcpy(saved,(void*)0xA43C78,sizeof saved);
         int32_t params[10]{};if(count){CallMethod<0x464080>(copy,count);memcpy(params,(void*)0xA43C78,count*4);}memcpy((void*)0xA43C78,saved,sizeof saved);
         if(op==0x054E||op==0x0467)ClearStoryDamage(params[0]);
@@ -809,7 +871,7 @@ void InstallStoryObjectCommands(){
 
 CommandsFn g_origCommands100=nullptr;
 int8_t __fastcall HookCommands100(void*script,void*edx,int opcode){
-    if(opcode==0x00A6&&Net().Online()&&Net().IsHost()&&script==g_currentScript&&Field<uint8_t>(script,0xDC)&&!PersonalActivity(script)){
+    if(opcode==0x00A6&&Net().Online()&&Net().IsHost()&&script==g_currentScript&&SharedStoryScript(script)){
         alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);
         uint32_t saved[32];memcpy(saved,(void*)0xA43C78,sizeof saved);CallMethod<0x464080>(copy,1);
         auto*v=GetVehicle(Ref<int32_t>(0xA43C78));memcpy((void*)0xA43C78,saved,sizeof saved);
@@ -820,7 +882,7 @@ int8_t __fastcall HookCommands100(void*script,void*edx,int opcode){
 CommandsFn g_origCommands500=nullptr;
 int8_t __fastcall HookCommands500(void*script,void*edx,int opcode){
     int handle=-1;
-    if(opcode==0x020A&&script==g_currentScript&&Replicating()&&Field<uint8_t>(script,0xDC)){
+    if(opcode==0x020A&&script==g_currentScript&&Replicating()&&SharedStoryScript(script)){
         alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);
         uint32_t saved[32];memcpy(saved,(void*)0xA43C78,sizeof saved);
         CallMethod<0x464080>(copy,2);handle=Ref<int32_t>(0xA43C78);memcpy((void*)0xA43C78,saved,sizeof saved);
@@ -844,7 +906,7 @@ int8_t __fastcall HookCommands200(void* script, void* edx, int opcode) {
         if(Ref<int32_t>(0xA43C78)==0)gymOpening=GymOpeningKey(script,Ref<int32_t>(0xA43C7C))||!NativeInteractionAllowed(script,Ref<int32_t>(0xA43C7C));
         memcpy((void*)0xA43C78,saved,sizeof saved);
     }
-    bool payout=opcode==0x0109&&Net().Online()&&Net().IsHost()&&script==g_currentScript&&Field<uint8_t>(script,0xDC)&&!PersonalActivity(script);
+    bool payout=opcode==0x0109&&Net().Online()&&Net().IsHost()&&script==g_currentScript&&SharedStoryScript(script);
     int32_t moneyBefore=payout?PlayerInfos()[0].money:0;
     int8_t result=g_origCommands200(script,edx,opcode);
     if(payout){
@@ -897,7 +959,20 @@ void* __cdecl HookStartNewScript(uint8_t* ip) {
         Fade(1.0f, 1);  // main.scm blacks the screen out before the prologue, which would fade it in
         LOGI("The prologue mission is the host's: this game's copy ends at once");
     }
-    return g_origStartScript(ip);
+    const auto parent = g_storyThreads.find(g_currentScript);
+    const bool inherit = SharedStoryScript(g_currentScript);
+    const uint64_t run = inherit ? parent->second.run : 0;
+    const uint64_t parentBirth = inherit ? parent->second.birth : 0;
+    void* child = g_origStartScript(ip);
+    if (child && inherit && run == StoryRunId() && !PersonalActivity(child)) {
+        // A streamed loader may set BaseIP after StartNewScript returns.
+        // Bind it on first Process; Init invalidates any previous slot owner.
+        g_storyThreads[child] = {run, ++g_storyThreadBirth, parentBirth, g_currentScript, nullptr, false};
+        LOGD("Story helper created script=%p parent=%p run=%llu birth=%llu parentBirth=%llu",
+             child, g_currentScript, (unsigned long long)run,
+             (unsigned long long)g_storyThreadBirth, (unsigned long long)parentBirth);
+    }
+    return child;
 }
 
 void HandleMissionWait(uint8_t from, Reader& r) {
@@ -1710,9 +1785,23 @@ void HandleCutscene(uint8_t from, Reader& r) {
         // where the previous scene put it (an interior's exit marker fires and takes the camera)
         if (g_csState == 2) PartnerEndCutscene();
         if (g_csState != 0) PartnerClearCutscene();
-        auto*me=FindPlayerPed(0);int type=me->VehicleIfIn()?me->VehicleIfIn()->VehicleSubClass():-1;
-        g_sceneBypassed=type==VEHICLE_TYPE_HELI||type==VEHICLE_TYPE_PLANE||type==VEHICLE_TYPE_BOAT||type==VEHICLE_TYPE_FHELI||type==VEHICLE_TYPE_FPLANE||
-            (type<0&&(!(me->PedFlags()&1)));
+        auto* me = FindPlayerPed(0);
+        int type = me->VehicleIfIn() ? me->VehicleIfIn()->VehicleSubClass() : -1;
+        g_sceneBypassed = type == VEHICLE_TYPE_HELI || type == VEHICLE_TYPE_PLANE || type == VEHICLE_TYPE_BOAT ||
+                          type == VEHICLE_TYPE_FHELI || type == VEHICLE_TYPE_FPLANE;
+        if (type < 0 && !me->AttachedTo()) {
+            // Standing is unset after a scene or a fresh spawn, even on a
+            // loaded floor. Preserve actual flight/swimming, not that bit.
+            bool found = false;
+            const auto at = me->GetPosition();
+            float floor = Call<0x5696C0, float>(at.x, at.y, at.z + .5f, &found, (CEntity**)nullptr);
+            bool airborne = found && std::isfinite(floor) && at.z - floor > 2.0f;
+            bool closeFloor = found && std::isfinite(floor) && std::fabs(at.z - floor) <= 2.0f;
+            bool flying = !closeFloor && me->IsInTheAir() && (me->ActiveWeapon().type == 46 ||
+                          std::fabs(me->MoveSpeed().z) > .03f ||
+                          (me->Intelligence() && CallMethod<0x601110, void*>(me->Intelligence())));
+            g_sceneBypassed = airborne || flying || anim::FindTask(me, 1304);
+        }
         if(g_sceneBypassed){SendCutscene(CS_READY,"",0,Net().HostId());LOGI("Host cutscene bypassed: player in air/on water");return;}
         LOGI("Host cutscene %s: loading here", name.c_str());
         // the loading sets us out of a vehicle (CCutsceneMgr::LoadCutsceneData_preload): we get back in afterwards
@@ -1877,7 +1966,7 @@ void __fastcall HookLoadAudio(void* audio, void* edx, uint8_t slot, int32_t even
     }
     if(SharedAudioSlot(slot))return;
     g_origLoadAudio(audio, edx, slot, event);
-    if (!Net().Online() || !Net().IsHost() || slot >= 4 || PersonalActivity(g_currentScript)) return;
+    if (slot >= 4 || !SharedStoryScript(g_currentScript)) return;
     if (++g_hostAudioToken[slot] == 0) ++g_hostAudioToken[slot];
     g_hostAudio[slot] = event;g_hostAudioStamp[slot]=NowMs();
     g_hostAudioTarget[slot] = {};
@@ -1887,7 +1976,7 @@ void __fastcall HookLoadAudio(void* audio, void* edx, uint8_t slot, int32_t even
 void __fastcall HookPlayAudio(void* audio, void* edx, uint8_t slot) {
     if(SharedAudioSlot(slot))return;
     g_origPlayAudio(audio, edx, slot);
-    if (slot < 4 && Net().IsHost() && !PersonalActivity(g_currentScript)) {
+    if (slot < 4 && SharedStoryScript(g_currentScript)) {
         g_hostAudioPlaying[slot] = true;g_hostAudioStamp[slot]=NowMs();
         if (Replicating() && g_hostAudio[slot] >= 0) SendMissionAudio(2, slot, g_hostAudio[slot]);
     }
@@ -1895,7 +1984,7 @@ void __fastcall HookPlayAudio(void* audio, void* edx, uint8_t slot) {
 void __fastcall HookClearAudio(void* audio, void* edx, uint8_t slot) {
     if(SharedAudioSlot(slot))return;
     g_origClearAudio(audio, edx, slot);
-    if (slot < 4 && Net().Online() && Net().IsHost() && !PersonalActivity(g_currentScript)) {
+    if (slot < 4 && Net().Online() && Net().IsHost() && (!g_currentScript || SharedStoryScript(g_currentScript))) {
         if (g_hostAudio[slot] >= 0) SendMissionAudio(3, slot, g_hostAudio[slot]);
         g_hostAudio[slot] = -1;
         g_hostAudioPlaying[slot] = false;
@@ -1908,11 +1997,11 @@ AudioAttachFn g_originalAudioAttach=nullptr;
 void __fastcall HookAudioPosition(void* audio,void* edx,uint8_t slot,CVector* point) {
     if(SharedAudioSlot(slot))return;
     g_originalAudioPosition(audio,edx,slot,point);
-    if(slot<4&&point&&Net().IsHost()&&!PersonalActivity(g_currentScript))g_hostAudioTarget[slot]=AudioTarget::Describe(nullptr,*point);
+    if(slot<4&&point&&SharedStoryScript(g_currentScript))g_hostAudioTarget[slot]=AudioTarget::Describe(nullptr,*point);
 }
 CVector* __fastcall HookAudioAttach(void* audio,void* edx,uint8_t slot,CPhysical* entity) {
     if(SharedAudioSlot(slot))return &Field<CVector>(audio,0x330+slot*0x20);
-    if(slot<4&&entity&&Net().IsHost()&&!PersonalActivity(g_currentScript))g_hostAudioTarget[slot]=AudioTarget::Describe(entity,entity->GetPosition());
+    if(slot<4&&entity&&SharedStoryScript(g_currentScript))g_hostAudioTarget[slot]=AudioTarget::Describe(entity,entity->GetPosition());
     return g_originalAudioAttach(audio,edx,slot,entity);
 }
 VoidFn g_originalSkipScene=nullptr;
@@ -2122,9 +2211,13 @@ void ApplyStoryWarp(){
     auto*me=FindPlayerPed(0);if(!me||me->Health()<=0)return;auto&next=g_storyWarp;
     auto*ownCar=me->VehicleIfIn();auto*networkCar=ownCar?Vehicles::Instance().Find(ownCar):nullptr;
     bool sameCar=next.vehicle&&networkCar&&networkCar->netId==next.vehicle;
-    bool aircraft=LocalStoryRoleMode()==5&&ownCar&&(ownCar->VehicleSubClass()==VEHICLE_TYPE_PLANE||ownCar->VehicleSubClass()==VEHICLE_TYPE_HELI);
-    if(sameCar||aircraft){
-        if(ownCar->AreaCode()!=next.area||(ownCar->GetPosition()-next.position).Length()>(aircraft?80.f:10.f)||!LocalCooperativeRoleReady())return;
+    if (LocalCooperativeRelocationReady(next.vehicle, next.area, next.position)) {
+        Cmd(0x04BB).I(next.area).Run(); Cmd(0x0860).I(GetPedRef(me)).I(next.area).Run();
+        next.pending = false; ReleaseStoryWarpHold();
+        LOGI("Story warp %u role support ready", next.sequence); return;
+    }
+    if(sameCar){
+        if(ownCar->AreaCode()!=next.area||(ownCar->GetPosition()-next.position).Length()>10.f||!LocalCooperativeRoleReady())return;
         Cmd(0x04BB).I(next.area).Run();Cmd(0x0860).I(GetPedRef(me)).I(next.area).Run();
         next.pending=false;ReleaseStoryWarpHold();LOGI("Story warp %u vehicle ready",next.sequence);return;
     }
@@ -2429,7 +2522,7 @@ void HostSendScreen(bool active, bool changesOnly=false) {
 }
 
 void ScriptFaded(int16_t dir, float seconds) {
-    if (!Net().Online() || !Net().IsHost() || !g_currentScript || !Field<uint8_t>(g_currentScript, 0xDC) || PersonalActivity(g_currentScript)) return;
+    if (!SharedStoryScript(g_currentScript)) return;
     ++g_screenGeneration;g_scriptBlack = dir == 0;
     g_scriptFadeSec = std::clamp(seconds, 0.1f, 5.0f);
     if (!Replicating()) return;
@@ -2558,12 +2651,7 @@ void PartnerMissionCleanup() {
     }
     g_pendingAudio.clear();
     StopScriptCamera();
-    if(auto*me=core::IsPlayerReady()?FindPlayerPed(0):nullptr)
-        for(auto&[weapon,own]:g_replaced)for(int i=0;i<NUM_WEAPON_SLOTS;++i)
-            if(own.first==weapon&&me->Weapons()[i].type==weapon&&me->Weapons()[i].ammoTotal<own.second)
-                Cmd(0x017B).I(GetPedRef(me)).I(weapon).I(std::min(own.second,99999)).Run();
-    g_missionWeapons.clear();
-    g_replaced.clear();
+    RestoreStoryMissionWeapons();
     ClearPartnerBlips();
     g_partnerBlipRecords.clear();
     g_partnerAreas.clear();
@@ -2606,6 +2694,14 @@ void SendMissionState(){
 void MissionsResync(uint8_t player) {
     if(!Net().IsHost())return;
     ResyncCooperativeStory(player);
+    if (g_hostWeaponRun == StoryRunId() && StoryRunId() && core::IsPlayerReady()) {
+        auto* cj = FindPlayerPed(0);
+        for (int weapon : g_hostMissionWeapons)
+            for (int slot = 0; cj && slot < NUM_WEAPON_SLOTS; ++slot)
+                if (cj->Weapons()[slot].type == weapon)
+                    SendMissionWeapon(WEAPON_GIVE, weapon, cj->Weapons()[slot].ammoTotal,
+                                      cj->ActiveWeapon().type == weapon, player);
+    }
     if(StoryRunId()&&core::IsPlayerReady()&&!CutsceneRunning())SendStoryWarp(FindPlayerPed(0),player,false);
     SendMissionState();
     if(g_waitSent)SendWait(true);
@@ -2686,6 +2782,8 @@ public:
         mem::RedirectCallFn(0x484361, &HookScriptClearArea, &g_origClearArea);  // CLEAR_AREA (opcode 0395)
         mem::HookFn(0x609590, &HookCanPlayerStartMission, &g_origCanStart, "CPlayerPed::CanPlayerStartMission");
         mem::HookFn(0x464C20, &HookStartNewScript, &g_origStartScript, "CTheScripts::StartNewScript");
+        mem::HookFn(0x4648E0, &HookScriptInit, &g_origScriptInit, "CRunningScript::Init (story ownership)");
+        mem::HookFn(0x465AA0, &HookScriptShutdown, &g_origScriptShutdown, "CRunningScript::ShutdownThisScript (story ownership)");
         {AddMsgFn previous=nullptr;mem::RedirectCallFn(0x5B187E,&NativeSubtitle,&previous);}
         mem::HookFn(0x69EDC0,&PrivateTextClear,&g_originalClearAll,"CText private table HUD preservation");
         mem::HookFn(0x6A0050,&SharedTextGet,&g_originalTextGet,"CText independent mission translations");
@@ -2732,6 +2830,7 @@ public:
     }
 
     void OnPreProcess() override {
+        PruneStoryThreads();
         if (core::IsPlayerReady() && Net().Online() && !Net().IsHost()) PlacePartnerMarkers();
     }
     void OnPostProcess() override {
@@ -2794,6 +2893,7 @@ public:
 
 private:
     static void Reset() {
+        ClearStoryThreads();
         g_contacts.clear();g_contactHistory.clear();g_contactCopies.clear();g_contactsSent=g_contactsApplied=0;
         g_sceneClockReceived=g_sceneClockSent=0;g_sceneClockLatest=g_sceneClockSequence=0;
         g_pendingSubtitles.clear();
@@ -2816,7 +2916,7 @@ private:
         g_partnerAreas.clear();
         g_placed.clear();  // checkpoints and spheres too
         g_sentMarked.clear();
-        g_missionWeapons.clear();
+        g_hostMissionWeapons.clear(); g_hostWeaponRun = 0;
         g_partnerMission = g_weFaded = g_weWide = g_onscreenSet = false;
         g_waitSent = g_hostWaits = false;
         g_waitMs = 0;
@@ -2877,7 +2977,19 @@ private:
             Net().Send(proto::CH_RELIABLE, w);
         }
         if (!active && g_active) {
+            // Native cleanup has finished. Confirm only the supplies it kept.
+            if (g_hostWeaponRun == StoryRunId()) {
+                auto* cj = FindPlayerPed(0);
+                for (int weapon : g_hostMissionWeapons) {
+                    int ammo = -1;
+                    for (int slot = 0; cj && slot < NUM_WEAPON_SLOTS; ++slot)
+                        if (cj->Weapons()[slot].type == weapon) ammo = cj->Weapons()[slot].ammoTotal;
+                    SendMissionWeapon(WEAPON_FINAL, weapon, ammo, false);
+                }
+            }
+            g_hostMissionWeapons.clear(); g_hostWeaponRun = 0;
             EndCooperativeStory((int32_t)g_missionPayout);
+            ClearStoryThreads();
             ++g_missionRevision;g_recentMissionText.clear();
             Vehicles::Instance().ReleaseScriptLocks();
             g_deadMissionPartner=-1;
@@ -3114,6 +3226,7 @@ bool StoryGroupReady(float x, float y, float z, int8_t area, float radius, float
 }
 
 bool HostReplicating() { return Replicating(); }
+bool IsSharedStoryScript(void* script) { return SharedStoryScript(script); }
 
 bool LocalSchoolActivity() {
     if(!core::IsPlayerReady()||!core::IsOnMission())return false;

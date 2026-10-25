@@ -6,8 +6,8 @@ namespace coop {
 // KEEP_IN_MEMORY survives native wanted-level model cleanup; release only our own bit.
 struct ModelRequest {uint64_t last=0;bool retained=false;};
 inline std::map<int,ModelRequest> pendingModelRequests;
-inline void RequestSharedModel(int model,bool priority=false){
-    if(!game::IsValidModel(model)||game::IsModelLoaded(model))return;
+inline void RequestSharedModel(int model,bool priority=false,bool retainLoaded=false){
+    if(!game::IsValidModel(model)||(!retainLoaded&&game::IsModelLoaded(model)))return;
     auto retain=[](int id){auto[i,added]=pendingModelRequests.try_emplace(id);auto&r=i->second;if(added)r.retained=!(game::Ref<uint8_t>(game::addr::StreamingInfo+(uintptr_t)id*0x14+6)&8);r.last=NowMs();};
     retain(model);
     // RequestModel propagates the keep flag to the texture dictionary chain.

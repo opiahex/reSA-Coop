@@ -49,6 +49,7 @@ struct NetVehicle {
     bool heldHere = false;     // a script of this game held it when it became a mirror here
     bool crashProofHere = false;  // made collision-proof here as a mirror (taken off when it is this game's again)
     bool physicsHeld=false,heldGravity=false;
+    bool trainAttached=false,trainCollisionHeld=false,trainHadCollision=false;
     uint32_t heldPhysicsMask=0;
 
     bool hasState = false;

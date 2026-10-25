@@ -12,6 +12,7 @@
 #include "entities/session/Flow.h"
 #include "shared/api/net-session/Session.h"
 #include "shared/api/story-world/StoryWorld.h"
+#include "shared/api/story-scripts/StoryScripts.h"
 #include "shared/game/Script.h"
 #include "shared/lib/core/Core.h"
 #include "shared/lib/memory/Memory.h"
@@ -44,7 +45,7 @@ void SendProgress(){
 using IplFn=void(__cdecl*)(int);IplFn originalIpl[3]{};
 template<int Op>void __cdecl ScriptIpl(int slot){
     originalIpl[Op](slot);auto*s=CurrentScript();
-    if(!Net().Online()||!Net().IsHost()||!HostReplicating()||!s||!Field<uint8_t>(s,0xDC)||LocalSchoolActivity())return;
+    if(!Net().Online()||!Net().IsHost()||!HostReplicating()||!IsSharedStoryScript(s)||LocalSchoolActivity())return;
     const char*name=Call<0x404A60,const char*>(slot);if(!name||!*name||strnlen(name,33)>32)return;
     {ipls[name]=Op;NextRevision();SendIpl(name,Op);LOGI("Story map IPL sent name=%s op=%d",name,Op);}
 }

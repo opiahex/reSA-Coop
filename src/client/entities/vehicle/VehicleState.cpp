@@ -51,6 +51,9 @@ VehicleState VehicleState::Capture(game::CVehicle* v) {
         s.turretYaw = game::Field<float>(v, 0x94C);   // CAutomobile::m_fDoomVerticalRotation
         s.turretPitch = game::Field<float>(v, 0x950);  // m_fDoomHorizontalRotation
     }
+    if(auto*parent=v->AttachedTo();parent&&parent->IsVehicle()&&((game::CVehicle*)parent)->IsTrain()&&DescribeTrainAttachment((game::CVehicle*)parent,s.train)){
+        s.trainOffset=game::Field<CVector>(v,0x100);s.trainRotation=game::Field<Quat>(v,0x118);
+    }
     return s;
 }
 
@@ -78,6 +81,7 @@ void VehicleState::Write(Writer& w) const {
     if (extras & X_SEARCHLIGHT) { w.Vec(V(searchTarget)); w.Unit8(searchIntensity); }
     if(extras & X_ROTOR)w.F32(rotorSpeed);
     if(extras & X_WHEELS)wheels.Write(w);
+    w.Bool(train.Valid());if(train.Valid()){train.Write(w);w.Vec(V(trainOffset));trainRotation.Write(w);}
 }
 
 bool VehicleState::Read(Reader& r) {
@@ -104,6 +108,7 @@ bool VehicleState::Read(Reader& r) {
     if (extras & X_SEARCHLIGHT) { searchTarget = G(r.Vec()); searchIntensity = r.Unit8(); }
     if(extras & X_ROTOR){r.Raw(&rotorSpeed,4);if(!std::isfinite(rotorSpeed)||rotorSpeed<0||rotorSpeed>5)return false;}
     if((extras & X_WHEELS)&&!wheels.Read(r))return false;
+    if(r.Bool()){if(!train.Read(r)||!train.Valid())return false;trainOffset=G(r.Vec());trainRotation.Read(r);if(!(trainOffset.Length()<100))return false;}else train={};
     return r.Ok();
 }
 

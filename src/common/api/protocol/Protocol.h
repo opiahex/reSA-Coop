@@ -135,7 +135,7 @@ enum MsgId : uint8_t {
     G_WAYPOINT = 133,         // reliable: the player's map waypoint (set or cleared)
     G_PROPERTY = 134,         // reliable: the player bought a property (its index in main.scm)
     G_HOST_SAVED = 135,       // reliable: the host saved its game, the partners save their profiles
-    G_MISSION_WEAPON = 136,   // reliable: u8 op (1 give, 2 take), u8 weapon, i32 ammo (CJ's count after the change):
+    G_MISSION_WEAPON = 136,  // u64 run, u8 target, u8 operation, u8 weapon, i32 ammo, u8 inHand
                               // the host's mission armed its CJ
     G_CHECKPOINTS = 137,      // reliable: the host's script checkpoints and spheres (u8 n, records)
     G_WORLD_OBJ = 138,        // a map object broke or moved (u16 model, origin, stage, flags, weapon[, pose, speeds]);

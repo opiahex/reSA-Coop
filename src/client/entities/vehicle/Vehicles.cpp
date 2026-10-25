@@ -1018,6 +1018,24 @@ void ApplyHydraulics(CVehicle* v, const VehicleState& st) {
     if (slot >= 0 && slot < 4) memcpy((void*)(0xC1CB60 + (uintptr_t)slot * 0x28 + 0x18), wheel, sizeof(wheel));
 }
 
+// A train-bound mission car follows its carriage in local space, rather than
+// alternating native attachment physics with delayed world-space snapshots.
+bool ApplyTrainBinding(NetVehicle&nv,const VehicleState&st){
+    auto*v=nv.veh;auto*parent=st.train.Valid()?ResolveTrainAttachment(st.train):nullptr;
+    if(parent&&!Net().EntityLink(ENTITY_VEHICLE,nv.netId,ENTITY_TRAIN,st.train.id,st.train.owner))parent=nullptr;
+    if(nv.trainAttached&&v->AttachedTo()!=parent){if(v->AttachedTo())CallMethod<0x5442F0>(v,0.f,0.f,0.f,false);nv.trainAttached=false;}
+    if(st.train.Valid()&&!parent){
+        if(!nv.trainCollisionHeld){nv.trainCollisionHeld=true;nv.trainHadCollision=(v->Flags()&1)!=0;}
+        v->Flags()&=~129u;SetVehicleMatrix(v,st.pos,st.rot);v->MoveSpeed()={};v->TurnSpeed()={};return true;
+    }
+    if(nv.trainCollisionHeld){if(nv.trainHadCollision)v->Flags()|=1u;nv.trainCollisionHeld=false;}
+    if(!parent)return false;
+    auto offset=st.trainOffset;auto rotation=st.trainRotation;
+    if(v->AttachedTo()!=parent)CallMethod<0x54D690>(v,parent,&offset,&rotation);
+    Field<CVector>(v,0x100)=offset;Field<Quat>(v,0x118)=rotation;
+    CallMethod<0x546FF0>(v);nv.trainAttached=true;return true;
+}
+
 void Vehicles::ApplyMirror(NetVehicle& nv, float dt) {
     if (!nv.hasState) return;
     CVehicle* v = nv.veh;
@@ -1068,9 +1086,11 @@ void Vehicles::ApplyMirror(NetVehicle& nv, float dt) {
     // then accumulated metres of error before snapping the car and its riders.
     // Use the sampled transform each tick, retaining physical velocity for local
     // contacts. Only the owner publishes the resulting vehicle physics.
-    SetVehicleMatrix(v, target, st.rot);
-    v->MoveSpeed() = nv.groundless ? CVector{} : st.vel * (1.0f / 50.0f);
-    v->TurnSpeed() = nv.groundless ? CVector{} : st.turn * (1.0f / 50.0f);
+    if(!ApplyTrainBinding(nv,st)){
+        SetVehicleMatrix(v, target, st.rot);
+        v->MoveSpeed() = nv.groundless ? CVector{} : st.vel * (1.0f / 50.0f);
+        v->TurnSpeed() = nv.groundless ? CVector{} : st.turn * (1.0f / 50.0f);
+    }
     if(wreck)return;
     if (nv.hasLook && NowMs() - nv.lookCheckMs >= 500) {
         nv.lookCheckMs = NowMs();

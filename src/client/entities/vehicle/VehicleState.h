@@ -5,6 +5,7 @@
 #include "shared/game/Game.h"
 #include "entities/vehicle/WheelState.h"
 #include "shared/lib/sync/Quat.h"
+#include "shared/lib/sync/TrainSupport.h"
 
 namespace coop {
 
@@ -35,6 +36,7 @@ struct VehicleState {
     float searchIntensity = 0;
     float rotorSpeed = 0; // CHeli: native rotor spool, separate from engine-on bit
     uint16_t towChild=0,towParent=0;
+    TrainAttachment train;game::CVector trainOffset;Quat trainRotation;
 
     static VehicleState Capture(game::CVehicle* v);
     void Write(Writer& w) const;

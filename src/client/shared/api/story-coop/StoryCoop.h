@@ -13,6 +13,8 @@ bool StoryRoleOwnsCamera();
 void SetCooperativeStoryCamera(bool mandatory);
 uint8_t CooperativeReservedSeats(game::CVehicle*car);
 uint8_t LocalStoryRoleMode();
+// A current mission support may be in mid-air without an ordinary floor.
+bool LocalCooperativeRelocationReady(uint16_t sourceVehicle,int8_t area,const game::CVector&point);
 void PrepareCooperativeStoryStage();
 void PrepareCooperativeRelocation(int8_t area,const game::CVector&position);
 void BeginCooperativeInventoryRestore();
