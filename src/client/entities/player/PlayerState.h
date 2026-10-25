@@ -65,6 +65,7 @@ struct OnFootState {
     uint32_t time = 0;  // sender clock (ms)
     game::CVector pos, vel;
     float rotation = 0, aimRotation = 0;
+    float breath=1000;
     uint8_t health = 100, armour = 0;
     uint8_t weapon = 0;
     uint16_t ammo = 0;

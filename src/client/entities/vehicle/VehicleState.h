@@ -19,6 +19,7 @@ struct VehicleState {
     float brake = 0;     // 0..1
     float health = 1000;
     uint8_t flags = 0;   // F_*
+    uint8_t water=0; // physical submerged / occupants drowning, owner decides
     uint8_t lock = 0;
     int8_t area=0;
 

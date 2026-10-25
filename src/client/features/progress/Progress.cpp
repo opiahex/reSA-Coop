@@ -1,3 +1,4 @@
+#include "shared/lib/sync/ModelRequests.h"
 // Separate progression and looks.
 //  * the host progresses in its own save; the partner keeps a profile on the server (money, every stat:
 //    fat, muscle, stamina, lung capacity, weapon/driving skills..., clothes with haircut and tattoos,
@@ -400,10 +401,12 @@ public:
             }
         }
 
+        int lookBudget=1; // native clothing caches are shared across player slots
         // remote looks: rebuild the remote ped once per new description (on foot: the rebuild swaps its clump)
         for (auto& [id, l] : g_looks) {
             RemotePlayer* rp = Players::Instance().Get(id);
             if (!rp || !rp->ped || (rp->pedHandle == l.appliedTo && !rp->lookStale) || rp->ped->InVehicle()) continue;
+            if(!lookBudget||now-rp->spawnedAt<500||!rp->ped->RwObject()||!rp->ped->ClothesDesc())continue;
             int model = l.model;
             if (model >= 290 && model <= 299) {  // here it is in whichever slot holds that name
                 model = Peds::Instance().SpecialModelFor(l.special);
@@ -413,14 +416,17 @@ public:
                     model = 0;
                 }
             }
+            if(model!=0&&!IsPedModel(model))model=0;
+            if(model!=0&&!IsModelLoaded(model)){RequestSharedModel(model,true);continue;}
             bool skin = model != 0 && Players::SetModel(rp->ped, model);
+            if(model!=0&&!skin)continue;
             if (!skin) {
                 Players::SetModel(rp->ped, 0);
                 memcpy(rp->ped->ClothesDesc(), l.desc.data(), kClothesSize);
                 MuscleFrom muscle(rp->ped->ClothesDesc());
                 RebuildPlayer(rp->ped, true);  // fat/muscle from the description, not from our stats
             }
-            l.appliedTo = rp->pedHandle;
+            --lookBudget;l.appliedTo = rp->pedHandle;
             rp->lookStale = false;
             LOGI("Look of player %d applied (model %d%s%s)", id, skin ? model : 0, l.special.empty() ? "" : ", ",
                  l.special.c_str());

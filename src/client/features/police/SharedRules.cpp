@@ -50,7 +50,7 @@ struct Rules{bool active=false,war=false;uint8_t max=6,ignore=0;float multiplier
 uint64_t received=0,sent=0;bool applied=false;uint32_t sequence=0,latest=0;
 bool Nearby(){
     auto*rp=Players::Instance().Get(Net().HostId());auto*me=core::IsPlayerReady()?FindPlayerPed(0):nullptr;
-    return Net().Online()&&!Net().IsHost()&&me&&flow::InHostWorld()&&!PlayerTraining(Net().MyId())&&rp&&rp->hasState&&NowMs()-rp->stateRecvMs<1500&&rp->state.area==AreaOf(me)&&(rp->state.pos-me->GetPosition()).Length()<300&&received&&NowMs()-received<3500;
+    return Net().Online()&&!Net().IsHost()&&me&&flow::InHostWorld()&&!PlayerTraining(Net().MyId())&&rp&&rp->hasState&&NowMs()-rp->stateRecvMs<1500&&rp->state.area==AreaOf(me)&&(rp->state.pos-me->GetPosition()).Length()<(applied?340.f:280.f)&&received&&NowMs()-received<3500;
 }
 using WarFn=bool(__cdecl*)();WarFn originalWar[2]{};
 bool __cdecl War0(){return originalWar[0]()||(remote.war&&Nearby());}

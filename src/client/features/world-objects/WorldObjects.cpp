@@ -3,11 +3,14 @@
 // What a player does to one, the other game repeats: it breaks (CObject::ObjectDamage: smashed, in pieces, its damaged
 // model), its window cracks or shatters, or it is knocked loose and moves. The game where it moves sends its pose until
 // it lies still, and the other game's copy follows. A game that meets such an object later (it was not streamed in
-// then, or it streamed out and in again) gets it as it was left, for a few minutes; after that the map puts it back as
-// it always does.
+// then, or it streamed out and in again) receives the current world state.
+// Records expire with the world, never independently on each participant.
 #include <algorithm>
 #include <cmath>
 #include <vector>
+#include <map>
+#include <tuple>
+#include "shared/lib/sync/SnapshotBuffer.h"
 
 #include "common/api/protocol/Protocol.h"
 #include "common/lib/log/Log.h"
@@ -24,25 +27,32 @@ namespace {
 using namespace game;
 
 constexpr float kRange = 150.0f;               // objects this far from our player are looked at
-constexpr uint64_t kKeepMs = 5 * 60 * 1000;    // a record still applies to objects made again this long
 constexpr uint64_t kFollowMs = 1500;           // the other game's moves stop: it lies still (or the message got lost)
 constexpr int kMaxSendsPerScan = 16;           // an explosion knocks dozens loose at once
-enum : uint8_t { F_MOVED = 1, F_MOVING = 2 };  // not where the map put it; still moving
+enum : uint8_t { F_MOVED = 1, F_MOVING = 2, F_CONTROLLED=4 };  // not where the map put it; still moving
 
+struct MechanismPose{uint32_t time=0;CVector pos;Quat rot;};
 struct Thing {
     uint16_t model = 0;
     CVector origin;        // where its map entry puts it: the same in both games
     uint8_t stage = 0;     // 0 whole, 1 damaged (its damaged model, a cracked window), 2 broken (smashed, in pieces)
-    bool moved = false, moving = false;
+    bool moved = false, moving = false,controlled=false;uint8_t entityFlags=129;
+    SnapshotBuffer<MechanismPose>history;int heldHandle=-1;bool wasStatic=false;
     CVector pos, speed, turn;
     Quat rot;
     uint8_t weapon = 0;    // what broke it (CObject::m_nLastWeaponDamage): the same proofs decide in the other game
+    uint8_t source=255;
     bool remote = false;   // the other game's: this one follows
     bool following = false;  // our copy plays the other game's moves
     uint64_t updatedMs = 0, sentMs = 0, appliedMs = 0;
 };
 std::vector<Thing> g_things;
-uint64_t g_scanMs = 0, g_statsMs = 0;
+using MapKey=std::tuple<uint16_t,int,int,int>;
+MapKey Key(uint16_t model,const CVector&p){return{model,(int)std::lround(p.x*10),(int)std::lround(p.y*10),(int)std::lround(p.z*10)};}
+std::map<MapKey,size_t>g_index;
+Thing*Remember(uint16_t model,const CVector&origin){g_index[Key(model,origin)]=g_things.size();g_things.emplace_back();auto&t=g_things.back();t.model=model;t.origin=origin;return &t;}
+void ClearObjects(){g_index.clear();g_things.clear();}
+uint64_t g_scanMs = 0, g_statsMs = 0;size_t scanCursor=0;
 int g_sent = 0, g_received = 0;  // messages since the last stats line
 
 uint8_t ObjectType(CObject* o) { return Field<uint8_t>(o, 0x13C); }  // CObject::m_nObjectType: 1 the map's
@@ -56,12 +66,19 @@ CEntity* Dummy(CObject* o) {                                           // CObjec
     return d;
 }
 
+bool Controlled(CObject*o){auto special=Field<uint8_t>(o,0x145);return Field<void*>(o,0x138)||(special>=6&&special<=8);}
+uint8_t ControlSource(CObject*o){
+    auto at=o->GetPosition();uint8_t source=255;
+    auto add=[&](uint8_t id,int8_t area,const CVector&pos){if((area==o->AreaCode()||o->AreaCode()==13)&&(pos-at).Length()<200)source=std::min(source,id);};
+    if(auto*me=FindPlayerPed(0))add(Net().MyId(),me->AreaCode(),me->GetPosition());
+    for(auto&[id,p]:Players::Instance().All())if(p.hasState&&NowMs()-p.stateRecvMs<1500)add(id,p.state.area,p.state.pos);
+    return source;
+}
 // what is the players' to break and move: not what the game moves itself or what explodes in the breaker's name
 bool Shared(CObject* o) {
     if (ObjectType(o) != 1 || !o->Matrix() || !Dummy(o)) return false;
-    if (Field<void*>(o, 0x138)) return false;  // m_pControlCodeList: garage doors, crossings, cranes, sam sites...
     uint8_t special = Field<uint8_t>(o, 0x145);  // m_nSpecialColResponseCase
-    if (special >= 6 && special <= 9) return false;  // swinging and locked doors, hanging things, pool balls
+    if (special == 9) return false;  // swinging and locked doors, hanging things, pool balls
     void* info = Field<void*>(o, 0x160);  // m_pObjectInfo
     return !info || !Field<uint8_t>(info, 0x1F);  // m_bCausesExplosion: CObject::Explode names this game's player
 }
@@ -83,18 +100,16 @@ bool Turned(CObject* o, CEntity* d) {
 }
 
 Thing* Find(uint16_t model, const CVector& origin) {
-    for (Thing& t : g_things)
-        if (t.model == model && (t.origin - origin).Length() < 0.1f) return &t;
-    return nullptr;
+    auto i=g_index.find(Key(model,origin));return i==g_index.end()?nullptr:&g_things[i->second];
 }
 
 void Send(const Thing& t, bool reliable) {
     Writer w(proto::G_WORLD_OBJ);
-    w.U16(t.model);
+    w.U16(t.model);w.U32((uint32_t)NowMs());
     w.Vec({t.origin.x, t.origin.y, t.origin.z});
     w.U8(t.stage);
-    w.U8((t.moved ? F_MOVED : 0) | (t.moving ? F_MOVING : 0));
-    w.U8(t.weapon);
+    w.U8((t.moved ? F_MOVED : 0) | (t.moving ? F_MOVING : 0) | (t.controlled?F_CONTROLLED:0));
+    w.U8(t.weapon);if(t.controlled)w.U8(t.entityFlags);
     if (t.moved) {
         w.Vec({t.pos.x, t.pos.y, t.pos.z});
         t.rot.Write(w);
@@ -120,6 +135,8 @@ void Place(CObject* o, const CVector& pos, const Quat& rot, bool loose, const CV
 
 // as the other game broke it: the same damage path shows the same pieces
 void Break(CObject* o, uint8_t stage, uint8_t weapon) {
+    if(!o->RwObject()){if(stage>=2)o->Flags()&=~129u;return;}
+
     CVector p = o->GetPosition();
     if (Call<0x46A760, bool>(o)) {  // CGlass::IsObjectGlass: windows break in CGlass, not in ObjectDamage
         if (stage >= 2) Call<0x71BC40>((CEntity*)o, 1000.0f, 0.0f, 0.0f, 0.0f, p.x, p.y, p.z, false);  // WindowRespondsToCollision
@@ -146,6 +163,26 @@ void CatchUp(CObject* o, Thing& t, bool driven) {
     t.following = driven;
 }
 
+void ReleaseMechanism(Thing&t){
+    if(auto*o=GetObject(t.heldHandle);o&&!t.wasStatic)CallVirtual<4>(o,false);
+    t.heldHandle=-1;
+}
+void FollowMechanism(CObject*o,Thing&t){
+    if(t.heldHandle!=GetObjectRef(o)){t.heldHandle=GetObjectRef(o);t.wasStatic=(o->Flags()&4)!=0;}
+    auto pose=t.history.At(NowMs(),[](const MechanismPose&a,const MechanismPose&b,float f){return MechanismPose{b.time,a.pos+(b.pos-a.pos)*f,Quat::Slerp(a.rot,b.rot,f)};},[](MechanismPose&,float,bool){});
+    Place(o,pose.pos,pose.rot,false,{},{});o->Flags()=(o->Flags()&~129u)|(t.entityFlags&129u);
+}
+void FollowMechanisms(){
+    auto*pool=ObjectPool();if(!pool)return;
+    for(int i=0;i<pool->size;++i)if(pool->byteMap[i]>=0){auto*o=(CObject*)(pool->objects+(size_t)i*kObjectPoolElemSize);
+        auto*d=Dummy(o);if(!d)continue;auto*t=Find(o->ModelIndex(),d->GetPosition());
+        if(t&&t->controlled&&t->remote){
+            if(ControlSource(o)==Net().MyId()){ReleaseMechanism(*t);t->remote=false;}
+            else if(NowMs()-t->updatedMs<kFollowMs)FollowMechanism(o,*t);
+        }
+    }
+}
+
 void Scan() {
     CPlayerPed* me = FindPlayerPed(0);
     CPoolHeader* pool = ObjectPool();
@@ -153,13 +190,17 @@ void Scan() {
     CVector mp = me->GetPosition();
     uint64_t now = NowMs();
     int sends = 0;
-    for (int i = 0; i < pool->size; ++i) {
+    for (int step = 0; step < pool->size; ++step) {
+        int i=(scanCursor+step)%pool->size;
         if (pool->byteMap[i] < 0) continue;
         auto* o = (CObject*)(pool->objects + (size_t)i * kObjectPoolElemSize);
         if (!Shared(o) || (o->GetPosition() - mp).Length2D() > kRange) continue;
         CEntity* d = Dummy(o);
         CVector at = o->GetPosition(), origin = d->GetPosition();
         Thing* t = Find(o->ModelIndex(), origin);
+        bool controlled=Controlled(o);
+        if(controlled&&ControlSource(o)!=Net().MyId())continue;
+        if(controlled&&t&&t->remote){ReleaseMechanism(*t);t->remote=false;}
         if (t && t->remote) {
             // the other game moves it right now, or this copy is behind its last word: as there
             bool driven = t->moving && now - t->updatedMs < kFollowMs;
@@ -171,21 +212,19 @@ void Scan() {
             CatchUp(o, *t, false);  // ours, made again since (streamed out and in): as it was left
             continue;
         }
-        uint8_t stage = StageOf(o);
-        bool moving = Moving(o) && stage < 2, moved = moving || (at - origin).Length() > 0.05f || Turned(o, d);
+        uint8_t stage = controlled?0:StageOf(o);
+        bool moving = controlled||(Moving(o) && stage < 2), moved = moving || (at - origin).Length() > 0.05f || Turned(o, d);
         if (stage == 0 && !moved) continue;  // as the map made it
         if (!t) {
-            g_things.push_back({});
-            t = &g_things.back();
-            t->model = o->ModelIndex();
-            t->origin = origin;
+            t=Remember(o->ModelIndex(),origin);
         }
         bool changed = t->remote || stage != t->stage || moved != t->moved || moving != t->moving ||
                        (moved && !moving && (at - t->pos).Length() > 0.1f);
         if (!changed && !(moving && now - t->sentMs >= 100)) continue;
-        if (sends >= kMaxSendsPerScan) continue;
+        if (sends >= kMaxSendsPerScan){scanCursor=i;break;}
         ++sends;
         if (t->remote) LOGD("World object %d at %.1f,%.1f: ours now", t->model, origin.x, origin.y);
+        t->source=Net().MyId();t->controlled=controlled;t->entityFlags=(uint8_t)(o->Flags()&129u);
         t->remote = t->following = false;
         t->stage = stage;
         t->moved = moved;
@@ -199,10 +238,8 @@ void Scan() {
         Send(*t, changed);
         if (changed && !moving) LOGD("World object %d at %.1f,%.1f: stage %d%s", t->model, origin.x, origin.y, stage, moved ? ", moved" : "");
     }
-    // records nobody needs any more
-    g_things.erase(std::remove_if(g_things.begin(), g_things.end(),
-                                  [&](const Thing& t) { return now - t.updatedMs > kKeepMs; }),
-                   g_things.end());
+    // Keep final states until the authoritative world is reset.
+
 }
 
 // Each game has a copy of the other player, and that copy pushes things too (a mirror car runs a little ahead of the
@@ -216,9 +253,9 @@ bool OursToMove(const CVector& at, uint8_t from) {
 }
 
 void Handle(uint8_t from, Reader& r) {
-    uint16_t model = r.U16();
+    uint16_t model = r.U16();auto tick=r.U32();
     Vec3 o = r.Vec();
-    uint8_t stage = r.U8(), flags = r.U8(), weapon = r.U8();
+    uint8_t stage = r.U8(), flags = r.U8(), weapon = r.U8();uint8_t entityFlags=flags&F_CONTROLLED?r.U8():129;
     Vec3 p{}, s{}, tn{};
     Quat q;
     if (flags & F_MOVED) {
@@ -227,17 +264,23 @@ void Handle(uint8_t from, Reader& r) {
         s = r.Vec();
         tn = r.Vec();
     }
-    if (!r.Ok() || from == Net().MyId() || !core::IsPlayerReady() || stage > 2 || !IsValidModel(model)) return;
+    if (!r.Ok() || from == Net().MyId() || !core::IsPlayerReady() || stage > 2 || (flags&~7u) || !IsValidModel(model) || !(CVector{o.x,o.y,o.z}.Length()<25000) || ((flags&F_MOVED)&&(!(CVector{p.x,p.y,p.z}.Length()<25000)||!(CVector{s.x,s.y,s.z}.Length()<100)))) return;
     ++g_received;
     CVector origin{o.x, o.y, o.z};
     Thing* t = Find(model, origin);
-    if ((flags & F_MOVING) && OursToMove(origin, from)) return;  // our physics moves it; where it lies still comes
+    if (!(flags&F_CONTROLLED)&&(flags & F_MOVING) && OursToMove(origin, from)) return;  // our physics moves it; where it lies still comes
     if (!t) {
-        g_things.push_back({});
-        t = &g_things.back();
-        t->model = model;
-        t->origin = origin;
+        t=Remember(model,origin);
     }
+    if(flags&F_CONTROLLED){
+        // Accept the elected simulator; reset its clock history on handover.
+        auto*pool=ObjectPool();for(int i=0;pool&&i<pool->size;++i)if(pool->byteMap[i]>=0){auto*object=(CObject*)(pool->objects+(size_t)i*kObjectPoolElemSize);auto*d=Dummy(object);
+            if(object->ModelIndex()==model&&d&&Key(model,d->GetPosition())==Key(model,origin)){auto source=ControlSource(object);if(source!=255&&source!=from)return;break;}}
+        if(t->source!=from)t->history.Clear();
+    }
+    if(t->controlled&&!(flags&F_CONTROLLED))ReleaseMechanism(*t);
+    t->source=from;t->controlled=(flags&F_CONTROLLED)!=0;t->entityFlags=entityFlags;
+    if(t->controlled&&!t->history.Push({tick,{p.x,p.y,p.z},q},NowMs()))return;
     t->remote = true;
     t->stage = std::max(t->stage, stage);
     t->moved = (flags & F_MOVED) != 0;
@@ -254,16 +297,18 @@ class WorldObjects : public Module {
 public:
     const char* Name() const override { return "WorldObjects"; }
     void OnInstallHooks() override { Net().SetHandler(proto::G_WORLD_OBJ, &Handle); }
-    void OnSessionEnd() override { g_things.clear(); }
+    void OnSessionEnd() override {for(auto&t:g_things)ReleaseMechanism(t);ClearObjects();}
+    void OnGameShutdown()override{ClearObjects();}
     void OnGameStarted() override {  // a new world: what was broken came back
         for (Thing& t : g_things) t.following = false;
     }
     void OnPeerResync(uint8_t) override {  // its world is new: what both games know goes again
         for (const Thing& t : g_things)
-            if (!t.moving) Send(t, true);
+            if (!t.moving||t.controlled) Send(t, true);
     }
     void OnPostProcess() override {
-        if (!Net().Online() || !core::IsPlayerReady() || NowMs() - g_scanMs < 100) return;
+        if (!Net().Online() || !core::IsPlayerReady())return;FollowMechanisms();
+        if(NowMs()-g_scanMs<100)return;
         g_scanMs = NowMs();
         Scan();
         if ((g_sent || g_received) && NowMs() - g_statsMs >= 10000) {

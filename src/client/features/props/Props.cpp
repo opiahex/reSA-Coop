@@ -255,7 +255,7 @@ void Scan() {
                 bool roadblock = Field<uint8_t>(o, 0x13C) == 3 &&  // OBJECT_TEMPORARY (our copies are 6)
                                  (model == Ref<int16_t>(0x8CD57C) || model == Ref<int16_t>(0x8CD580));  // MI_DYN_ROADBARRIER_6, MI_LA_FUCKCAR1
                 int8_t area = o->AreaCode() == 13 ? 0 : o->AreaCode();  // 13: seen in every area (the roadblock's are)
-                bool poolBall=OwnsNativePoolTable()&&((model>=2995&&model<=3003)||(model>=3100&&model<=3106))&&
+                bool poolBall=IsNativePoolBall(GetObjectRef(o))&&((model>=2995&&model<=3003)||(model>=3100&&model<=3106))&&
                     (o->GetPosition()-me->GetPosition()).Length()<8&&Field<uint8_t>(o,0x13C)!=6;
                 if ((!roadblock&&!poolBall) || RemoteDistance(o->GetPosition(), area) > 150.0f) continue;
                 Prop p;
@@ -287,6 +287,7 @@ void Scan() {
         }
         auto f = std::find_if(found.begin(), found.end(), [&](const auto& x) { return x.first == ow.obj; });
         Prop p;
+        if(ow.pool&&f==found.end()){gone.push_back(id);continue;}
         if (f != found.end()) {
             p = f->second;
             found.erase(f);

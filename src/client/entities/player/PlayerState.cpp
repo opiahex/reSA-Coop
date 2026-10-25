@@ -120,7 +120,7 @@ void OnFootState::Write(Writer& w) const {
     w.VecQ(V(vel), 40.0f);
     w.Angle(rotation);
     w.Angle(aimRotation);
-    w.U8(health);
+    w.U8(health);w.F32(breath);
     w.U8(armour);
     w.U8(weapon);
     w.U16(ammo);
@@ -143,7 +143,7 @@ bool OnFootState::Read(Reader& r) {
     vel = G(r.VecQ(40.0f));
     rotation = game::WrapAngle(r.Angle());
     aimRotation = game::WrapAngle(r.Angle());
-    health = r.U8();
+    health = r.U8();breath=r.F32();if(!std::isfinite(breath)||breath<0||breath>1000000)return false;
     armour = r.U8();
     weapon = r.U8();
     ammo = r.U16();

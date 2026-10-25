@@ -44,6 +44,7 @@
 #include "shared/api/net-session/Session.h"
 #include "shared/config/Config.h"
 #include "shared/game/Game.h"
+#include "shared/game/Anim.h"
 #include "shared/game/Script.h"
 #include "shared/lib/core/Core.h"
 #include "shared/lib/sync/SceneBarrier.h"
@@ -55,6 +56,7 @@
 #include "shared/ui/chat/Chat.h"
 
 namespace coop {
+void AlignSharedSoundtrack(uint32_t milliseconds,bool hard);
 
 namespace {
 using namespace game;
@@ -87,6 +89,7 @@ bool g_personalFlag = false;
 bool g_schoolFlag = false;
 bool g_sceneBypassed=false;
 bool g_saveFlag = false;  // the flag up is PSAVE1's
+int g_storySubtitlePreference=-1;
 uint64_t g_localActivityUntil=0;void*g_localActivityScript=nullptr;
 void StopScriptCamera();
 bool SharedSceneOwnsScreen();
@@ -221,7 +224,7 @@ struct Area {
 };
 
 enum : uint8_t { BLIP_SET = 1, BLIP_REMOVE = 2, BLIP_CLEAR = 3 };
-enum : uint8_t { CS_LOAD = 1, CS_START = 2, CS_END = 3, CS_SKIP_VOTE = 4, CS_SKIP_STATE = 5, CS_SPOT = 6, CS_READY = 7 };
+enum : uint8_t { CS_LOAD = 1, CS_START = 2, CS_END = 3, CS_SKIP_VOTE = 4, CS_SKIP_STATE = 5, CS_SPOT = 6, CS_READY = 7, CS_CLOCK = 8 };
 enum : uint8_t { TXT_MSG = 1, TXT_MSG_Q, TXT_BIG, TXT_BIG_Q, TXT_HELP, TXT_CLEAR, TXT_CLEAR_SMALL };
 enum : uint8_t { FADE_ACTIVE = 1, FADE_WIDE = 2, FADE_BLACK = 4 };
 
@@ -744,7 +747,7 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
         if(chainOp==0x0318)MarkCooperativeStoryPassed();
     }
     auto object=ReadStoryObject(script,opcode);
-    uint8_t before=Field<uint8_t>(script,0xC5);int16_t logic=Field<int16_t>(script,0xD0);bool coop=false;int32_t*killOutput=nullptr;int killModel=-1;
+    uint8_t before=Field<uint8_t>(script,0xC5);int16_t logic=Field<int16_t>(script,0xD0);bool coop=story&&chainOp==0x09C8;int32_t*killOutput=nullptr;int killModel=-1;
     int op=opcode&0x7FFF;int count=(op==0x00A3||op==0x02D6||(op>=0x00EC&&op<=0x00EE))?6:(op==0x00A4||(op>=0x00FE&&op<=0x0100))?8:(op==0x0480||op==0x00E1||op==0x0179||op==0x023B||op==0x031E||op==0x051C||op==0x08FF||op==0x09ED||op==0x06B7||op==0x02D8||op==0x0737||op==0x0364||op==0x031D||op==0x00DB||op==0x00DD||op==0x051A||op==0x0298)?2:(op==0x04C5||op==0x0833||op==0x054E||op==0x0467||op==0x0468||op==0x054F||op==0x0900||op==0x0366||op==0x0297||op==0x00DF)?1:0;
     if((count||op==0x04DC)&&script==g_currentScript&&Field<uint8_t>(script,0xDC)&&Replicating()&&!PersonalActivity(script)){
         alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);uint32_t saved[32];memcpy(saved,(void*)0xA43C78,sizeof saved);
@@ -766,7 +769,10 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
     int mapParams[6]{};bool mapEdit=story&&(chainOp==0x0363||chainOp==0x088D||chainOp==0x03B6);
     if(mapEdit){alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);uint32_t saved[32];memcpy(saved,(void*)0xA43C78,sizeof saved);CallMethod<0x464080>(copy,6);memcpy(mapParams,(void*)0xA43C78,sizeof mapParams);memcpy((void*)0xA43C78,saved,sizeof saved);}
     if(mapEdit)mapEdit=ResolveStoryMapTarget(chainOp,mapParams);
+    auto savedSubtitleSetting=Ref<uint8_t>(0xBA678C);int previousPreference=g_storySubtitlePreference;
+    if(story){g_storySubtitlePreference=savedSubtitleSetting;Ref<uint8_t>(0xBA678C)=1;}
     auto result=g_objectCommands[Group](script,edx,opcode);
+    if(story){Ref<uint8_t>(0xBA678C)=savedSubtitleSetting;g_storySubtitlePreference=previousPreference;}
     if(mapEdit)RecordStoryMapCommand(chainOp,mapParams);
     if(story&&(chainOp==0x015A||chainOp==0x02EB))g_sceneScriptCamera=false;
     if(killOutput)*killOutput=std::clamp<int64_t>((int64_t)*killOutput+CooperativeGuestKills(killModel),0,1000000);
@@ -785,6 +791,7 @@ void InstallStoryObjectCommands(){
     g_objectCommands[9]=Ref<CommandsFn>(0x8A6168+9*4);mem::Put(0x8A6168+9*4,&HookStoryObjects<9>);
     g_objectCommands[10]=Ref<CommandsFn>(0x8A6168+10*4);mem::Put(0x8A6168+10*4,&HookStoryObjects<10>);
     g_objectCommands[11]=Ref<CommandsFn>(0x8A6168+11*4);mem::Put(0x8A6168+11*4,&HookStoryObjects<11>);
+
     g_objectCommands[12]=Ref<CommandsFn>(0x8A6168+12*4);mem::Put(0x8A6168+12*4,&HookStoryObjects<12>);
     g_objectCommands[13]=Ref<CommandsFn>(0x8A6168+13*4);mem::Put(0x8A6168+13*4,&HookStoryObjects<13>);
     g_objectCommands[14]=Ref<CommandsFn>(0x8A6168+14*4);mem::Put(0x8A6168+14*4,&HookStoryObjects<14>);
@@ -940,34 +947,52 @@ uint32_t GxtHashOf(const char* text, bool& mission) {
     return 0;  // not a GXT entry (built by a script or a mod): sent as is
 }
 
-// The partner runs no missions, so its mission table slot holds the host's table (timer and counter labels
-// are looked up by key at draw time too).
-// shortcut: a partner-side script with its own table (gym dumbbells, valet) loses its texts while the host's
-// mission prints; give it a CText of its own if that matters.
-void UseMissionTable(const std::string& table) {
-    static std::string missing;  // not in this game's GXT: don't reload (and clear the messages) for every text
-    if (table.empty() || table == MissionTable() || table == missing) return;
-    char name[9] = {};
-    memcpy(name, table.data(), std::min<size_t>(table.size(), 8));
-    CallMethod<0x69FBF0>((void*)kTheText, (const char*)name);  // CText::LoadMissionText
-    missing = MissionTable() == table ? std::string() : table;
+// Keep the host's translated table independent of local gym/shop scripts.
+// Loading another native CText normally clears all HUD messages: suppress that
+// side effect only during this private, synchronous table read.
+bool g_loadingPrivateText=false;
+using ClearAllFn=void(__cdecl*)(bool);ClearAllFn g_originalClearAll=nullptr;
+void __cdecl PrivateTextClear(bool flag){if(!g_loadingPrivateText)g_originalClearAll(flag);}
+std::map<std::string,std::map<uint32_t,std::string>>g_sharedTranslations;
+std::string g_sharedMissionTable,g_cutsceneTextTable;
+uint8_t g_translationLanguage=255;
+const std::map<uint32_t,std::string>&TranslatedTable(const std::string&table){
+    auto language=Ref<uint8_t>(kTheText+0x20);
+    if(language!=g_translationLanguage){g_sharedTranslations.clear();g_translationLanguage=language;}
+    auto existing=g_sharedTranslations.find(table);if(existing!=g_sharedTranslations.end())return existing->second;
+    auto&out=g_sharedTranslations[table];
+    if(table.empty())return out;
+    alignas(4)uint8_t copy[0xA90];memcpy(copy,(void*)kTheText,sizeof copy);
+    memset(copy+0x10,0,16);memset(copy+0x24,0,8);copy[0x23]=0;
+    char name[9]{};memcpy(name,table.data(),std::min<size_t>(8,table.size()));
+    g_loadingPrivateText=true;CallMethod<0x69FBF0>(copy,(const char*)name);g_loadingPrivateText=false;
+    const auto&keys=Field<GxtKeys>(copy,0x10);
+    for(uint32_t i=0;i<keys.size;++i)if(keys.data[i].text)out[keys.data[i].hash]=keys.data[i].text;
+    CallMethod<0x69F510>(copy+0x10);CallMethod<0x69F640>(copy+0x18);
+    return out;
 }
-
-const char* GxtLocal(uint32_t hash, const std::string& table) {
-    if (!hash) return nullptr;
-    UseMissionTable(table);
-    const GxtKeys& keys = Ref<GxtKeys>(kTheText + (table.empty() ? 0 : 0x10));
-    uint32_t lo = 0, hi = keys.size;  // sorted by hash, as CKeyArray::BinarySearch expects
-    while (lo < hi) {
-        uint32_t mid = (lo + hi) / 2, h = keys.data[mid].hash;
-        if (h == hash) return keys.data[mid].text;
-        if (h < hash) lo = mid + 1;
-        else hi = mid;
+void UseMissionTable(const std::string&table){g_sharedMissionTable=table;TranslatedTable(table);}
+const char*GxtLocal(uint32_t hash,const std::string&table){
+    if(!hash)return nullptr;
+    if(!table.empty()){const auto&keys=TranslatedTable(table);auto i=keys.find(hash);return i==keys.end()?nullptr:i->second.c_str();}
+    const auto&keys=Ref<GxtKeys>(kTheText);uint32_t lo=0,hi=keys.size;
+    while(lo<hi){auto mid=(lo+hi)/2;if(keys.data[mid].hash==hash)return keys.data[mid].text;if(keys.data[mid].hash<hash)lo=mid+1;else hi=mid;}return nullptr;
+}
+using TextGetFn=const char*(__fastcall*)(void*,void*,const char*);TextGetFn g_originalTextGet=nullptr;
+const char*__fastcall SharedTextGet(void*self,void*edx,const char*key){
+    // Script code keeps its own table. Only the remote on-screen counters use
+    // the host table, looked up by the native game at display time.
+    if((uintptr_t)self==kTheText&&Net().Online()&&!Net().IsHost()&&!CurrentScript()&&((g_onscreenSet&&NowMs()>=g_localActivityUntil)||CutsceneRunning())&&key){
+        const auto&keys=TranslatedTable(CutsceneRunning()&&!g_cutsceneTextTable.empty()?g_cutsceneTextTable:g_sharedMissionTable);
+        // CKeyGen::GetUppercaseKey uses GTA's CRC32, not std::hash.
+        auto hash=Call<0x53CF30,uint32_t>(key);auto i=keys.find(hash);if(i!=keys.end())return i->second.c_str();
     }
-    return nullptr;
+    return g_originalTextGet(self,edx,key);
 }
 
 using AddMsgFn = void(__cdecl*)(const char*, uint32_t, uint16_t, bool);
+using AddMsgStringFn=void(__cdecl*)(const char*,uint32_t,uint16_t,const char*,bool);
+AddMsgStringFn g_origMsgString=nullptr,g_origMsgQString=nullptr;
 using AddMsgNumFn = void(__cdecl*)(const char*, uint32_t, uint16_t, int, int, int, int, int, int, bool);
 using AddBigFn = void(__cdecl*)(const char*, uint32_t, uint16_t);
 using AddBigNumFn = void(__cdecl*)(const char*, uint32_t, uint16_t, int, int, int, int, int, int);
@@ -994,7 +1019,16 @@ void ReplayMissionText(uint8_t to){
     }
 }
 
-void SendText(uint8_t kind, const char* text, uint32_t time, uint16_t flag, const int* nums, uint8_t bools) {
+bool g_nativeSubtitle=false,g_textIsSubtitle=false;
+struct SubtitlePacket{std::vector<uint8_t>bytes;uint64_t deadline=0,run=0;uint32_t phase=0;};
+std::vector<SubtitlePacket>g_pendingSubtitles;uint64_t g_replayingSubtitleDeadline=0;
+bool SubtitlesEnabled(){return g_storySubtitlePreference>=0?g_storySubtitlePreference!=0:Ref<uint8_t>(0xBA678C)!=0;}
+std::pair<int,uint32_t>SubtitleAudio();
+bool SubtitleWaiting(int slot,uint32_t token,uint32_t&time);
+bool DialogueBusy();
+void __cdecl NativeSubtitle(const char*t,uint32_t time,uint16_t flag,bool brief);
+void SendText(uint8_t kind, const char* text, uint32_t time, uint16_t flag, const int* nums, uint8_t bools,const char*insert=nullptr) {
+    g_textIsSubtitle=g_nativeSubtitle||((kind==TXT_MSG||kind==TXT_MSG_Q)&&text&&!strncmp(text,"~z~",3));
     if (!Replicating()) return;
     // a running cutscene prints its subtitles itself, outside any script (CCutsceneMgr's text list, AddMessageJumpQ at
     // 0x5B187E), and so does the partner's copy of it: sent too, each line came twice
@@ -1010,7 +1044,7 @@ void SendText(uint8_t kind, const char* text, uint32_t time, uint16_t flag, cons
     w.U8(bools);
     bool mission = false;
     w.U32(text ? GxtHashOf(text, mission) : 0);
-    w.Str(mission ? MissionTable() : std::string(), 8);w.U8(proto::kServerId);
+    w.Str(mission ? MissionTable() : std::string(), 8);w.Bool(g_textIsSubtitle);auto binding=g_textIsSubtitle?SubtitleAudio():std::pair<int,uint32_t>{-1,0};w.I8((int8_t)binding.first);w.U32(binding.second);bool insertMission=false;w.Str(insert?insert:"",399);w.U32(insert?GxtHashOf(insert,insertMission):0);w.Str(insertMission?MissionTable():std::string(),8);w.U8(proto::kServerId);
     if(kind==TXT_CLEAR)g_recentMissionText.clear();
     else if(kind==TXT_CLEAR_SMALL)g_recentMissionText.erase(TXT_MSG);
     else if(kind==TXT_HELP||kind==TXT_MSG||kind==TXT_MSG_Q){
@@ -1023,21 +1057,29 @@ void SendText(uint8_t kind, const char* text, uint32_t time, uint16_t flag, cons
 
 void __cdecl HookMsg(const char* t, uint32_t time, uint16_t flag, bool brief) {
     SendText(TXT_MSG, t, time, flag, nullptr, brief);
-    g_origMsg(t, time, flag, brief);
+    if(!g_textIsSubtitle||SubtitlesEnabled())g_origMsg(t, time, flag, brief);
 }
 void __cdecl HookMsgQ(const char* t, uint32_t time, uint16_t flag, bool brief) {
     SendText(TXT_MSG_Q, t, time, flag, nullptr, brief);
-    g_origMsgQ(t, time, flag, brief);
+    if(!g_textIsSubtitle||SubtitlesEnabled())g_origMsgQ(t, time, flag, brief);
 }
 void __cdecl HookMsgNum(const char* t, uint32_t time, uint16_t flag, int a, int b, int c, int d, int e, int f, bool brief) {
     int n[6] = {a, b, c, d, e, f};
     SendText(TXT_MSG, t, time, flag, n, brief);
-    g_origMsgNum(t, time, flag, a, b, c, d, e, f, brief);
+    if(!g_textIsSubtitle||SubtitlesEnabled())g_origMsgNum(t, time, flag, a, b, c, d, e, f, brief);
 }
 void __cdecl HookMsgQNum(const char* t, uint32_t time, uint16_t flag, int a, int b, int c, int d, int e, int f, bool brief) {
     int n[6] = {a, b, c, d, e, f};
     SendText(TXT_MSG_Q, t, time, flag, n, brief);
-    g_origMsgQNum(t, time, flag, a, b, c, d, e, f, brief);
+    if(!g_textIsSubtitle||SubtitlesEnabled())g_origMsgQNum(t, time, flag, a, b, c, d, e, f, brief);
+}
+void __cdecl HookMsgString(const char*t,uint32_t time,uint16_t flag,const char*insert,bool brief){
+    SendText(TXT_MSG,t,time,flag,nullptr,brief,insert);
+    if(!g_textIsSubtitle||SubtitlesEnabled())g_origMsgString(t,time,flag,insert,brief);
+}
+void __cdecl HookMsgQString(const char*t,uint32_t time,uint16_t flag,const char*insert,bool brief){
+    SendText(TXT_MSG_Q,t,time,flag,nullptr,brief,insert);
+    if(!g_textIsSubtitle||SubtitlesEnabled())g_origMsgQString(t,time,flag,insert,brief);
 }
 // The host's own WASTED and BUSTED (CPlayerInfo::KillPlayer, CGameLogic) are not the mission's: the partner's HUD keeps
 // that style's text until its own player respawns (CHud::ResetWastedText), so it stayed on the partner's screen.
@@ -1076,7 +1118,12 @@ void __cdecl HookClearSmall() {
     g_origClearSmall();
 }
 
+void __cdecl NativeSubtitle(const char*t,uint32_t time,uint16_t flag,bool brief){
+    if(!SubtitlesEnabled())return;
+    g_nativeSubtitle=true;HookMsgQ(t,time,flag,brief);g_nativeSubtitle=false;
+}
 void HandleText(uint8_t from, Reader& r) {
+    auto*packetStart=r.Cursor();auto packetSize=r.Remaining();
     uint8_t kind = r.U8();
     std::string text = r.Str(399);
     uint32_t time = r.U32();
@@ -1088,9 +1135,22 @@ void HandleText(uint8_t from, Reader& r) {
     uint8_t bools = r.U8();
     uint32_t hash = r.U32();
     std::string table = r.Str(8);
+    bool subtitle=r.Bool();int slot=r.I8();auto token=r.U32();auto insert=r.Str(399);auto insertHash=r.U32();auto insertTable=r.Str(8);
     auto to=r.U8();if(to!=proto::kServerId&&to!=Net().MyId())return;
     if (!r.Ok() || from != Net().HostId() || Net().IsHost() || !core::IsPlayerReady() || !flow::InHostWorld()) return;
+    if(subtitle&&!SubtitlesEnabled())return;
+    if(subtitle&&SubtitleWaiting(slot,token,time)){
+        auto deadline=g_replayingSubtitleDeadline?g_replayingSubtitleDeadline:NowMs()+15000;
+        if(NowMs()<deadline)g_pendingSubtitles.push_back({std::vector<uint8_t>(packetStart,packetStart+packetSize),deadline,StoryRunId(),CooperativeStoryPhase()});
+        return;
+    }
+    if(subtitle&&token&&!time)return;
+    if(kind==TXT_CLEAR_SMALL&&DialogueBusy())return;
+    if(kind==TXT_CLEAR){g_pendingSubtitles.clear();}
     if (const char* own = GxtLocal(hash, table)) text = own;
+    if(const char*own=GxtLocal(insertHash,insertTable))insert=own;
+    if(!insert.empty()){size_t pos=0;while((pos=text.find("~1~",pos))!=std::string::npos){text.replace(pos,3,insert);pos+=insert.size();if(text.size()>399){text.resize(399);break;}}}
+    if(subtitle)LOGD("Subtitle displayed slot=%d token=%u duration=%u",slot,token,time);
     const char* t = text.empty() ? nullptr : PoolText(text);
     switch (kind) {
     case TXT_MSG:
@@ -1306,6 +1366,7 @@ using LoadCutsceneFn = void(__cdecl*)(const char*);
 LoadCutsceneFn g_origLoadCutscene = nullptr;
 VoidFn g_origStartCutscene = nullptr;
 
+uint64_t g_sceneClockReceived=0,g_sceneClockSent=0;float g_sceneClockSeconds=0;uint32_t g_sceneClockSequence=0,g_sceneClockLatest=0,g_sceneMapRevision=0;
 void SendCutscene(uint8_t op, const char* name = "", int32_t area = 0, uint8_t to = proto::kServerId) {
     Writer w(proto::G_CUTSCENE);
     w.U8(op);
@@ -1313,6 +1374,8 @@ void SendCutscene(uint8_t op, const char* name = "", int32_t area = 0, uint8_t t
     w.I32(area);
     w.U8(to);
     w.U32(Net().IsHost() ? g_sceneBarrier.generation : g_sceneToken);
+    if(op==CS_LOAD){w.Str(MissionTable(),8);w.U32(StoryWorldRevision());}
+    if(op==CS_START||op==CS_CLOCK){w.U32(++g_sceneClockSequence);w.F32(CutsceneRunning()?Ref<float>(0xBC3F08):0.f);}
     Net().Send(proto::CH_RELIABLE, w);
 }
 // the host's choice of the partner's spot for a shot, and when (the camera's clock) the shot begins
@@ -1638,6 +1701,7 @@ void HandleCutscene(uint8_t from, Reader& r) {
     }
     if(!flow::InHostWorld())return;
     if (op == CS_LOAD) {
+        auto table=r.Str(8);auto mapRevision=r.U32();if(!r.Ok())return;g_sceneMapRevision=mapRevision;g_cutsceneTextTable=table;TranslatedTable(table);
         if (token == g_sceneToken && g_csState != 0) return;
         StopScriptCamera();
         g_sceneToken = token;
@@ -1674,7 +1738,11 @@ void HandleCutscene(uint8_t from, Reader& r) {
         g_csStartRequested = false;
     } else if (token != g_sceneToken) {
         return;
-    } else if (op == CS_START) {
+    } else if (op == CS_START||op==CS_CLOCK) {
+        auto seq=r.U32();float seconds=r.F32();
+        if(!r.Ok()||!std::isfinite(seconds)||seconds<0||seconds>7200||token!=g_sceneToken||(g_sceneClockLatest&&(int32_t)(seq-g_sceneClockLatest)<=0))return;
+        g_sceneClockLatest=seq;g_sceneClockSeconds=seconds;g_sceneClockReceived=NowMs();
+        if(op==CS_CLOCK)return;
         if(g_sceneBypassed)return;
         g_csStartRequested = true;
         g_csArea = area;
@@ -1706,7 +1774,29 @@ void UpdatePartnerCutscene() {
             HandleCutscene(Net().HostId(), r);
         }
     }
-    if (g_csState == 1 && !g_sceneReadySent && Ref<int32_t>(kCutsceneLoadStatus) == 2) {
+    if(g_csState==2&&CutsceneRunning()&&g_sceneClockReceived&&NowMs()-g_sceneClockReceived<3000){
+        float target=g_sceneClockSeconds+(NowMs()-g_sceneClockReceived+std::min<uint32_t>(Net().Rtt()/2,500))/1000.f;
+        auto&clock=Ref<float>(0xBC3F08);float error=target-clock;
+        if(std::fabs(error)>.12f){
+            bool hard=std::fabs(error)>1.f;float corrected=hard?target:clock+std::clamp(error,-.035f,.035f);
+            clock=std::max(0.f,corrected);
+            auto length=CallMethod<0x50AD90,uint32_t>((void*)addr::TheCamera);
+            if(length)CallMethod<0x50C070>((void*)addr::TheCamera,std::clamp(clock*100000.f/length,0.f,100.f));
+            for(int i=0;i<std::clamp(Ref<int32_t>(kNumCutsceneObjects),0,50);++i)if(auto*o=Ref<CEntity*>(kCutsceneObjects+i*4);o&&o->RwObject()&&Field<uint8_t>(o->RwObject(),0)==2)
+                for(void*a=anim::First(o->RwObject());a;a=anim::Next(a))if(auto*h=anim::Hierarchy(a)){
+                    float duration=anim::TotalTime(h);if(duration<=0)continue;float t=clock*anim::Speed(a);
+                    anim::SetCurrentTime(a,(anim::Flags(a)&anim::F_LOOPED)?std::fmod(t,duration):std::min(t,std::max(0.f,duration-.001f)));
+                }
+            // Skip obsolete subtitle starts after a seek; retain the line at
+            // the destination instead of replaying every missed line in turn.
+            int count=std::clamp(Ref<int32_t>(0xBC3FEC),0,64),next=0;int ms=(int)(clock*1000);
+            while(next<count&&Ref<int32_t>(0xBC2EC0+next*4)+Ref<int32_t>(0xBC2DC0+next*4)<ms)++next;
+            if(hard)Ref<int32_t>(0xBC3FF0)=next;
+            AlignSharedSoundtrack((uint32_t)ms,hard);
+            if(hard)LOGI("Cutscene timeline restored at=%.3f error=%.3f",clock,error);
+        }
+    }
+    if (g_csState == 1 && !g_sceneReadySent && Ref<int32_t>(kCutsceneLoadStatus) == 2 && StoryWorldReady(g_sceneMapRevision,Ref<CVector>(kCutsceneOffset))) {
         g_sceneReadySent = true;
         SendCutscene(CS_READY, "", 0, Net().HostId());
     }
@@ -1738,6 +1828,27 @@ bool SharedAudioSlot(uint8_t slot) {
 uint32_t g_hostAudioToken[4] = {};
 int g_hostAudio[4] = {-1, -1, -1, -1};
 bool g_hostAudioPlaying[4] = {};
+uint64_t g_hostAudioStamp[4]{};
+std::pair<int,uint32_t>SubtitleAudio(){
+    int slot=-1;uint64_t latest=0;
+    for(int i=0;i<4;++i)if(g_hostAudio[i]>=0&&g_hostAudioStamp[i]>latest&&NowMs()-g_hostAudioStamp[i]<15000&&(!g_hostAudioPlaying[i]||!CallMethod<0x5072C0,bool>((void*)0xB6BC90,(uint8_t)i))){slot=i;latest=g_hostAudioStamp[i];}
+    return {slot,slot<0?0:g_hostAudioToken[slot]};
+}
+bool SubtitleWaiting(int slot,uint32_t token,uint32_t&time){
+    if(slot<0||slot>=4||!token)return false;
+    const auto&q=g_audioSlots[slot];
+    for(const auto&c:q.clips)if(c.token==token){if(!c.started||!c.observedPlaying)return true;auto age=NowMs()-c.startedAt;time=age<time?time-(uint32_t)age:1500;return false;}
+    if(q.latest&&(int32_t)(token-q.latest)<=0){time=0;return false;}
+    return true;
+}
+bool DialogueBusy(){for(auto&q:g_audioSlots)if(!q.clips.empty()&&q.clips.front().play)return true;return !g_pendingSubtitles.empty();}
+void UpdateSubtitles(){
+    auto pending=std::move(g_pendingSubtitles);g_pendingSubtitles.clear();
+    for(auto&p:pending)if(NowMs()<p.deadline&&p.run==StoryRunId()&&p.phase==CooperativeStoryPhase()){
+        g_replayingSubtitleDeadline=p.deadline;Reader r(p.bytes.data(),p.bytes.size());HandleText(Net().HostId(),r);
+    }
+    g_replayingSubtitleDeadline=0;
+}
 std::vector<std::vector<uint8_t>> g_pendingAudio;
 using LoadAudioFn = void(__fastcall*)(void*, void*, uint8_t, int32_t);
 using SlotAudioFn = void(__fastcall*)(void*, void*, uint8_t);
@@ -1768,7 +1879,7 @@ void __fastcall HookLoadAudio(void* audio, void* edx, uint8_t slot, int32_t even
     g_origLoadAudio(audio, edx, slot, event);
     if (!Net().Online() || !Net().IsHost() || slot >= 4 || PersonalActivity(g_currentScript)) return;
     if (++g_hostAudioToken[slot] == 0) ++g_hostAudioToken[slot];
-    g_hostAudio[slot] = event;
+    g_hostAudio[slot] = event;g_hostAudioStamp[slot]=NowMs();
     g_hostAudioTarget[slot] = {};
     g_hostAudioPlaying[slot] = false;
     if (Replicating()) SendMissionAudio(1, slot, event);
@@ -1777,7 +1888,7 @@ void __fastcall HookPlayAudio(void* audio, void* edx, uint8_t slot) {
     if(SharedAudioSlot(slot))return;
     g_origPlayAudio(audio, edx, slot);
     if (slot < 4 && Net().IsHost() && !PersonalActivity(g_currentScript)) {
-        g_hostAudioPlaying[slot] = true;
+        g_hostAudioPlaying[slot] = true;g_hostAudioStamp[slot]=NowMs();
         if (Replicating() && g_hostAudio[slot] >= 0) SendMissionAudio(2, slot, g_hostAudio[slot]);
     }
 }
@@ -1820,7 +1931,7 @@ void HandleMissionAudio(uint8_t from, Reader& r) {
     if(op==5){
         std::array<uint32_t,4>limits;for(auto&t:limits)t=r.U32();
         if(!r.Ok()||from!=Net().HostId()||Net().IsHost())return;
-        if(!core::IsPlayerReady()||flow::GetPhase()==flow::Phase::LoadingWorld){if(g_pendingAudio.size()<128)g_pendingAudio.push_back(std::move(packet));return;}
+        if(!core::IsPlayerReady()||flow::GetPhase()==flow::Phase::LoadingWorld){g_pendingAudio.push_back(std::move(packet));return;}
         for(uint8_t i=0;i<4;++i){auto&q=g_audioSlots[i];bool loaded=!q.clips.empty()&&q.clips.front().loaded;
             if(q.CancelThrough(limits[i])&&loaded&&NowMs()>=g_localActivityUntil)g_origClearAudio((void*)0xB6BC90,nullptr,i);
             for(auto it=g_audioTargets[i].begin();it!=g_audioTargets[i].end();)it=(int32_t)(it->first-limits[i])<=0?g_audioTargets[i].erase(it):std::next(it);
@@ -1893,7 +2004,7 @@ void UpdateMissionAudio() {
             LOGI("Host dialogue %d plays in slot %u (token %u)", a.event, slot, a.token);
         }
     }
-    g_applyingAudio=false;
+    g_applyingAudio=false;UpdateSubtitles();
 }
 
 // Some story scenes use a fixed SCM camera rather than CCutsceneMgr (car conversations, mission outros).
@@ -2507,7 +2618,7 @@ void MissionsResync(uint8_t player) {
     HostSendMarked(true);
     g_lastAreasMsg.clear();
     g_lastOnscreen.clear();
-    for (uint8_t slot = 0; slot < 4; ++slot) if (g_hostAudio[slot] >= 0) {
+    for (uint8_t slot = 0; slot < 4; ++slot) if (g_hostAudio[slot] >= 0&&(!g_hostAudioPlaying[slot]||!CallMethod<0x5072C0,bool>((void*)0xB6BC90,slot))) {
         SendMissionAudio(1, slot, g_hostAudio[slot], player);
         if (g_hostAudioPlaying[slot]) SendMissionAudio(2, slot, g_hostAudio[slot], player);
     }
@@ -2575,8 +2686,13 @@ public:
         mem::RedirectCallFn(0x484361, &HookScriptClearArea, &g_origClearArea);  // CLEAR_AREA (opcode 0395)
         mem::HookFn(0x609590, &HookCanPlayerStartMission, &g_origCanStart, "CPlayerPed::CanPlayerStartMission");
         mem::HookFn(0x464C20, &HookStartNewScript, &g_origStartScript, "CTheScripts::StartNewScript");
+        {AddMsgFn previous=nullptr;mem::RedirectCallFn(0x5B187E,&NativeSubtitle,&previous);}
+        mem::HookFn(0x69EDC0,&PrivateTextClear,&g_originalClearAll,"CText private table HUD preservation");
+        mem::HookFn(0x6A0050,&SharedTextGet,&g_originalTextGet,"CText independent mission translations");
         mem::HookFn(0x69F0B0, &HookMsg, &g_origMsg, "CMessages::AddMessage");
         mem::HookFn(0x69F1E0, &HookMsgQ, &g_origMsgQ, "CMessages::AddMessageJumpQ");
+        mem::HookFn(0x69E800,&HookMsgString,&g_origMsgString,"CMessages::AddMessageWithStringQ");
+        mem::HookFn(0x69E950,&HookMsgQString,&g_origMsgQString,"CMessages::AddMessageJumpQWithString");
         mem::HookFn(0x69E360, &HookMsgNum, &g_origMsgNum, "CMessages::AddMessageWithNumber");
         mem::HookFn(0x69E4E0, &HookMsgQNum, &g_origMsgQNum, "CMessages::AddMessageJumpQWithNumber");
         mem::HookFn(0x69F2B0, &HookBig, &g_origBig, "CMessages::AddBigMessage");
@@ -2615,6 +2731,9 @@ public:
         Net().SetHandler(proto::G_STORY_CONTACTS,&HandleContacts);
     }
 
+    void OnPreProcess() override {
+        if (core::IsPlayerReady() && Net().Online() && !Net().IsHost()) PlacePartnerMarkers();
+    }
     void OnPostProcess() override {
         if (!core::IsPlayerReady()) return;
         HealInheritedFlag();  // in a game of one's own too: such a save is broken there as well
@@ -2676,6 +2795,9 @@ public:
 private:
     static void Reset() {
         g_contacts.clear();g_contactHistory.clear();g_contactCopies.clear();g_contactsSent=g_contactsApplied=0;
+        g_sceneClockReceived=g_sceneClockSent=0;g_sceneClockLatest=g_sceneClockSequence=0;
+        g_pendingSubtitles.clear();
+        g_sharedTranslations.clear();g_sharedMissionTable.clear();g_cutsceneTextTable.clear();g_translationLanguage=255;
         g_missionPayout=0;g_inheritedFlagMs=0;g_sceneBypassed=false;
         g_missionRevision=g_partnerRevision=0;g_missionHeartbeat=0;g_recentMissionText.clear();
         g_pendingAudio.clear();for(auto&targets:g_audioTargets)targets.clear();
@@ -2815,6 +2937,7 @@ private:
         HostSkipUpdate();
         // cutscene end
         bool cs = CutsceneRunning() && g_sharedScene;
+        if(cs&&NowMs()-g_sceneClockSent>=500){SendCutscene(CS_CLOCK);g_sceneClockSent=NowMs();}
         if (g_hostCutscene && !cs) {
             SendCutscene(CS_END);
             // The next scene uses the story's actual CJ position. A guest may
@@ -2883,6 +3006,16 @@ private:
         }
     }
 
+    static void PlacePartnerMarkers() {
+        // C3dMarkers::Update activates these during the game's process, before rendering.
+        if (g_hostWaits) g_origHighlight(g_waitArea.id, g_waitArea.x1, g_waitArea.y1, g_waitArea.x2, g_waitArea.y2, g_waitArea.z);
+        if (NowMs() - g_partnerAreasMs < 1000)
+            for (const Area& a : g_partnerAreas) {
+                if (a.kind == AREA_SPHERE) DrawSphere(a.id ^ 0x40000000u, a);
+                else g_origHighlight(a.id ^ 0x40000000u, a.x1, a.y1, a.x2, a.y2, a.z);
+            }
+    }
+
     static void PartnerUpdate() {
         UpdatePartnerCutscene();
         static uint64_t withoutScene=0;
@@ -2897,13 +3030,6 @@ private:
             if (FadeAlpha() > 1.0f) Fade(0.25f, 1);
             g_weFaded = false; g_blackSince = 0; g_blackExpired = true;
         }
-        if (g_hostWaits) g_origHighlight(g_waitArea.id, g_waitArea.x1, g_waitArea.y1, g_waitArea.x2, g_waitArea.y2, g_waitArea.z);
-        // markers are drawn every frame while the host keeps them (stale after 1 s: host gone/paused)
-        if (NowMs() - g_partnerAreasMs < 1000)
-            for (const Area& a : g_partnerAreas) {
-                if (a.kind == AREA_SPHERE) DrawSphere(a.id ^ 0x40000000u, a);
-                else g_origHighlight(a.id ^ 0x40000000u, a.x1, a.y1, a.x2, a.y2, a.z);
-            }
         // entity blips whose mirror appeared later
         static uint64_t last = 0;
         if (NowMs() - last > 500) {

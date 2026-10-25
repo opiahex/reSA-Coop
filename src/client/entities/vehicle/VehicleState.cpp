@@ -22,7 +22,7 @@ VehicleState VehicleState::Capture(game::CVehicle* v) {
     s.steer = v->SteerAngle();
     s.gas = v->GasPedal();
     s.brake = v->BrakePedal();
-    s.health = v->Health();
+    s.health = v->Health();s.water=((v->PhysicalFlags()&0x100u)?1:0)|((v->VehicleFlagsLo()&0x40000000u)?2:0);
     s.flags = (v->EngineOn() ? F_ENGINE : 0) | (v->LightsOn() ? F_LIGHTS : 0) | (v->SirenOn() ? F_SIREN : 0) |
               (v->Status() == 5 ? F_WRECKED : 0) | (v->HandbrakeOn() ? F_HANDBRAKE : 0) | (!v->IsVisible() ? F_HIDDEN : 0);
     s.wheels=WheelState::Capture(v);
@@ -65,7 +65,7 @@ void VehicleState::Write(Writer& w) const {
     w.SUnit8(gas);
     w.Unit8(brake);
     w.U16((uint16_t)std::clamp(health, 0.0f, 65535.0f));
-    w.U8(flags);
+    w.U8(flags);w.U8(water);
     w.U8(lock);
     w.I8(area);
     w.U8(extras);
@@ -91,7 +91,7 @@ bool VehicleState::Read(Reader& r) {
     gas = r.SUnit8();
     brake = r.Unit8();
     health = (float)r.U16();
-    flags = r.U8();
+    flags = r.U8();water=r.U8();if(water>3)return false;
     lock = r.U8();
     area=r.I8();
     extras = r.U8();

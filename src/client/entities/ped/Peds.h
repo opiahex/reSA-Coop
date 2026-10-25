@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include "shared/lib/sync/SpawnWait.h"
 #include "shared/lib/sync/IdAllocator.h"
 #include <map>
 #include <string>
@@ -71,6 +72,7 @@ struct NetPed {
     // mirror side
     bool hasState = false;
     bool pendingAdoption=false;
+    SpawnWait spawnWait;
     bool awayHeld=false,awayGravity=false;
     uint32_t awayPhysicsMask=0;
     PedSyncState state;

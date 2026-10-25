@@ -598,7 +598,7 @@ void FillCommon(OnFootState& st, CPlayerPed* me) {
     st.fightingStyle = me->FightingStyle();
     st.attackMoves = me->AllowedAttackMoves();
     st.flags = me->Health() <= 0 || me->PedState() == 54 || me->PedState() == 55 ? OnFootState::F_DEAD : 0;
-    st.health = ClampByte(me->Health());
+    st.health = ClampByte(me->Health());st.breath=me->PlayerData()?std::clamp(Field<float>(me->PlayerData(),0x44),0.f,1000000.f):1000.f;
     st.wanted = WantedLevel(me);
     st.policeFlags = PoliceFlags(me);
     st.armour = ClampByte(me->Armour());
@@ -631,7 +631,7 @@ void FillCommon(OnFootState& st, CPlayerPed* me) {
 void WriteCommon(Writer& w, const OnFootState& st) {
     st.pad.Write(w);
     st.cam.Write(w);
-    w.U8(st.health);
+    w.U8(st.health);w.F32(st.breath);
     w.U8(st.armour);
     w.U8(st.weapon);
     w.U16(st.ammo);
@@ -647,7 +647,7 @@ void WriteCommon(Writer& w, const OnFootState& st) {
 bool ReadCommon(Reader& r, OnFootState& st) {
     st.pad.Read(r);
     st.cam.Read(r);
-    st.health = r.U8();
+    st.health = r.U8();st.breath=r.F32();if(!std::isfinite(st.breath)||st.breath<0||st.breath>1000000)return false;
     st.armour = r.U8();
     st.weapon = r.U8();
     st.ammo = r.U16();
@@ -955,6 +955,7 @@ void Players::SpawnRemote(RemotePlayer& rp) {
     ped->SetStreamingDontDelete(true);
     Cmd(0x039E).I(handle).I(0).Run();  // allow native car-jacking responses
     ped->AreaCode() = rp.state.area;
+    rp.spawnedAt=NowMs();
     rp.ped = ped;
     CallMethod<0x571B70>(ped, (CEntity**)&rp.ped);
     rp.pedHandle = handle;
@@ -1216,6 +1217,7 @@ void Players::ApplyState(RemotePlayer& rp) {
     }
 
     ped->Health() = (float)st.health;
+    if(ped->PlayerData())Field<float>(ped->PlayerData(),0x44)=st.breath;
     ped->Armour() = (float)st.armour;
     // ScenePartner owns these native peds for the cutscene. Old seat, phone,
     // weapon and jetpack tasks must not replace its staged animation.
@@ -1670,7 +1672,7 @@ void Players::CaptureMotion(OnFootState& st,CPlayerPed* ped,uint32_t seatKey) {
     if(!ped->InVehicle()) {
         if(auto*task=anim::FindTask(ped,1304)) {
             m.kind=MotionState::SWIM;m.phase=(uint8_t)std::min<uint16_t>(5,Field<uint16_t>(task,0xA));
-            m.pitch=Field<float>(task,0x28);m.roll=Field<float>(task,0x2C);st.flags|=OnFootState::F_SWIMMING;
+            m.pitch=Field<float>(task,0x24);m.roll=Field<float>(task,0x28);m.torsoPitch=Field<float>(task,0x2C);m.swimHeading=Field<float>(task,0x30);st.flags|=OnFootState::F_SWIMMING;
         }else if(auto*task=anim::FindTask(ped,254)) {
             m.kind=MotionState::CLIMB;m.phase=Field<uint8_t>(task,0xD);
         }else if(ped->ActiveWeapon().type==46&&ped->IsInTheAir())m.kind=MotionState::PARACHUTE;
@@ -1776,7 +1778,7 @@ void Players::SendLocalState() {
     st.vel = me->MoveSpeed() * 50.0f;
     st.rotation = me->CurrentRotation();
     st.aimRotation = me->AimingRotation();
-    st.health = ClampByte(me->Health());
+    st.health = ClampByte(me->Health());st.breath=me->PlayerData()?std::clamp(Field<float>(me->PlayerData(),0x44),0.f,1000000.f):1000.f;
     st.armour = ClampByte(me->Armour());
     CWeapon& w = me->ActiveWeapon();
     st.weapon = (uint8_t)w.type;

@@ -28,7 +28,8 @@ struct DialogueQueue {
         latest = token;
         // An unused preload may be replaced; a line with a PLAY request may not.
         if (!clips.empty() && !clips.back().play) clips.pop_back();
-        if (clips.size() >= 16) return;
+        // Requested lines retire/cancel explicitly; a loading guest must not
+        // silently lose the seventeenth spoken line.
         clips.push_back({event, token, op == 2, false, false, false, now, 0});
     }
     bool Retire(uint64_t now, bool finished) {

@@ -21,6 +21,7 @@
 #include "shared/game/Transform.h"
 #include "shared/lib/core/Core.h"
 #include "shared/lib/sync/EventWindow.h"
+#include "shared/lib/sync/SnapshotBuffer.h"
 #include "shared/lib/memory/Memory.h"
 
 namespace coop {
@@ -248,9 +249,10 @@ struct Flight {
     uint8_t kind=0;uint16_t id=0;bool authority=false;
     uint32_t token=0;uint64_t created=0;
     CVector lastPos;
-    int handle=-1;uint8_t from=255;uint64_t creatorGeneration=0;int weapon=0;
+    int handle=-1;uint8_t from=255;uint64_t creatorGeneration=0;int weapon=0;uint64_t flightSent=0;uint8_t sentTargetKind=255;uint16_t sentTarget=0;
 };
 void RetireProjectile(uint8_t from,uint32_t token);
+void SendFlightGone(const Flight&flight);
 void ClearReplicaProjectiles(uint8_t from);
 std::deque<Flight> g_flights;
 using RemoveProjectileFn=void(__cdecl*)(void*,CPhysical*);
@@ -258,6 +260,7 @@ RemoveProjectileFn g_origRemoveProjectile=nullptr;
 CPhysical*g_detonatingProjectile=nullptr;
 void __cdecl HookRemoveProjectile(void*info,CPhysical*object){
     struct Restore{CPhysical*saved=g_detonatingProjectile;~Restore(){g_detonatingProjectile=saved;}} restore;
+    for(auto&f:g_flights)if(f.object==object&&f.authority)SendFlightGone(f);
     g_detonatingProjectile=object;g_origRemoveProjectile(info,object);
 }
 // Copy authority belongs to this projectile, never to its creator's current owner.
@@ -435,7 +438,9 @@ void RetireProjectile(uint8_t from,uint32_t token){
 void ClearReplicaProjectiles(uint8_t from){
     for(auto i=g_flights.begin();i!=g_flights.end();)if(i->from==from&&!i->authority){RemoveFlightCopy(*i);i=g_flights.erase(i);}else ++i;
 }
+bool FlightEnded(uint8_t from,uint32_t token);
 bool ReplayProjectile(const PendingProjectile&p){
+    if(FlightEnded(p.from,p.sequence))return true;
     auto*creator=SourceValid(p.kind,p.id,p.refs)?Resolve(p.kind,p.id):nullptr;
     if(p.kind==ON_SPOT){auto*rp=Players::Instance().Get(p.from);creator=rp?rp->ped:nullptr;}
     if(!creator)return false;
@@ -501,13 +506,59 @@ void RetryCombat(){
     for(auto i=g_flights.begin();i!=g_flights.end();){
         bool active=false;
         for(int n=0;n<32;++n)if(Ref<CPhysical*>(kProjectiles+n*4)==i->object&&Ref<uint8_t>(kProjectileInfos+n*0x24+0x10)&&i->handle>=0&&GetObject(i->handle)==i->object)active=true;
-        if(!active||(i->weapon!=39&&NowMs()-i->created>30000))i=g_flights.erase(i);else {i->lastPos=i->object->GetPosition();++i;}
+        if(!active||(i->weapon!=39&&NowMs()-i->created>30000)){if(i->authority)SendFlightGone(*i);i=g_flights.erase(i);}else {i->lastPos=i->object->GetPosition();++i;}
     }
 }
 
 // ---------------------------------------------------------------- water cannons
 // A fire truck's or a SWAT van's water jet (CWaterCannons::UpdateOne each frame it shoots) shoots from the other game's
 // copy of the vehicle too, and puts out and knocks down there what it reaches.
+bool Guided(int weapon){return weapon==19||weapon==20||weapon==58;}
+using FlightKey=std::pair<uint8_t,uint32_t>;
+struct FlightPose{uint32_t time=0;CVector pos,speed;Quat rot;};
+struct FlightCopy{SnapshotBuffer<FlightPose>poses;uint64_t received=0;uint8_t targetKind=255;uint16_t target=0;};
+std::map<FlightKey,FlightCopy>g_flightCopies;std::map<FlightKey,uint64_t>g_flightEnded;
+bool FlightEnded(uint8_t from,uint32_t token){return g_flightEnded.count({from,token})!=0;}
+void SendFlightGone(const Flight&f){if(!Guided(f.weapon))return;Writer w(proto::G_PROJECTILE_FLIGHT);w.U8(2);w.U32(f.token);Net().Send(proto::CH_RELIABLE,w);}
+void FlightMessage(uint8_t from,Reader&r){
+    auto op=r.U8();auto token=r.U32();if(from>=3||!token)return;FlightKey key{from,token};
+    if(op==2){if(!r.Ok())return;LOGD("Guided flight retired source=%u token=%u",from,token);g_flightEnded[key]=NowMs();g_flightCopies.erase(key);RetireProjectile(from,token);return;}
+    if(op!=1)return;FlightPose pose;pose.time=r.U32();auto p=r.Vec(),v=r.Vec();pose.pos={p.x,p.y,p.z};pose.speed={v.x,v.y,v.z};pose.rot.Read(r);auto kind=r.U8();auto target=r.U16();
+    if(!r.Ok()||g_flightEnded.count(key)||kind>ON_PLAYER||!(pose.pos.Length()<25000)||!(pose.speed.Length()<150))return;
+    auto&copy=g_flightCopies[key];if(!copy.poses.Push(pose,NowMs()))return;copy.received=NowMs();if(copy.targetKind!=kind||copy.target!=target)LOGD("Guided flight target received source=%u token=%u target=%u:%04X",from,token,kind,target);copy.targetKind=kind;copy.target=target;
+}
+using ProjectileUpdateFn=void(__cdecl*)();ProjectileUpdateFn originalProjectileUpdate=nullptr;
+void __cdecl ProjectileUpdate(){
+    // Replicas follow the owner's trajectory. Local guidance/collision/fuse
+    // decisions must not consume a copy before the authoritative retirement.
+    std::vector<std::pair<int,CPhysical*>>held;
+    for(auto&f:g_flights)if(!f.authority&&Guided(f.weapon)&&GetObject(f.handle)==f.object){
+        f.object->Flags()&=~1u;
+        for(int i=0;i<32;++i)if(Ref<CPhysical*>(kProjectiles+i*4)==f.object&&Ref<uint8_t>(kProjectileInfos+i*0x24+0x10)){
+            Ref<uint8_t>(kProjectileInfos+i*0x24+0x10)=0;held.push_back({i,f.object});break;
+        }
+    }
+    originalProjectileUpdate();
+    for(auto[i,p]:held)if(Ref<CPhysical*>(kProjectiles+i*4)==p)Ref<uint8_t>(kProjectileInfos+i*0x24+0x10)=1;
+}
+void SyncFlights(){
+    for(auto&f:g_flights)if(Guided(f.weapon)&&GetObject(f.handle)==f.object){
+        if(f.authority){
+            if(NowMs()-f.flightSent<100)continue;f.flightSent=NowMs();CEntity*target=nullptr;
+            for(int i=0;i<32;++i)if(Ref<CPhysical*>(kProjectiles+i*4)==f.object){target=Ref<CEntity*>(kProjectileInfos+i*0x24+8);break;}
+            uint8_t kind=ON_SPOT;uint16_t id=0;if(!DescribeAny(target,kind,id))kind=ON_SPOT;
+            if(f.sentTargetKind!=kind||f.sentTarget!=id){LOGD("Guided flight target sent token=%u target=%u:%04X",f.token,kind,id);f.sentTargetKind=kind;f.sentTarget=id;}
+            auto p=f.object->GetPosition(),v=f.object->MoveSpeed();Writer w(proto::G_PROJECTILE_FLIGHT);w.U8(1);w.U32(f.token);w.U32((uint32_t)NowMs());w.Vec({p.x,p.y,p.z});w.Vec({v.x,v.y,v.z});
+            Quat q;if(f.object->Matrix())q=Quat::FromMatrix(*f.object->Matrix());q.Write(w);w.U8(kind);WriteSource(w,kind,id,true);Net().Send(proto::CH_STATE,w);
+        }else if(auto i=g_flightCopies.find({f.from,f.token});i!=g_flightCopies.end()&&NowMs()-i->second.received<1500){
+            auto p=i->second.poses.At(NowMs(),[](const FlightPose&a,const FlightPose&b,float t){return FlightPose{b.time,a.pos+(b.pos-a.pos)*t,a.speed+(b.speed-a.speed)*t,Quat::Slerp(a.rot,b.rot,t)};},[](FlightPose&p,float dt,bool stale){if(!stale)p.pos=p.pos+p.speed*(dt*50);else p.speed={};});
+            SetEntityPosition(f.object,p.pos);f.object->MoveSpeed()=p.speed;if(f.object->Matrix())p.rot.ToMatrix(*f.object->Matrix());
+        }
+    }
+    for(auto i=g_flightCopies.begin();i!=g_flightCopies.end();)i=NowMs()-i->second.received>5000?g_flightCopies.erase(i):std::next(i);
+    for(auto i=g_flightEnded.begin();i!=g_flightEnded.end();)i=NowMs()-i->second>30000?g_flightEnded.erase(i):std::next(i);
+}
+
 struct Jet {
     CVector offset,speed;uint64_t ms=0,generation=0;uint32_t sequence=0;uint8_t owner=255;bool active=false;
 };
@@ -587,6 +638,8 @@ public:
         Net().SetHandler(proto::G_EXPLOSION, &HandleExplosion);
         mem::HookFn(0x737C80, &HookAddProjectile, &g_origAddProjectile, "CProjectileInfo::AddProjectile");
         Net().SetHandler(proto::G_PROJECTILE, &HandleProjectile);
+        Net().SetHandler(proto::G_PROJECTILE_FLIGHT,&FlightMessage);
+        mem::HookFn(0x738B20,&ProjectileUpdate,&originalProjectileUpdate,"CProjectileInfo::Update guided replica authority");
         mem::HookFn(0x728CB0, &HookWaterCannon, &g_origWaterCannon, "CWaterCannons::UpdateOne");
         mem::HookFn(0x7295E0, &PushWater, &g_origPushWater, "CWaterCannon::PushPeds authority");
         Net().SetHandler(proto::G_WATER_CANNON, [](uint8_t from, Reader& r) {
@@ -664,7 +717,7 @@ public:
     }
     void OnGameStarted() override { Forget(); }
     void OnPreProcess() override {
-        if (Net().Online() && core::IsPlayerReady()){RetryCombat();ShootJets();}
+        if (Net().Online() && core::IsPlayerReady()){RetryCombat();SyncFlights();ShootJets();}
     }
     void OnPeerResync(uint8_t id) override { OnPeerLeave(id);ReannounceCharges();for(auto&[f,s]:g_sent)SendCurrentFire(f,s); }
 
@@ -706,6 +759,7 @@ public:
 private:
     static void Forget() {
         g_blastSequence=0;for(auto&w:g_explosionsSeen)w={};for(auto&w:g_projectilesSeen)w={};
+        g_flightCopies.clear();g_flightEnded.clear();
         g_pendingBlasts.clear();g_pendingProjectiles.clear();g_flights.clear();
         g_sent.clear();
         g_copies.clear();g_pendingFires.clear();

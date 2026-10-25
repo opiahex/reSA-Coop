@@ -3,6 +3,7 @@
 #include "shared/lib/sync/IdAllocator.h"
 #include <map>
 #include <set>
+#include "shared/lib/sync/SpawnWait.h"
 
 #include "entities/vehicle/VehicleState.h"
 #include "shared/game/Game.h"
@@ -90,6 +91,7 @@ public:
     const std::map<uint16_t,NetVehicle>& All() const { return m_byId; }
     const std::map<uint16_t,VehicleSpawn>& Pending() const { return m_pending; }
 
+    const SpawnWait* PendingWait(uint16_t id)const{auto i=m_spawnWait.find(id);return i==m_spawnWait.end()?nullptr:&i->second;}
     NetVehicle* Find(uint16_t netId);
     // the record's vehicle is still there (one deleted in the last frame stays listed until OnPreProcess, after the
     // network handlers that use its handle)
@@ -124,6 +126,7 @@ public:
     std::vector<uint16_t> ClearMirrors(const game::CVector& at, float radius);
 
 private:
+    std::map<uint16_t,SpawnWait> m_spawnWait;
     void Announce(const NetVehicle& nv);
     bool CreateMirror(const VehicleSpawn& sp);
     void ScanTraffic();

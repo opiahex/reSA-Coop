@@ -1,3 +1,4 @@
+#include "shared/lib/sync/ModelRequests.h"
 // NPC synchronisation. Every game owns the peds it created (random population, mission peds); peds near
 // the other player are announced and follow the owner on the other side as "mirrors": script-created
 // peds with an empty decision maker and all proofs. What the owner's ped does is replayed with the
@@ -749,32 +750,32 @@ void Peds::ScanOwned() {
 
 CPed* Peds::SpawnMirror(NetPed& np) {
     profile::Scope timing(profile::ENTITY_CREATE);
-    if(m_spawnBudget<=0)return nullptr;
+    if(m_spawnBudget<=0){np.spawnWait.Block("ped",np.netId,"creation_budget",np.spawnWait.priority);return nullptr;}
     const PedSyncState& st = np.state;
     int model = np.model;
     if (model >= kSpecialFirst && model <= kSpecialLast) {
-        if (np.special.empty()) return nullptr;
+        if (np.special.empty()){np.spawnWait.Block("ped",np.netId,"special_name_missing");return nullptr;}
         // in whichever slot holds that name here, or a free one: the owner's slot can belong to someone here (a
         // mission's person, another copy), and RequestSpecialModel took the model from under them
         model = SpecialModelFor(np.special);
-        if (model < 0) return nullptr;
+        if (model < 0){np.spawnWait.Block("ped",np.netId,"special_slot_pending",np.spawnWait.priority);return nullptr;}
     } else if (!IsPedModel(model)) {
         return nullptr;
     }
     if (!IsModelLoaded(model)) {
         // streamed in the background, the spawn is retried (a blocking load per ped stalls the frame)
-        RequestModel(model, 0);
-        return nullptr;
+        RequestSharedModel(model,np.spawnWait.priority>0);
+        np.spawnWait.Block("ped",np.netId,"model_not_loaded",np.spawnWait.priority);return nullptr;
     }
-    if (!HasRoom(PedPool(), kKeepPeds, "ped")) return nullptr;
-    if (!HasRoom(Ref<CPoolHeader*>(0xB744A8),64,"task")) return nullptr;
+    if (!HasRoom(PedPool(), kKeepPeds, "ped")){np.spawnWait.Block("ped",np.netId,"ped_pool_full");return nullptr;}
+    if (!HasRoom(Ref<CPoolHeader*>(0xB744A8),64,"task")){np.spawnWait.Block("ped",np.netId,"task_pool_full");return nullptr;}
     // mirrors are civilians whatever the owner's type: cop/gang/emergency classes add their own AI and
     // the cop class even replaces the model
-    int pedType = np.pedType == PED_TYPE_CIVFEMALE ? PED_TYPE_CIVFEMALE : PED_TYPE_CIVMALE;
+    int pedType = np.pendingAdoption&&np.model==285&&np.pedType==PED_TYPE_COP?PED_TYPE_COP:np.pedType == PED_TYPE_CIVFEMALE ? PED_TYPE_CIVFEMALE : PED_TYPE_CIVMALE;
     int handle = -1;
     if (st.flags & PedSyncState::F_IN_VEHICLE) {
         NetVehicle* nv = (Net().EntityLink(ENTITY_PED,np.netId,ENTITY_VEHICLE,st.vehNetId)?Vehicles::Instance().Find(st.vehNetId):nullptr);
-        if (!nv || !Vehicles::Alive(*nv)) return nullptr;  // wait for the vehicle
+        if (!nv || !Vehicles::Alive(*nv)){np.spawnWait.Block("ped",np.netId,"vehicle_missing",np.spawnWait.priority);return nullptr;}
         if (st.seat < 0) {
             // A local ambient task can occupy a remote car before its streamed
             // driver arrives. That unrelated occupant must not block the real
@@ -787,11 +788,11 @@ CPed* Peds::SpawnMirror(NetPed& np) {
                     auto p=d->GetPosition();Cmd(0x0362).I(GetPedRef(d)).F(p.x).F(p.y).F(p.z).Run();
                 }
             }
-            if (nv->veh->Driver()) return nullptr;
+            if (nv->veh->Driver()){np.spawnWait.Block("ped",np.netId,"driver_seat_occupied",np.spawnWait.priority);return nullptr;}
             --m_spawnBudget;
             Cmd(0x0129).I(nv->handle).I(pedType).I(model).Out(&handle).Run();  // CREATE_CHAR_INSIDE_CAR
         } else {
-            if (st.seat >= nv->veh->MaxPassengers() || st.seat >= 8 || nv->veh->Passengers()[st.seat]) return nullptr;
+            if (st.seat >= nv->veh->MaxPassengers() || st.seat >= 8 || nv->veh->Passengers()[st.seat]){np.spawnWait.Block("ped",np.netId,"passenger_seat_unavailable",np.spawnWait.priority);return nullptr;}
             --m_spawnBudget;
             Cmd(0x01C8).I(nv->handle).I(pedType).I(model).I(st.seat).Out(&handle).Run();  // CREATE_CHAR_AS_PASSENGER
         }
@@ -800,7 +801,8 @@ CPed* Peds::SpawnMirror(NetPed& np) {
         Cmd(0x009A).I(pedType).I(model).F(st.pos.x).F(st.pos.y).F(st.pos.z - 1.0f).Out(&handle).Run();  // CREATE_CHAR
     }
     CPed* ped = GetPed(handle);
-    if (!ped) return nullptr;
+    if (!ped){np.spawnWait.Block("ped",np.netId,"native_creation_failed");return nullptr;}
+    np.spawnWait.Done("ped",np.netId);
     Cmd(0x060B).I(handle).I(kEmptyDecisionMaker).Run();  // SET_CHAR_DECISION_MAKER: reacts to nothing by itself
     Cmd(0x02AB).I(handle).I(1).I(1).I(1).I(1).I(1).Run();  // SET_CHAR_PROOFS: damage is decided by the owner
     Cmd(0x087E).I(handle).I(0).Run();                      // SET_CHAR_DROPS_WEAPONS_WHEN_DEAD false
@@ -844,7 +846,8 @@ void Peds::HandleRemove(uint8_t from, Reader& r) {
 }
 
 bool Peds::CanGiveAwayType(const NetPed& np) {
-    return np.pedType != PED_TYPE_COP && np.pedType != PED_TYPE_MEDIC && np.pedType != PED_TYPE_FIREMAN;
+    if(np.pedType==PED_TYPE_COP)return np.model==285&&IsAlive(np)&&!FindTask(np.ped,108);
+    return np.pedType != PED_TYPE_MEDIC && np.pedType != PED_TYPE_FIREMAN;
 }
 
 // A passer-by of this game: alive, on foot, not a script's (a mission's ped stays with its script), not the player's
@@ -870,6 +873,7 @@ void Peds::GiveAway(uint16_t netId, uint8_t to) {
     Net().Send(proto::CH_RELIABLE, w);
     LOGD("Ped %04X handed over to player %d", netId, to);
     np.owner=to;np.hasState=false;np.handoverUntil=NowMs()+3000;
+    if(np.model==285&&np.pedType==PED_TYPE_COP){m_byPtr.erase(np.ped);Cmd(0x009B).I(np.handle).Run();np.ped=nullptr;np.handle=-1;return;}
     Cmd(0x060B).I(np.handle).I(kEmptyDecisionMaker).Run();
     Cmd(0x02AB).I(np.handle).I(1).I(1).I(1).I(1).I(1).Run();
     Cmd(0x087E).I(np.handle).I(0).Run();
@@ -906,6 +910,7 @@ void Peds::HandleOwner(uint8_t from, Reader& r) {
         np.state.flags|=PedSyncState::F_DEAD;np.state.health=0;
     }
     Adopt(np);
+    if(!IsAlive(np))return;
     np.lastSendMs = 0;np.handoverUntil=NowMs()+2000;
     Announce(np);  // preserve the id, including its vehicle's occupant references
     SendState(np);
@@ -913,6 +918,14 @@ void Peds::HandleOwner(uint8_t from, Reader& r) {
 }
 
 void Peds::Adopt(NetPed& np) {
+    if(IsAlive(np)&&np.model==285&&np.pedType==PED_TYPE_COP&&np.ped->PedType()!=PED_TYPE_COP){
+        auto at=np.state.pos;auto old=np.ped;m_byPtr.erase(old);Cmd(0x009B).I(np.handle).Run();np.ped=nullptr;np.handle=-1;
+        int handle=-1;Cmd(0x009A).I(PED_TYPE_COP).I(285).F(at.x).F(at.y).F(at.z-1).Out(&handle).Run();
+        auto*p=GetPed(handle);if(!p){np.pendingAdoption=true;return;}
+        np.ped=p;np.handle=handle;m_byPtr[p]=np.netId;p->AreaCode()=np.state.area;
+        if(np.state.weapon>0&&np.state.weapon<=46){Cmd(0x01B2).I(handle).I(np.state.weapon).I(300).Run();Cmd(0x01B9).I(handle).I(np.state.weapon).Run();}
+        LOGI("Landed SWAT native AI adopted id=%04X owner=%u",np.netId,Net().MyId());
+    }
     if(IsAlive(np))np.ped->PhysicalFlags()&=~0x2000u;
     Cmd(0x02AB).I(np.handle).I(0).I(0).I(0).I(0).I(0).Run();  // SET_CHAR_PROOFS off
     Cmd(0x087E).I(np.handle).I(1).Run();                      // SET_CHAR_DROPS_WEAPONS_WHEN_DEAD
@@ -1371,9 +1384,23 @@ void Peds::OnPreProcess() {
         m_lastScan = NowMs();
         ScanOwned();
     }
-    for (auto& [id, np] : m_byId) {
+    std::vector<std::pair<float,uint16_t>> order;
+    auto focus=FindPlayerPed(0)->GetPosition();
+    for(auto&[id,n]:m_byId){
+        int priority=(n.state.entityFlags&16)||(n.model>=290&&n.model<=299)||n.state.interaction.leader<3?3:
+            (n.state.flags&(PedSyncState::F_FIRING|PedSyncState::F_AIMING))?2:
+            (n.state.flags&PedSyncState::F_IN_VEHICLE)&&n.state.seat<0?1:0;
+        if(n.owner!=Net().MyId()&&!IsAlive(n)){
+            n.spawnWait.Block("ped",id,"queued",priority);
+            if(IsPedModel(n.model)&&!IsModelLoaded(n.model))RequestSharedModel(n.model,priority>0);
+        }
+        float age=n.spawnWait.since?std::min(10000.f,(NowMs()-n.spawnWait.since)*.05f):0;
+        order.push_back({(n.state.pos-focus).Length()-priority*10000.f-age,id});
+    }
+    std::sort(order.begin(),order.end());
+    for(auto[score,id]:order){auto&np=m_byId.at(id);
         if(np.pendingAdoption){
-            if(SpawnMirror(np)){np.pendingAdoption=false;Adopt(np);np.lastSendMs=0;np.handoverUntil=NowMs()+3000;Announce(np);SendState(np);}
+            if(SpawnMirror(np)){np.pendingAdoption=false;Adopt(np);if(!IsAlive(np))continue;np.lastSendMs=0;np.handoverUntil=NowMs()+3000;Announce(np);SendState(np);}
             continue;
         }
         if(np.owner==Net().MyId()){

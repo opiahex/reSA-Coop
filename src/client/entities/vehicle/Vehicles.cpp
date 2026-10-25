@@ -1,3 +1,4 @@
+#include "shared/lib/sync/ModelRequests.h"
 #include "shared/api/vehicle-effects/VehicleEffects.h"
 #include "shared/api/police/Police.h"
 #include "entities/vehicle/Vehicles.h"
@@ -550,17 +551,17 @@ CVehicle* Vehicles::FindAdoptable(uint16_t model, const CVector& pos) {
 CVehicle* Vehicles::SpawnMirror(const VehicleSpawn& sp) {
     profile::Scope timing(profile::ENTITY_CREATE);
     if (!IsModelLoaded(sp.model)) {
-        RequestModel(sp.model, 0);  // streamed in the background, CreateMirror is retried every frame
+        RequestSharedModel(sp.model,sp.script||sp.playerUsed);  // streamed in the background, CreateMirror is retried every frame
         return nullptr;
     }
-    if (!HasRoom(VehiclePool(), kKeepVehicles, "vehicle")) return nullptr;
+    if (!HasRoom(VehiclePool(), kKeepVehicles, "vehicle")){m_spawnWait[sp.netId].Block("vehicle",sp.netId,"vehicle_pool_full",m_spawnWait[sp.netId].priority);return nullptr;}
     int handle = -1;
     const auto savedComponents=Ref<uint16_t>(0x8A6458);
     for(int c=0;c<2;++c)Ref<int8_t>(0x8A6458+c)=sp.components[c];
     Cmd(0x00A5).I(sp.model).F(sp.pos.x).F(sp.pos.y).F(sp.pos.z).Out(&handle).Run();
     Ref<uint16_t>(0x8A6458)=savedComponents;  // CREATE_CAR
     CVehicle* v = GetVehicle(handle);
-    if (!v) return nullptr;
+    if (!v){m_spawnWait[sp.netId].Block("vehicle",sp.netId,"native_creation_failed");return nullptr;}
     SetVehicleMatrix(v, sp.pos, sp.rot);
     memcpy(v->Colors(), sp.colors, 4);
     v->Health() = sp.health;
@@ -1088,6 +1089,8 @@ void Vehicles::ApplyMirror(NetVehicle& nv, float dt) {
     else if(fireType!=VEHICLE_TYPE_BOAT&&fireType!=VEHICLE_TYPE_TRAIN)Field<float>(v,0x8E4)=std::min(Field<float>(v,0x8E4),4000.f);
     v->DoorLock() = TrainingVehicleRestricted(v)?2:m_scriptLocks.count(nv.netId)?m_scriptLocks[nv.netId]:st.lock;
     v->SetEngineOn((st.flags & VehicleState::F_ENGINE) != 0);
+    v->PhysicalFlags()=(v->PhysicalFlags()&~0x100u)|((st.water&1)?0x100u:0);
+    v->VehicleFlagsLo()=(v->VehicleFlagsLo()&~0x40000000u)|((st.water&2)?0x40000000u:0);
     v->SetSiren((st.flags & VehicleState::F_SIREN) != 0);
     int16_t alarm=Field<int16_t>(v,0x45C);
     if(alarm==0||alarm==-1)Field<uint32_t>(v,0x514)=(st.flags&VehicleState::F_HORN)?1:0;
@@ -1105,10 +1108,24 @@ void Vehicles::OnPreProcess() {
         if(auto*n=Find(v);n&&IsMirror(*n))TakeOwnership(*n);
     for(auto it=m_scriptRemoved.begin();it!=m_scriptRemoved.end();)it=NowMs()>=it->second?m_scriptRemoved.erase(it):std::next(it);
     for(auto&[id,lock]:m_scriptLocks)if(auto*nv=Find(id);nv&&IsVehicleValid(nv->veh))nv->veh->DoorLock()=lock;
-    int created=0;
-    for (auto it = m_pending.begin(); it != m_pending.end()&&created<2;){
-        if(CreateMirror(it->second)){it=m_pending.erase(it);++created;}else ++it;
+    std::vector<std::pair<float,uint16_t>> spawnOrder;
+    auto focus=localDriver->GetPosition();
+    for(auto&[id,sp]:m_pending){
+        bool crew=false;for(auto&[pid,p]:Peds::Instance().All())if(p.hasState&&p.state.vehNetId==id&&(p.state.flags&PedSyncState::F_IN_VEHICLE)){crew=true;break;}
+        int priority=sp.script?3:sp.playerUsed?2:crew?1:0;
+        auto&wait=m_spawnWait[id];wait.Block("vehicle",id,!IsModelLoaded(sp.model)?"model_not_loaded":"creation_budget",priority);
+        if(!IsModelLoaded(sp.model))RequestSharedModel(sp.model,priority>0);
+        float distance=(sp.pos-focus).Length();float age=std::min(10000.f,(NowMs()-wait.since)*.05f);
+        spawnOrder.push_back({distance-priority*10000.f-age,id});
     }
+    std::sort(spawnOrder.begin(),spawnOrder.end());int created=0;
+    for(auto[score,id]:spawnOrder){
+        auto i=m_pending.find(id);if(i==m_pending.end())continue;
+        if(created>=2)break;
+        if(CreateMirror(i->second)){m_spawnWait[id].Done("vehicle",id);m_pending.erase(i);++created;}
+
+    }
+    for(auto i=m_spawnWait.begin();i!=m_spawnWait.end();)i=!m_pending.count(i->first)?m_spawnWait.erase(i):std::next(i);
     float dt = TimeStep() / 50.0f;
     std::vector<uint16_t> dead;
     for (auto& [id, nv] : m_byId) {
@@ -1284,6 +1301,8 @@ void Vehicles::OnPostProcess() {
             // keep the visual controls after the physics step (wheels, brake lights)
             if (nv.hasState) {
                 nv.veh->SetEngineOn((nv.state.flags&VehicleState::F_ENGINE)!=0);
+                nv.veh->PhysicalFlags()=(nv.veh->PhysicalFlags()&~0x100u)|((nv.state.water&1)?0x100u:0);
+                nv.veh->VehicleFlagsLo()=(nv.veh->VehicleFlagsLo()&~0x40000000u)|((nv.state.water&2)?0x40000000u:0);
                 if(nv.veh->VehicleSubClass()==VEHICLE_TYPE_HELI&&(nv.state.extras&VehicleState::X_ROTOR))Field<float>(nv.veh,0x84C)=nv.state.rotorSpeed;
                 nv.veh->SteerAngle() = nv.state.steer;
                 nv.veh->BrakePedal() = nv.state.brake;

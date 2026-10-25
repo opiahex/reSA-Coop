@@ -30,6 +30,7 @@ struct RemotePlayer {
 
     bool hasState = false;
     OnFootState state;          // latest received state (pad/camera/health are also filled in vehicles)
+    uint64_t spawnedAt=0;
     uint64_t stateRecvMs = 0;   // local time of reception
     uint32_t lastStateTime = 0; // sender time of the latest applied state (drops reordered packets)
     SnapshotBuffer<OnFootState> history;

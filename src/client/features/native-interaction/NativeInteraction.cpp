@@ -73,6 +73,15 @@ bool RequestNativeInteraction(uint16_t model,int8_t area,float x,float y,float z
     return NativeInteractionOwner(key)==Net().MyId();
 }
 bool OwnsNativePoolTable(){return localKey&&localModel==2964&&NativeInteractionOwner(localKey)==Net().MyId();}
+bool IsNativePoolBall(int handle){
+    if(!OwnsNativePoolTable()||handle<0)return false;
+    bool active=false;for(auto*s=Ref<void*>(0xA8B42C);s;s=Field<void*>(s,0))if(!_strnicmp(Field<char[8]>(s,8),"POOL2",5)&&Field<uint8_t>(s,0xDC)){active=true;break;}
+    if(!active)return false;
+    // Native POOL2 owns sixteen physical balls at locals 82..97. Its other
+    // ball objects draw the aiming/score interface and must remain local.
+    for(int i=0;i<16;++i)if(Ref<int32_t>(0xA48960+(82+i)*4)==handle)return true;
+    return false;
+}
 void ReleaseNativeInteraction(){if(localKey&&Net().Online()){if(Net().IsHost())Release(localKey,Net().MyId());else{Writer w(proto::G_INTERACTION);w.U8(3);w.U64(localKey);Net().Send(proto::CH_RELIABLE,w);}}localKey=asked=granted=0;}
 bool BeginNativeInteraction(void*script){
     if(!Net().Online()||!core::IsPlayerReady())return true;

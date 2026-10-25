@@ -1,4 +1,5 @@
 #include <array>
+#include "shared/api/story-world/StoryWorld.h"
 #include <map>
 #include <set>
 #include "shared/api/story-stage/StoryStage.h"
@@ -17,7 +18,7 @@
 namespace coop {namespace {
 using namespace game;using game::script::Cmd;
 struct Dependency{uint8_t kind;uint16_t id;uint64_t generation=0;};
-struct Gate{uint64_t run=0,since=0,sent=0;uint32_t token=0;int opcode=0;void*script=nullptr;void*ip=nullptr;int8_t area=0;CVector point;std::vector<Dependency>entities;std::vector<EntityRef>refs;std::set<uint8_t>ready;};
+struct Gate{uint64_t run=0,since=0,sent=0;uint32_t token=0;uint32_t worldRevision=0;int opcode=0;void*script=nullptr;void*ip=nullptr;int8_t area=0;CVector point;std::vector<Dependency>entities;std::vector<EntityRef>refs;std::set<uint8_t>ready;};
 uint64_t phaseRun=0;uint32_t phase=0;bool transitionPending=false,recoveryPending=false;
 uint64_t reportAt=0,hostReportAt=0;uint8_t blockedReason=0;uint16_t blockedEntity=0;uint8_t blockedKind=0;
 uint64_t clockRun=0;uint32_t pausedTime=0,gateTime=0;std::map<void*,std::pair<void*,uint64_t>>armed;
@@ -26,7 +27,7 @@ void SendGate(){
     bool removed=false;for(auto i=host.entities.begin();i!=host.entities.end();){bool alive=i->kind==ENTITY_VEHICLE?Vehicles::Instance().Find(i->id)&&Vehicles::Alive(*Vehicles::Instance().Find(i->id)):i->kind==ENTITY_PED?GetPed(Peds::Instance().HandleOf(i->id))!=nullptr:SharedMissionObjectById(i->id)!=nullptr;
         if(!alive||Net().EntityGeneration(i->kind,i->id)!=i->generation){i=host.entities.erase(i);removed=true;}else ++i;}
     if(removed){host.ready.clear();host.token=++sequence;if(!host.token)host.token=++sequence;}
-    Writer w(proto::G_STORY_STAGE);w.U8(1);w.U64(host.run);w.U32(host.token);w.U16((uint16_t)host.opcode);w.I8(host.area);w.Vec({host.point.x,host.point.y,host.point.z});w.U8((uint8_t)host.entities.size());for(auto&e:host.entities){w.U8(e.kind);w.Entity(e.kind,e.id);}Net().Send(proto::CH_RELIABLE,w);host.sent=NowMs();}
+    Writer w(proto::G_STORY_STAGE);w.U8(1);w.U64(host.run);w.U32(host.token);w.U16((uint16_t)host.opcode);w.U32(StoryWorldRevision());w.I8(host.area);w.Vec({host.point.x,host.point.y,host.point.z});w.U8((uint8_t)host.entities.size());for(auto&e:host.entities){w.U8(e.kind);w.Entity(e.kind,e.id);}Net().Send(proto::CH_RELIABLE,w);host.sent=NowMs();}
 bool DependenciesReady(bool includeRecovery=true){
     blockedReason=blockedKind=0;blockedEntity=0;
     auto blocked=[](uint8_t reason,uint8_t kind=0,uint16_t id=0){blockedReason=reason;blockedKind=kind;blockedEntity=id;return false;};
@@ -37,6 +38,7 @@ bool DependenciesReady(bool includeRecovery=true){
     if(includeRecovery&&recoveryPending)return blocked(5);
     auto*me=FindPlayerPed(0);if(me->AreaCode()!=client.area)return blocked(6);
     if(!LocalCooperativeRoleReady())return blocked(7);
+    if(!StoryWorldReady(client.worldRevision,client.point))return blocked(11);
     for(auto&e:client.entities){
         if(e.kind==ENTITY_VEHICLE){auto*n=Vehicles::Instance().Find(e.id);if(!n||!Vehicles::Alive(*n))return blocked(8,e.kind,e.id);}
         else if(e.kind==ENTITY_PED){auto*p=GetPed(Peds::Instance().HandleOf(e.id));if(!p||!IsPedValid(p))return blocked(8,e.kind,e.id);}
@@ -58,7 +60,7 @@ class Stages:public Module{const char*Name()const override{return "CooperativeSt
             }
             LOGI("Story blocked player=%u run=%llu phase=%u gate=%u opcode=%04X reason=%u entity=%u:%04X",from,(unsigned long long)run,revision,token,host.opcode,reason,kind,entity);return;}
         return;}
-    if(op!=1||Net().IsHost()||from!=Net().HostId())return;Gate g;g.run=run;g.token=token;g.opcode=r.U16();g.area=r.I8();auto p=r.Vec();g.point={p.x,p.y,p.z};auto count=r.U8();if(count>72)return;
+    if(op!=1||Net().IsHost()||from!=Net().HostId())return;Gate g;g.run=run;g.token=token;g.opcode=r.U16();g.worldRevision=r.U32();g.area=r.I8();auto p=r.Vec();g.point={p.x,p.y,p.z};auto count=r.U8();if(count>72)return;
     for(int i=0;i<count;++i){auto kind=r.U8();auto id=r.U16();if(kind<ENTITY_VEHICLE||kind>ENTITY_OBJECT)return;g.entities.push_back({kind,id});}g.refs=Net().EntityContext();
     if(!r.Ok()||!run||!token||(run==completedRun&&(int32_t)(token-completedToken)<=0)||run!=StoryRunId()||(client.run==run&&(int32_t)(token-client.token)<0))return;
     if(client.run!=run||client.token!=token){ackSent=0;Cmd(0x04E4).F(g.point.x).F(g.point.y).Run();LOGI("Story stage waiting token=%u opcode=%04X dependencies=%u",token,g.opcode,count);}client=std::move(g);

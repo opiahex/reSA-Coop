@@ -188,6 +188,7 @@ enum MsgId : uint8_t {
     G_HELI_SHOT = 176, // authoritative helicopter gun round, generation + sequence
     G_STORY_WORLD = 177, // host map/IPL edits and shared campaign counters
     G_POLICE_RULES = 178, // nearby host gang-war and story police policy
+    G_PROJECTILE_FLIGHT = 179, // authoritative guided flight/target/retirement
     G_VOICE = 200,            // unreliable: voice frame
     G_LAST = 255,
 };

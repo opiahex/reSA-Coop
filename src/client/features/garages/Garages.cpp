@@ -36,6 +36,7 @@ constexpr uintptr_t kStoredCars = 0x96ABD8;                         // CGarages:
 constexpr size_t kGarageSize = 0xD8;
 enum : uint8_t { GARAGE_STORE = 1, GARAGE_KEPT = 2, GARAGE_BRING_OUT = 3, GARAGE_CARS = 4, GARAGE_BACK = 5 };
 constexpr size_t kStoredCarSize = 0x40;
+uint32_t StoredCrc(const uint8_t*p){return Crc32(p+0xC,0x30);} // appearance, not rolling position/heading
 
 uint8_t TypeOf(void* g) { return Field<uint8_t>(g, 0x4C); }  // CGarage::m_nType
 bool IsHideout(uint8_t t) { return (t >= 16 && t <= 18) || (t >= 24 && t <= 32) || (t >= 39 && t <= 42) || t == 45; }
@@ -52,7 +53,7 @@ bool Inside(void* g, const CVector& p) { return CallMethod<0x448740, bool>(g, p)
 // the partner's game in the host's world: its garages keep nothing of their own
 bool Partner() { return Net().Online() && !Net().IsHost() && flow::InHostWorld(); }
 
-struct StoredReceipt {uint8_t owner=255,index=0;int handle=-1;};
+struct StoredReceipt {uint8_t owner=255,index=0,slot=0;int handle=-1;uint32_t crc=0;uint64_t generation=0;};
 std::map<uint16_t,StoredReceipt>g_storedReceipts;
 
 bool Occupied(CVehicle* v) {
@@ -80,19 +81,35 @@ void AskToKeep(void* garage) {
     w.U8(IndexOf(garage));
     w.U32(Net().WorldEpoch());
     w.U8((uint8_t)ids.size());
-    for (uint16_t id : ids) w.Entity(ENTITY_VEHICLE,id);
+    for(uint16_t id:ids){
+        auto*nv=Vehicles::Instance().Find(id);std::array<uint8_t,kStoredCarSize> record{};
+        // Capture on the simulator, after this frame's native repair/tuning.
+        // A delayed appearance packet must not decide what the garage saves.
+        CallMethod<0x449760>(record.data(),nv->veh);w.Entity(ENTITY_VEHICLE,id);w.U32(nv->repairRevision);w.Bytes(record.data(),record.size());
+    }
     Net().Send(proto::CH_RELIABLE, w);
     LOGI("Garage %s: %zu car(s) of ours go to the host's store", NameOf(garage).c_str(), ids.size());
 }
 
 using StoreFn = void(__fastcall*)(void*, void*, void*, int);
 StoreFn g_origStoreClosing = nullptr, g_origStoreBeforeSave = nullptr;
+void StoreHost(void*garage,void*edx,void*stored,int maxSlot,StoreFn native){
+    // A guest already transferred these cars to this store. Native saving
+    // clears every slot, and cannot reconstruct them from mission replicas.
+    struct Keep{uint16_t id;std::array<uint8_t,kStoredCarSize> car;};std::vector<Keep>kept;
+    if(Net().Online()&&Net().IsHost())for(auto&[id,receipt]:g_storedReceipts)if(receipt.index==IndexOf(garage)){
+        auto*record=(uint8_t*)stored+receipt.slot*kStoredCarSize;
+        if(Ref<uint16_t>((uintptr_t)record+0x12)&&StoredCrc(record)==receipt.crc){Keep k;k.id=id;memcpy(k.car.data(),record,kStoredCarSize);kept.push_back(k);}
+    }
+    native(garage,edx,stored,std::max(0,maxSlot-(int)kept.size()));
+    for(auto&k:kept)for(int i=0;i<4;++i){auto*slot=(uint8_t*)stored+i*kStoredCarSize;if(!Ref<uint16_t>((uintptr_t)slot+0x12)){memcpy(slot,k.car.data(),kStoredCarSize);g_storedReceipts[k.id].slot=(uint8_t)i;break;}}
+}
 void __fastcall HookStoreClosing(void* garage, void* edx, void* stored, int maxSlot) {  // the door closed (CGarage::Update)
-    if (!Partner()) return g_origStoreClosing(garage, edx, stored, maxSlot);
+    if (!Partner()) return StoreHost(garage,edx,stored,maxSlot,g_origStoreClosing);
     AskToKeep(garage);
 }
 void __fastcall HookStoreBeforeSave(void* garage, void* edx, void* stored, int maxSlot) {  // CloseHideOutGaragesBeforeSave
-    if (!Partner()) return g_origStoreBeforeSave(garage, edx, stored, maxSlot);
+    if (!Partner()) return StoreHost(garage,edx,stored,maxSlot,g_origStoreBeforeSave);
     AskToKeep(garage);
 }
 
@@ -100,7 +117,7 @@ using RestoreFn = bool(__fastcall*)(void*, void*, void*);
 // the game's own until redirected: a site another mod changed is left alone, and this is still called
 RestoreFn g_origRestore = (RestoreFn)0x448550;
 bool __fastcall HookRestore(void* garage, void* edx, void* stored) {  // CGarage::RestoreCarsForThisHideOut
-    if (!Partner()) return g_origRestore(garage, edx, stored);
+    if (!Partner()){for(auto i=g_storedReceipts.begin();i!=g_storedReceipts.end();)i=i->second.index==IndexOf(garage)?g_storedReceipts.erase(i):std::next(i);return g_origRestore(garage,edx,stored);}
     if (core::IsPlayerReady()) {
         Writer w(proto::G_GARAGE);
         w.U8(GARAGE_BRING_OUT);
@@ -135,41 +152,49 @@ void Handle(uint8_t from, Reader& r) {
     if (!r.Ok() || from == Net().MyId() || !g || !IsHideout(TypeOf(g)) || !core::IsPlayerReady()) return;
     if (op == GARAGE_STORE && Net().IsHost()) {
         uint32_t requesterEpoch=r.U32();uint8_t n=r.U8();if(n>4||!requesterEpoch)return;
-        std::vector<uint16_t>ids;for(int i=0;i<n;++i)ids.push_back(r.U16());
-        if(!r.Ok())return; // validate the complete request before mutating garage storage
+        struct FinalCar{uint16_t id=0;uint32_t revision=0;std::vector<uint8_t>record;};std::vector<FinalCar>ids;
+        for(int i=0;i<n;++i){FinalCar c;c.id=r.U16();c.revision=r.U32();c.record=r.Bytes(kStoredCarSize);ids.push_back(std::move(c));}
+        if(!r.Ok()||std::any_of(ids.begin(),ids.end(),[](auto&c){return c.record.size()!=kStoredCarSize;}))return; // validate before mutations
         uint8_t* store = StoreOf(g);
-        std::vector<uint16_t> kept;
-        for (auto id:ids) {
+        std::vector<std::pair<uint16_t,uint32_t>> kept;
+        for (auto&car:ids) {auto id=car.id;
             NetVehicle* nv = Vehicles::Instance().Find(id);
             if (!r.Ok() || !nv || nv->owner != from || !nv->veh || !IsVehicleValid(nv->veh) || Occupied(nv->veh) ||
                 !Inside(g, nv->veh->GetPosition()))
                 continue;
-            if(auto receipt=g_storedReceipts.find(id);receipt!=g_storedReceipts.end()&&
-               receipt->second.owner==from&&receipt->second.index==index&&receipt->second.handle==nv->handle){kept.push_back(id);continue;}
-            uint8_t* slot = nullptr;
+            CVector captured;memcpy(&captured,car.record.data(),sizeof captured);uint16_t model;memcpy(&model,car.record.data()+0x12,2);
+            if(!Restorable(car.record.data())||model!=nv->model||!std::isfinite(captured.x)||!std::isfinite(captured.y)||!std::isfinite(captured.z)||!Inside(g,captured)||(int32_t)(car.revision-nv->repairRevision)<0)continue;
+            uint32_t crc=StoredCrc(car.record.data());uint8_t*slot=nullptr;
+            auto receipt=g_storedReceipts.find(id);
+            if(receipt!=g_storedReceipts.end()&&receipt->second.owner==from&&receipt->second.index==index&&receipt->second.handle==nv->handle&&receipt->second.generation==Net().EntityGeneration(ENTITY_VEHICLE,id)){
+                auto*c=store+receipt->second.slot*kStoredCarSize;
+                if(StoredCrc(c)==receipt->second.crc)slot=c;
+            }
             for (int k = 0; k < 4 && !slot; ++k)
                 if (!Ref<uint16_t>((uintptr_t)store + (uintptr_t)k * 0x40 + 0x12)) slot = store + k * 0x40;  // CStoredCar::m_wModelIndex
             if (!slot) break;  // all four places taken: the car stays where it is
-            CallMethod<0x449760>(slot, nv->veh);  // CStoredCar::StoreCar
+            memcpy(slot,car.record.data(),kStoredCarSize); // one owner-captured state
             if(g_storedReceipts.size()>=512)g_storedReceipts.erase(g_storedReceipts.begin());
-            g_storedReceipts[id]={from,index,nv->handle};kept.push_back(id);
+            g_storedReceipts[id]={from,index,(uint8_t)((slot-store)/kStoredCarSize),nv->handle,crc,Net().EntityGeneration(ENTITY_VEHICLE,id)};kept.push_back({id,crc});
         }
         if (kept.empty()) return;
         Writer w(proto::G_GARAGE);
         w.U8(GARAGE_KEPT);
         w.U8(index);w.U8(from);w.U32(requesterEpoch);
         w.U8((uint8_t)kept.size());
-        for (uint16_t id : kept) w.Entity(ENTITY_VEHICLE,id);
+        for(auto[id,crc]:kept){w.Entity(ENTITY_VEHICLE,id);w.U32(crc);}
         Net().Send(proto::CH_RELIABLE, w);
         LOGI("Garage %s keeps %zu car(s) of player %d", NameOf(g).c_str(), kept.size(), from);
     } else if (op == GARAGE_KEPT && from == Net().HostId() && !Net().IsHost()) {
         auto to=r.U8();auto epoch=r.U32();if(to!=Net().MyId()||epoch!=Net().WorldEpoch())return;
         uint8_t n = r.U8();if(n>4)return;
-        std::vector<uint16_t>ids;for(int i=0;i<n;++i)ids.push_back(r.U16());if(!r.Ok())return;
+        std::vector<std::pair<uint16_t,uint32_t>>ids;for(int i=0;i<n;++i){auto id=r.U16();auto crc=r.U32();ids.push_back({id,crc});}if(!r.Ok())return;
         int gone = 0;
-        for (auto id:ids) {
+        for(auto[id,crc]:ids){
             NetVehicle* nv = Vehicles::Instance().Find(id);
             if (!r.Ok() || !nv || Vehicles::Instance().IsMirror(*nv) || !nv->veh || !IsVehicleValid(nv->veh) || Occupied(nv->veh)) continue;
+            std::array<uint8_t,kStoredCarSize>current{};CallMethod<0x449760>(current.data(),nv->veh);
+            if(StoredCrc(current.data())!=crc){AskToKeep(g);continue;}
             StopEntering(nv->veh);
             Cmd(0x00A6).I(GetVehicleRef(nv->veh)).Run();  // DELETE_CAR: the vehicle sync tells the host's game it is gone
             ++gone;
@@ -178,6 +203,7 @@ void Handle(uint8_t from, Reader& r) {
     } else if (op == GARAGE_BRING_OUT && Net().IsHost()) {  // the cars it keeps go to the partner's game: out of our store
         auto epoch=r.U32();if(!r.Ok()||!epoch)return;
         uint8_t* store = StoreOf(g);
+        for(auto i=g_storedReceipts.begin();i!=g_storedReceipts.end();)i=i->second.index==index?g_storedReceipts.erase(i):std::next(i);
         Writer w(proto::G_GARAGE);
         w.U8(GARAGE_CARS);
         w.U8(index);

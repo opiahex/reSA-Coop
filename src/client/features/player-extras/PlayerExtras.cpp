@@ -74,13 +74,32 @@ void __fastcall SwimInput(void*task,void*edx,CPlayerPed*ped){
     originalSwim(task,edx,ped);
     if(auto*rp=Players::Instance().FindByPed(ped);rp&&rp->state.motion.kind==MotionState::SWIM&&NowMs()-rp->stateRecvMs<1000){
         Field<uint16_t>(task,0xA)=rp->state.motion.phase;
-        Field<float>(task,0x28)=rp->state.motion.pitch;Field<float>(task,0x2C)=rp->state.motion.roll;
+        Field<float>(task,0x24)=rp->state.motion.pitch;Field<float>(task,0x28)=rp->state.motion.roll;Field<float>(task,0x2C)=rp->state.motion.torsoPitch;Field<float>(task,0x30)=rp->state.motion.swimHeading;
     }
+}
+CPlayerPed*breathActor=nullptr;float breathDose=0,drowningRemainder=0;int drowningHandle=-1;
+using DrownFn=bool(__cdecl*)(CPed*,CEntity*,int,int,int,int);DrownFn originalDrown=nullptr;
+bool __cdecl Drown(CPed*victim,CEntity*creator,int weapon,int damage,int piece,int dir){
+    if(Net().Online()&&victim==breathActor&&weapon==53){
+        int handle=GetPedRef(victim);if(handle!=drowningHandle){drowningHandle=handle;drowningRemainder=0;}
+        drowningRemainder+=breathDose;damage=(int)drowningRemainder;drowningRemainder-=damage;
+        if(!damage)return true;
+    }
+    return originalDrown(victim,creator,weapon,damage,piece,dir);
+}
+using BreathFn=void(__fastcall*)(CPlayerPed*,void*,bool,float);BreathFn originalBreath=nullptr;
+void __fastcall Breath(CPlayerPed*p,void*edx,bool decrease,float multiplier){
+    if(auto*rp=Players::Instance().FindByPed(p);rp&&rp->hasState){if(p->PlayerData())Field<float>(p->PlayerData(),0x44)=rp->state.breath;return;}
+    auto*previous=breathActor;auto previousDose=breathDose;breathActor=p;breathDose=std::max(0.f,TimeStep()*multiplier*3.f);
+    if(!decrease||(p->PlayerData()&&Field<float>(p->PlayerData(),0x44)>0))drowningRemainder=0;
+    originalBreath(p,edx,decrease,multiplier);breathActor=previous;breathDose=previousDose;
 }
 class PlayerExtras:public Module {
 public:
  const char*Name()const override{return "PlayerExtras";}
  void OnInstallHooks()override{
+    mem::RedirectCallFn(0x60A943,&Drown,&originalDrown);
+    mem::HookFn(0x60A8D0,&Breath,&originalBreath,"CPlayerPed::HandlePlayerBreath owner state");
     mem::HookFn(0x688A90,&SwimInput,&originalSwim,"CTaskSimpleSwim::ProcessControlInput");
     Net().SetHandler(proto::G_PLAYER_EXTRAS,[](uint8_t from,Reader&r){
         uint8_t op=r.U8();uint32_t time=r.U32();
@@ -113,8 +132,8 @@ public:
     LOGI("Reconnect restore sent to player %u",id);
  }
  void OnPeerLeave(uint8_t id)override{auto it=extras.find(id);if(it!=extras.end()){DeleteProps(it->second);extras.erase(it);}rejoining.erase(id);}
- void OnSessionEnd()override{for(auto&[id,e]:extras)DeleteProps(e);extras.clear();remembered.clear();rejoining.clear();restoreAt=motionRestoreUntil=0;SetLocalStoryRecoveryPending(false);lastPacket.clear();lastSent=0;}
- void OnGameShutdown()override{for(auto&[id,e]:extras){e.objects={-1,-1,-1};e.phone=false;}restoreAt=0;SetLocalStoryRecoveryPending(false);if(Net().IsHost()){remembered.clear();rejoining.clear();}}
+ void OnSessionEnd()override{breathActor=nullptr;breathDose=drowningRemainder=0;drowningHandle=-1;for(auto&[id,e]:extras)DeleteProps(e);extras.clear();remembered.clear();rejoining.clear();restoreAt=motionRestoreUntil=0;SetLocalStoryRecoveryPending(false);lastPacket.clear();lastSent=0;}
+ void OnGameShutdown()override{breathActor=nullptr;breathDose=drowningRemainder=0;drowningHandle=-1;for(auto&[id,e]:extras){e.objects={-1,-1,-1};e.phone=false;}restoreAt=0;SetLocalStoryRecoveryPending(false);if(Net().IsHost()){remembered.clear();rejoining.clear();}}
  void OnPostProcess()override{
     if(!Net().Online()||!core::IsPlayerReady())return;
     auto now=NowMs();auto*me=FindPlayerPed(0);
@@ -129,7 +148,7 @@ public:
             if(nv&&IsVehicleValid(nv->veh))p=nv->veh->GetPosition()+CVector{3,0,1};
             int area=nv&&IsVehicleValid(nv->veh)?nv->veh->AreaCode():s.area;
             if(!forced){Cmd(0x04BB).I(area).Run();Cmd(0x0860).I(GetPedRef(me)).I(area).Run();Cmd(0x03CB).F(p.x).F(p.y).F(p.z).Run();
-            Cmd(0x00A1).I(GetPedRef(me)).F(p.x).F(p.y).F(p.z-1).Run();me->Health()=s.health?s.health:100;me->Armour()=s.armour;
+            Cmd(0x00A1).I(GetPedRef(me)).F(p.x).F(p.y).F(p.z-1).Run();me->Health()=s.health?s.health:100;me->Armour()=s.armour;if(me->PlayerData())Field<float>(me->PlayerData(),0x44)=s.breath;
             me->CurrentRotation()=me->AimingRotation()=s.rotation;}
             Cmd(0x048F).I(GetPedRef(me)).Run();
             for(int i=0;i<13;++i)if(resume.extras.weapons[i]){
@@ -168,7 +187,7 @@ public:
         else if(resumedMotion.kind==MotionState::SWIM){
             if(auto*t=anim::FindTask(me,1304)){
                 Field<uint16_t>(t,0xA)=resumedMotion.phase;
-                Field<float>(t,0x28)=resumedMotion.pitch;Field<float>(t,0x2C)=resumedMotion.roll;
+                Field<float>(t,0x24)=resumedMotion.pitch;Field<float>(t,0x28)=resumedMotion.roll;Field<float>(t,0x2C)=resumedMotion.torsoPitch;Field<float>(t,0x30)=resumedMotion.swimHeading;
                 motionRestoreUntil=0;
             }
         }else motionRestoreUntil=0;

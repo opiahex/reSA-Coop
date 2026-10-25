@@ -251,6 +251,18 @@ def main():
     if not CXX.exists():
         print(f"toolchain not found: {CXX}\nrun: powershell -ExecutionPolicy Bypass -File tools/get-toolchain.ps1")
         return 1
+    # A duplicate message ID silently replaces another subsystem's handler.
+    protocol = (ROOT / "src/common/api/protocol/Protocol.h").read_text(encoding="utf-8")
+    body = re.search(r"enum MsgId[^\{]*\{(.*?)\};", protocol, re.S).group(1)
+    assigned = {}
+    for symbol, value in re.findall(r"^\s*([CSG]_[A-Z0-9_]+)\s*=\s*(\d+)", body, re.M):
+        if symbol in {"G_FIRST", "G_LAST"}:
+            continue
+        number = int(value)
+        if not 0 <= number <= 255 or number in assigned:
+            print(f"Invalid protocol ID {symbol}={number}: conflicts with {assigned.get(number, 'one-byte range')}")
+            return 1
+        assigned[number] = symbol
     extra = [str(p.resolve()) for d in args.extra for p in sorted(Path(d).glob("**/*.cpp"))]
     all_t = targets(extra)
     want = [w for w in args.what if w != "dist"] or list(all_t.keys())
