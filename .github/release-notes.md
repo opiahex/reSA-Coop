@@ -1,54 +1,52 @@
-# reSA-Coop 0.2.30-3p
+# reSA-Coop 0.2.31-3p
 
 Кооператив на троих для GTA San Andreas 1.0 US. / Three-player co-op for GTA San Andreas 1.0 US.
 
-**Готовая сборка / Compiled build: `reSA-Coop-v0.2.30-3p-win32.zip` в Assets / in Assets.**
+**Готовая сборка / Compiled build: `reSA-Coop-v0.2.31-3p-win32.zip` в Assets / in Assets.**
 
-## Русский — исправления 0.2.30
+## Русский
 
-- Ускорено создание сетевых копий: миссионный транспорт, используемые игроками машины, экипажи и ближайшие участники боя получают приоритет. Причины ожидания моделей, мест и пулов выводятся в диагностику.
-- Загрузка сетевых моделей удерживается до создания копии, включая полицейские вертолёты и спецназ у гостей без розыска. Временные удержания моделей и текстур освобождаются; обслуживание загрузки не зависит от отрисовки окна.
-- Попадания полицейского вертолёта определяет его симулятор. Передаются конкретная цель, часть тела, урон и поколение сущности; наблюдатели не пересчитывают попадание независимо. Учитываются задержка доставки, удаление вертолёта и переподключение цели.
-- Исправлен порядок обновления гостевых красных маркеров: GTA успевает активировать их перед отрисовкой. Готовность перехода проверяет IPL нужной точки; явно удалённые части карты не загружаются заново.
-- Убраны прежние пределы 512 изменений карты и 128 IPL. Позднее подключение получает полный снимок актуальных изменений; их ревизия, IPL и заменённые модели входят в готовность сюжетного этапа и катсцены.
-- Общие правила полиции включаются ближе 280 метров и отпускаются дальше 340 метров. Личные звёзды розыска остаются индивидуальными.
-- Для спуска спецназа сохраняется найденная высота земли при уходе владельца в интерьер. После приземления обычный боец передаётся игре, которая продолжает загружать его район; копии не создают собственную физическую верёвку.
-- Бильярд передаёт 16 игровых шаров, исключая вспомогательные объекты прицела и счёта. Забитые шары, завершение и повторный запуск не оставляют прежние сетевые копии.
-- Проверены присед и оба переката с несколькими типами оружия и направлениями. Передача плавания исправлена по реальным полям задачи GTA: наклон, крен, торс и направление; запас воздуха приходит от владельца игрока.
-- Урон от утопления сохраняет дробную часть между кадрами: высокий FPS больше не округляет каждое небольшое повреждение в ноль. Затопление машины, остановка двигателя и состояния пассажиров передаются согласованно.
-- Исправлены пропадающие субтитры гостей при отключённых субтитрах у хоста. Настройка каждого игрока действует независимо; поддерживаются строки с подстановкой чисел и текста.
-- Субтитр связанной реплики ждёт фактического начала звука у гостя и получает своё время показа. Завершённые реплики не запускаются повторно при восстановлении состояния.
-- Подключение посреди катсцены восстанавливает текущее время, камеру, анимации и положение звуковой дорожки. Периодическая коррекция ограничивает накопление расхождения часов.
-- Общие сюжетные переводы загружаются отдельно от местной таблицы гостя: спортзал, магазин и другие личные занятия сохраняют свои надписи.
-- Разрушенные обычные объекты сохраняют состояние до смены мира. Для подвижных механизмов карты добавлены выбор симулятора, передача положения, поворота, видимости и коллизии, интерполяция и восстановление при смене источника.
-- Очередь одноразовых звуков отделена от состояния сюжетной дорожки. При перегрузке отбрасываются устаревшие эффекты, а команда остановки сохраняется.
-- Управляемые ракеты и тепловые ловушки следуют полёту исходного симулятора. Передаются смена и потеря цели, завершение полёта; поздний запуск после уже полученного удаления отбрасывается.
-- Гараж получает финальное состояние машины от её владельца, включая последний ремонт и тюнинг. Повторные запросы не занимают второй слот; штатное сохранение не очищает уже переданную гостем машину.
-- Усилена пересборка внешности при одновременной загрузке множества моделей: одежда дожидается завершения обоих каналов загрузки перед использованием геометрии.
-- Протокол 41: обновите всех игроков и сервер. Личные профили сохраняют формат 5.
+- Исправлена синхронизация состава и окраски миссионных поездов. Ящики, NPC и прикреплённая техника движутся вместе с нужным вагоном, в том числе при смене направления и повторном создании копии.
+- Убрано долгое ожидание поезда из-за выгрузки локомотива во время загрузки вагонов. Запоздавшие события удалённого состава отбрасываются вместе с его прежними привязками.
+- Вспомогательные сюжетные сценарии передают гостям реплики, субтитры, изменения карты, переносы и выдачу оружия. Привязка к общей миссии очищается при завершении или замене сценария.
+- Сюжетные предметы из вспомогательных сценариев появляются у гостей. Предметы спортзала и других личных занятий остаются локальными; их тексты сохраняются во время общих реплик.
+- Временный сюжетный боезапас отделён от личных патронов. После эпизода возвращаются собственное оружие и оставшиеся личные боеприпасы; подобранные патроны и постоянные сюжетные награды сохраняются.
+- Исправлена утечка дополнительных 30 000 патронов, которые GTA выдаёт при прикреплении стрелка. Посадка и отсоединение больше не превращают этот запас в личные боеприпасы гостя.
+- После выхода из режима стрелка вновь выбирается личное оружие, которым игрок пользовался перед эпизодом.
+- Выполнение заданий медика, полицейского и пожарного и их постоянные бонусы сохраняются в личном профиле после переподключения. Новый гость не получает эти достижения из сохранения хоста.
+- В Deconstruction касания объектов машиной гостя учитываются сюжетными проверками с её настоящей скоростью, массой и моделью.
+- Гостевые самолёты удерживают положение во время обязательной сцены, затем получают управление и скорость полёта. Самостоятельный выход из выданного транспорта сохраняется.
+- Исправлена остановка переноса, когда гость уже прикреплён к нужному летящему объекту: переход завершается без ожидания земли под ним.
+- Исправлены места гостевых стрелков вертолёта: тело, камера и точка выстрела располагаются снаружи корпуса с обзором в нужную сторону. Для прикреплённых стрелков применяются заданные сценарием направление и диапазон обзора.
+- В New Model Army гости получают свои RC-вертолёты с магнитами и могут переносить общие грузы. После вступительной камеры возвращаются собственный обзор и управление; один груз удерживает только один вертолёт.
+- Сюжетное затемнение из End of the Line передаётся гостям и снимается вместе со сценой. При выходе из её области восстанавливаются личные эффекты изображения.
+- Устранён конфликт обработки полиции и синхронизации спуска спецназа. При входе хоста в интерьер приземлившийся боец продолжает преследование нужного игрока снаружи.
+- Личные профили сохраняются в формате 6; поддерживается загрузка профилей предыдущей версии.
 
-## English — 0.2.30 fixes
+Обновите мод у хоста, гостей и сервера.
 
-- Prioritized replica creation for mission vehicles, player-used cars, crews and nearby combatants. Diagnostics identify model, seat and native pool waits.
-- Network model requests remain retained until replicas can be created, including police helicopters and SWAT when the observer has no wanted level. Temporary model/texture leases are released; background loading no longer depends on window rendering.
-- Police-helicopter simulators resolve hits once and transmit the target, body part, damage and entity generation. Observers do not independently raycast damage. Delivery delay, helicopter removal and target reconnects are fenced.
-- Guest red markers are placed before GTA activates markers for rendering. Transition readiness checks IPLs at the destination without reloading explicitly removed map sections.
-- Removed the previous 512-map-edit and 128-IPL limits. Late joiners receive a complete current snapshot; its revision, IPLs and replacement models participate in story-stage and cutscene readiness.
-- Shared police rules enter within 280 metres and release beyond 340 metres. Personal wanted levels remain individual.
-- SWAT descent retains a known ground height when its simulator enters an interior. After landing, an ambient officer moves to the simulator still loading that area; observers do not allocate additional physical ropes.
-- Billiards replicates the 16 physical game balls, excluding aiming/score interface objects. Pocketed balls, exit and restart remove obsolete replicas.
-- Checked crouching and both rolls with several weapons and directions. Swimming now transmits the correct native task fields for body pitch, roll, torso and heading; oxygen comes from the owning player.
-- Drowning damage retains fractional damage between frames, preventing high FPS from rounding every small hit to zero. Vehicle submersion, engine shutdown and passenger states replicate consistently.
-- Guest subtitles work even when the host disables subtitles. Each participant retains their own preference; numeric and string substitutions are supported.
-- Captions associated with a voice line wait for actual guest playback and receive their own display duration. Finished lines are not replayed during state recovery.
-- Joining a running cutscene restores its current time, camera, animation and soundtrack position. Periodic clock correction limits accumulated drift.
-- Shared story translations use an independent text table, preserving local gym, shop and other activity captions.
-- Broken world objects retain their state until a world reset. Moving map mechanisms receive simulator election, transform/visibility/collision replication, interpolation and source-change recovery.
-- One-shot sound backlog is separate from desired soundtrack state. Overload may discard stale effects while retaining STOP commands.
-- Guided missiles and flares follow their original simulator's trajectory, including target changes, lock loss and retirement. A delayed launch cannot revive an already retired projectile.
-- Garages receive final vehicle state from its owner, including the latest repair/tuning. Repeated requests reuse one slot; native saving preserves cars already transferred by guests.
-- Clothing rebuilds finish both streaming channels before using part geometry during concurrent model loading.
-- Protocol 41 requires updating all clients and the server. Personal profiles retain format 5.
+Основано на [SA:COOP](https://github.com/Karimov-Akbar/sa-coop) Karimov-Akbar. Доработки reSA-Coop — opiahex. Лицензия MIT.
+
+## English
+
+- Fixed mission train consist and colour replication. Crates, NPCs and attached vehicles stay with the correct carriage, including direction changes and replica recreation.
+- Fixed long train creation waits caused by the locomotive model unloading while carriages were loading. Delayed events from a retired consist cannot restore its old attachments.
+- Mission helper scripts forward dialogue, captions, map changes, relocations and weapon grants to guests. Their mission association ends when the script terminates or its slot is reused.
+- Story pickups created by helper scripts appear for guests. Gym and other personal-activity pickups remain local, and their text remains available during shared dialogue.
+- Temporary mission supply is tracked separately from personal ammunition. Personal weapons and remaining ammunition return after the episode; collected ammunition and permanent story awards are retained.
+- Fixed the additional 30,000 rounds granted by GTA when attaching a gunner leaking into personal ammunition. Attaching and detaching no longer converts that supply into the guest's own rounds.
+- Leaving a gunner role reselects the personal weapon that was active before the episode.
+- Paramedic, Vigilante and Firefighter completion and permanent benefits survive reconnects in each player's profile. New guests do not inherit those achievements from the host's save.
+- In Deconstruction, a guest vehicle's contact with objects is evaluated using its actual speed, mass and model.
+- Guest aircraft hold their position during mandatory scenes, then receive flight control and velocity. Leaving the supplied vehicle remains the player's choice.
+- Relocation completes when the guest is already attached to the correct airborne object, instead of waiting for ground below it.
+- Corrected guest helicopter gunner positions: the body, camera and shot origin sit outside the hull with the view facing the intended direction. Attached gunners also receive the script's view direction and range.
+- In New Model Army, guests receive their own RC helicopters and magnets and can move shared cargo. Their own view and controls return after the fixed intro; each item can be held by only one helicopter.
+- Guests receive the scripted darkness effect used in End of the Line, including its removal. Leaving the scene's area restores personal visual effects.
+- Resolved a conflict between police processing and SWAT descent synchronization. When the host enters an interior, a landed officer continues pursuing the correct player outside.
+- Personal profiles use format 6 and retain support for profiles from the previous version. Update all clients and the server together.
+
+Based on [SA:COOP](https://github.com/Karimov-Akbar/sa-coop) by Karimov-Akbar. reSA-Coop development by opiahex. MIT license.
 
 ## Установка / Installation
 
@@ -56,7 +54,7 @@
 
 Extract the ZIP beside `gta_sa.exe`, preserving settings and `coop/server-data`. Run `install.bat` if an ASI loader is needed; open F9 in-game. A separate `coop.dll` is not required.
 
-**Протокол 41: обновите всех игроков и сервер. / Protocol 41: update every client and the server.**
+**Протокол 42: обновите всех игроков и сервер. / Protocol 42: update every client and the server.**
 
 [Полная история изменений / Complete changelog](https://github.com/opiahex/reSA-Coop/blob/main/CHANGELOG.md).
 
