@@ -1,47 +1,62 @@
-**reSA-Coop is an actively maintained, fixed version of the GTA San Andreas cooperative mod, developed for three players.**
+**reSA-Coop is an actively developed SA:COOP fork with fixes for three-player cooperative play.**
 
-Key fixes and improvements:
+[![Release](https://img.shields.io/github/v/release/opiahex/reSA-Coop?label=release)](https://github.com/opiahex/reSA-Coop/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/opiahex/reSA-Coop/total?label=downloads)](https://github.com/opiahex/reSA-Coop/releases)
+[![License](https://img.shields.io/github/license/opiahex/reSA-Coop)](LICENSE)
 
-- Vehicle duplication/disappearance during ownership changes, carjacking and interior transitions.
-- Host-priority population around nearby players, with separate population zones for distant players.
-- Guest engine starting, simultaneous seat conflicts and motorcycle passenger entry.
-- Vehicle colours, body variants, cargo, rotors, wheel rotation, punctures and repairs.
-- Story dialogue queues and recovery of cameras, screen fades, HUD and controls.
-- Fire extinguishing, mission objects, pickups, checkpoints and missing replica recovery.
-- Guest story actions, scripted rides, hit processing, animations and stealth kills.
-- Crash prevention around projectiles, occupied vehicle deletion, world loading and reconnects.
+# reSA-Coop
 
-[Download ready-to-install builds](https://github.com/opiahex/reSA-Coop/releases) · [Complete cumulative changelog](CHANGELOG.md) · [Русский](README.md)
+Play GTA San Andreas with a host and two guests. The host loads a save and starts missions; each player keeps their own money, weapons, skills and appearance. Gyms, schools and side jobs can be played separately.
 
-## About
+[Download](https://github.com/opiahex/reSA-Coop/releases/latest) · [Changelog RU / EN](CHANGELOG.md) · [Русский](README.md)
 
-An independent fork of [SA:COOP](https://github.com/Karimov-Akbar/sa-coop), prioritising more active testing, fuller guest participation and a consistent three-player world.
-The host runs the original story from their save. Two guests join with separate money, equipment, skills and appearance.
-Mandatory story characters and native mission logic remain intact; no extra personal objectives or role HUD are added.
-Side activities remain personal, and each player controls their own radio.
+## Fixes
 
-Current baseline: **0.2.29-3p, protocol 40**. This version adds fixes for remote movement beyond 20 metres, campaign-progress restoration, helicopter rounds, SWAT ropes, billiard balls, story map changes and railway-track selection. Wanted rules and population retention during resurrection have been refined. Earlier fixes are included. Complete campaign coverage and arbitrary third-party mod combinations still require further testing.
+- Vehicle duplication and disappearance during carjacking, disconnects and interior transitions.
+- Guests starting engines, seat conflicts and NPCs dragging drivers out of cars.
+- Vehicle colours, body variants, cargo, wheels, damage, repairs and rotor speed.
+- Traffic and NPC population: a shared zone near the host, separate zones when players travel apart.
+- Cameras, subtitles, story dialogue and control recovery after scenes.
+- Mission objects, fire, map changes and recovery of missing network entities.
 
-## Install and play
+Supported story rides provide extra vehicles or seats for guests when the mission calls for them. A normal ride does not become a scripted shooting sequence.
 
-1. Use GTA San Andreas **1.0 US**. Definitive Edition is unsupported.
-2. Download **reSA-Coop-…-win32.zip** from [Release Assets](https://github.com/opiahex/reSA-Coop/releases), rather than the source-code archives.
-3. Extract beside `gta_sa.exe`, including `coop.asi`, `install.bat` and `coop/`.
-4. Run `install.bat` if an ASI loader is needed. The original game library is retained as `vorbisHooked.dll`.
-5. Open **F9** in the game. The host creates a session and shares its code; guests enter it under Connect.
+See the [changelog](CHANGELOG.md) for the full history. Not every mission or third-party mod combination has been tested. Report problems in [Issues](https://github.com/opiahex/reSA-Coop/issues).
 
-Update all clients and the server together. Keep your settings and `coop/server-data` when updating.
-`coop.asi` is the game module; players do not need an additional `coop.dll`.
-Allow the game/server through Windows Firewall. Direct connectivity depends on the network; connection and relay settings are available in the mod menu.
+## Installation
 
-Important story markers wait for connected participants. Regular health, money and weapon pickups remain independent.
-Any participant's death triggers the shared mission's native failure path. Successful positive mission rewards are credited once per player.
-Supported scripted transport mechanics provide overflow rides when required; ordinary escorts are optional, and a gunner role requires an actual scripted shooting section.
-Use compatible story scripts, handling data and model collisions across clients.
+Requires **GTA San Andreas 1.0 US for Windows**. Definitive Edition is not supported.
 
-## Build and contribute
+1. Download **reSA-Coop-…-win32.zip** from the [latest release](https://github.com/opiahex/reSA-Coop/releases/latest).
+2. Extract the entire archive beside `gta_sa.exe`.
+3. Run `install.bat` if you do not already have an ASI loader.
+4. Start the game and press **F9**.
 
-Windows, Python 3.10+ and PowerShell are required:
+The archive includes `coop.asi` and the `coop` folder containing the server and other mod files. Players do not need a separate `coop.dll`. The **Source code** archives are for building the project yourself.
+
+Keep your settings and `coop/server-data` player profiles when updating. **All players and the server must use the same mod version.**
+
+## Connecting
+
+The host opens **F9 → Create game**, selects a save and shares the session code. Guests enter it through **F9 → Connect**. The built-in server starts automatically; allow network access when Windows asks.
+
+The host starts story missions. Important story markers wait for the other participants, and a participant's death fails the shared mission. Regular pickups and personal activities do not require everyone to gather.
+
+Use matching story scripts, vehicle handling data and model collisions across players.
+
+## Reporting a problem
+
+Include the version, mission name and steps leading to the problem in an [issue](https://github.com/opiahex/reSA-Coop/issues). For synchronization problems, attach logs from the affected players for the same session:
+
+- `coop/coop.log`;
+- `coop/crash.log` if the game crashed;
+- matching files from `coop/diagnostics`.
+
+List your installed modifications and check attachments for personal information before posting.
+
+## Building
+
+Requires Windows, Python 3.10+ and PowerShell:
 
 ```powershell
 ./tools/get-toolchain.ps1
@@ -50,15 +65,10 @@ python tools/i18n_check.py
 python tools/build.py dist
 ```
 
-The installer archive is `dist/SA-COOP.zip`. Existing binary names are retained for compatibility.
-GitHub Actions builds `main`; a `v…` tag publishes a compiled ZIP and checksum to Releases.
-Private gameplay fixtures, session recordings, saves and game assets are excluded.
-
-For [bug reports](https://github.com/opiahex/reSA-Coop/issues), include the mod version, mission, host/guest roles, reproduction steps and installed modifications.
-Attach `coop/coop.log`, `coop/crash.log` for crashes, and matching session diagnostics from all affected players when possible. Review attachments for private data before publishing.
+The installable archive is `dist/SA-COOP.zip`. Game files are not included.
 
 ## Credits
 
-Based on [Karimov-Akbar/sa-coop](https://github.com/Karimov-Akbar/sa-coop); original copyright notices are retained.
-Licensed under [MIT](LICENSE), with ENet/MinHook notices in the binary package.
-Not affiliated with Rockstar Games. GTA San Andreas is not distributed with this mod.
+SA:COOP by [Karimov-Akbar](https://github.com/Karimov-Akbar/sa-coop). reSA-Coop development by [opiahex](https://github.com/opiahex).
+
+Licensed under [MIT](LICENSE). Copyright notices are retained; ENet and MinHook licenses are included in the archive. This project is not affiliated with Rockstar Games.

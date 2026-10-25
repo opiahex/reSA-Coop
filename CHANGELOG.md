@@ -2,7 +2,55 @@
 
 Первая публикация форка объединяет локальные версии **0.2.6-3p–0.2.24-3p** и перенесённые исправления SA:COOP.
 Это перечень итоговых изменений по подсистемам: промежуточные экспериментальные решения, которые были заменены, отдельными возможностями не считаются.
-Текущая база — **0.2.29-3p, протокол 40**. Все участники и сервер должны обновляться вместе.
+Текущая база — **0.2.30-3p, протокол 41**. Все участники и сервер должны обновляться вместе.
+
+## 0.2.30-3p
+
+### Русский
+
+- Ускорено создание сетевых копий: миссионный транспорт, используемые игроками машины, экипажи и ближайшие участники боя получают приоритет. Причины ожидания моделей, мест и пулов выводятся в диагностику.
+- Загрузка сетевых моделей удерживается до создания копии, включая полицейские вертолёты и спецназ у гостей без розыска. Временные удержания моделей и текстур освобождаются; обслуживание загрузки не зависит от отрисовки окна.
+- Попадания полицейского вертолёта определяет его симулятор. Передаются конкретная цель, часть тела, урон и поколение сущности; наблюдатели не пересчитывают попадание независимо. Учитываются задержка доставки, удаление вертолёта и переподключение цели.
+- Исправлен порядок обновления гостевых красных маркеров: GTA успевает активировать их перед отрисовкой. Готовность перехода проверяет IPL нужной точки; явно удалённые части карты не загружаются заново.
+- Убраны прежние пределы 512 изменений карты и 128 IPL. Позднее подключение получает полный снимок актуальных изменений; их ревизия, IPL и заменённые модели входят в готовность сюжетного этапа и катсцены.
+- Общие правила полиции включаются ближе 280 метров и отпускаются дальше 340 метров. Личные звёзды розыска остаются индивидуальными.
+- Для спуска спецназа сохраняется найденная высота земли при уходе владельца в интерьер. После приземления обычный боец передаётся игре, которая продолжает загружать его район; копии не создают собственную физическую верёвку.
+- Бильярд передаёт 16 игровых шаров, исключая вспомогательные объекты прицела и счёта. Забитые шары, завершение и повторный запуск не оставляют прежние сетевые копии.
+- Проверены присед и оба переката с несколькими типами оружия и направлениями. Передача плавания исправлена по реальным полям задачи GTA: наклон, крен, торс и направление; запас воздуха приходит от владельца игрока.
+- Урон от утопления сохраняет дробную часть между кадрами: высокий FPS больше не округляет каждое небольшое повреждение в ноль. Затопление машины, остановка двигателя и состояния пассажиров передаются согласованно.
+- Исправлены пропадающие субтитры гостей при отключённых субтитрах у хоста. Настройка каждого игрока действует независимо; поддерживаются строки с подстановкой чисел и текста.
+- Субтитр связанной реплики ждёт фактического начала звука у гостя и получает своё время показа. Завершённые реплики не запускаются повторно при восстановлении состояния.
+- Подключение посреди катсцены восстанавливает текущее время, камеру, анимации и положение звуковой дорожки. Периодическая коррекция ограничивает накопление расхождения часов.
+- Общие сюжетные переводы загружаются отдельно от местной таблицы гостя: спортзал, магазин и другие личные занятия сохраняют свои надписи.
+- Разрушенные обычные объекты сохраняют состояние до смены мира. Для подвижных механизмов карты добавлены выбор симулятора, передача положения, поворота, видимости и коллизии, интерполяция и восстановление при смене источника.
+- Очередь одноразовых звуков отделена от состояния сюжетной дорожки. При перегрузке отбрасываются устаревшие эффекты, а команда остановки сохраняется.
+- Управляемые ракеты и тепловые ловушки следуют полёту исходного симулятора. Передаются смена и потеря цели, завершение полёта; поздний запуск после уже полученного удаления отбрасывается.
+- Гараж получает финальное состояние машины от её владельца, включая последний ремонт и тюнинг. Повторные запросы не занимают второй слот; штатное сохранение не очищает уже переданную гостем машину.
+- Усилена пересборка внешности при одновременной загрузке множества моделей: одежда дожидается завершения обоих каналов загрузки перед использованием геометрии.
+- Протокол 41: обновите всех игроков и сервер. Личные профили сохраняют формат 5.
+
+### English
+
+- Prioritized replica creation for mission vehicles, player-used cars, crews and nearby combatants. Diagnostics identify model, seat and native pool waits.
+- Network model requests remain retained until replicas can be created, including police helicopters and SWAT when the observer has no wanted level. Temporary model/texture leases are released; background loading no longer depends on window rendering.
+- Police-helicopter simulators resolve hits once and transmit the target, body part, damage and entity generation. Observers do not independently raycast damage. Delivery delay, helicopter removal and target reconnects are fenced.
+- Guest red markers are placed before GTA activates markers for rendering. Transition readiness checks IPLs at the destination without reloading explicitly removed map sections.
+- Removed the previous 512-map-edit and 128-IPL limits. Late joiners receive a complete current snapshot; its revision, IPLs and replacement models participate in story-stage and cutscene readiness.
+- Shared police rules enter within 280 metres and release beyond 340 metres. Personal wanted levels remain individual.
+- SWAT descent retains a known ground height when its simulator enters an interior. After landing, an ambient officer moves to the simulator still loading that area; observers do not allocate additional physical ropes.
+- Billiards replicates the 16 physical game balls, excluding aiming/score interface objects. Pocketed balls, exit and restart remove obsolete replicas.
+- Checked crouching and both rolls with several weapons and directions. Swimming now transmits the correct native task fields for body pitch, roll, torso and heading; oxygen comes from the owning player.
+- Drowning damage retains fractional damage between frames, preventing high FPS from rounding every small hit to zero. Vehicle submersion, engine shutdown and passenger states replicate consistently.
+- Guest subtitles work even when the host disables subtitles. Each participant retains their own preference; numeric and string substitutions are supported.
+- Captions associated with a voice line wait for actual guest playback and receive their own display duration. Finished lines are not replayed during state recovery.
+- Joining a running cutscene restores its current time, camera, animation and soundtrack position. Periodic clock correction limits accumulated drift.
+- Shared story translations use an independent text table, preserving local gym, shop and other activity captions.
+- Broken world objects retain their state until a world reset. Moving map mechanisms receive simulator election, transform/visibility/collision replication, interpolation and source-change recovery.
+- One-shot sound backlog is separate from desired soundtrack state. Overload may discard stale effects while retaining STOP commands.
+- Guided missiles and flares follow their original simulator's trajectory, including target changes, lock loss and retirement. A delayed launch cannot revive an already retired projectile.
+- Garages receive final vehicle state from its owner, including the latest repair/tuning. Repeated requests reuse one slot; native saving preserves cars already transferred by guests.
+- Clothing rebuilds finish both streaming channels before using part geometry during concurrent model loading.
+- Protocol 41 requires updating all clients and the server. Personal profiles retain format 5.
 
 ## 0.2.29-3p
 
