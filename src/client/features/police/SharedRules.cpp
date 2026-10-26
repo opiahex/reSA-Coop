@@ -9,6 +9,7 @@
 #include "entities/vehicle/Vehicles.h"
 #include "entities/session/Flow.h"
 #include "shared/api/net-session/Session.h"
+#include "shared/api/gangwar/GangWarCoop.h"
 #include "shared/game/Anim.h"
 #include "shared/lib/core/Core.h"
 #include "shared/lib/memory/Memory.h"
@@ -53,8 +54,14 @@ bool Nearby(){
     return Net().Online()&&!Net().IsHost()&&me&&flow::InHostWorld()&&!PlayerTraining(Net().MyId())&&rp&&rp->hasState&&NowMs()-rp->stateRecvMs<1500&&rp->state.area==AreaOf(me)&&(rp->state.pos-me->GetPosition()).Length()<(applied?340.f:280.f)&&received&&NowMs()-received<3500;
 }
 using WarFn=bool(__cdecl*)();WarFn originalWar[2]{};
-bool __cdecl War0(){return originalWar[0]()||(remote.war&&Nearby());}
-bool __cdecl War1(){return originalWar[1]()||(remote.war&&Nearby());}
+bool LocalCooperativeWar(){
+    // A native police callback may currently borrow the offender's slot.
+    // The global battle flag alone would exempt an unrelated distant player.
+    auto*me=core::IsPlayerReady()?FindPlayerPed():nullptr;
+    return me&&CooperativeGangWarFightingAt(me->GetPosition(),AreaOf(me));
+}
+bool __cdecl War0(){return Net().Online()&&core::IsPlayerReady()?LocalCooperativeWar():originalWar[0]();}
+bool __cdecl War1(){return Net().Online()&&core::IsPlayerReady()?LocalCooperativeWar():originalWar[1]();}
 Rules Capture(){Rules r;auto*w=FindPlayerPed(0)->Wanted();r.max=(uint8_t)Ref<int32_t>(0x8CDEE4);r.ignore=Field<uint8_t>(w,0x1E)&5;r.multiplier=Field<float>(w,0x14);return r;}
 void Apply(const Rules&r){auto*w=FindPlayerPed(0)->Wanted();Call<0x561E70>((int)r.max);Field<uint8_t>(w,0x1E)=(Field<uint8_t>(w,0x1E)&~5u)|(r.ignore&5);Field<float>(w,0x14)=r.multiplier;}
 void Restore(){if(applied&&core::IsPlayerReady()){Apply(own);applied=false;LOGD("Shared police rules released");}}

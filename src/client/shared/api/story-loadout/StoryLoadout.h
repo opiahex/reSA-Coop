@@ -4,6 +4,10 @@ namespace coop {
 // Host story inventory changes are provisional until native mission cleanup
 // confirms which weapons remain. Personal inventory is tracked separately.
 void ApplyStoryMissionWeapon(uint8_t operation,int weapon,int ammo,bool inHand);
+// Explicit REMOVE_ALL_CHAR_WEAPONS from the shared host script. Targeted to
+// the participating connection, independently of temporary weapon loans.
+void ApplyStoryMissionStrip(uint8_t from,uint32_t world,uint64_t run,uint32_t phase,
+                            uint32_t sequence,uint8_t target,uint32_t targetIncarnation);
 void RestoreStoryMissionWeapons();
 void PersonalStoryWeapon(int slot,int&weapon,int&ammo);
 // Snapshot for a role's eventual release. Resolve a story-selected loan back

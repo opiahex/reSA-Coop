@@ -165,7 +165,7 @@ enum MsgId : uint8_t {
 
     G_SYNC_AUDIT = 156, // bounded diagnostic owner manifest; never changes authority
     G_ENTITY_REQUEST = 157, // reliable request for one authoritative entity announcement
-    G_VEH_CONTACT = 158, // reliable, once-resolved native cross-owner collision impulse
+    G_VEH_CONTACT = 158, // reliable native cross-owner collision impulse and accepted damage witness
     G_ACTIVITY_STATE = 159, // reliable: readiness, population availability and private school activity
     G_AUDIO_RECEIPT = 160, // reliable: guest slot/token/event and playback milestone; diagnostics only
     G_MISSION_STATE = 161, // reliable periodic mission revision + active/name; no script memory copied
@@ -189,6 +189,8 @@ enum MsgId : uint8_t {
     G_STORY_WORLD = 177, // host map/IPL edits, campaign counters; op7 run/phase/area darkness
     G_POLICE_RULES = 178, // nearby host gang-war and story police policy
     G_PROJECTILE_FLIGHT = 179, // authoritative guided flight/target/retirement
+    G_GANG_WAR = 180, // owner-confirmed provocation and authoritative native gang-war context
+    G_AIRPORT_GATE = 181, // native airport gate authority, access and movement state
     G_VOICE = 200,            // unreliable: voice frame
     G_LAST = 255,
 };
@@ -240,6 +242,7 @@ struct PlayerEntry {
 
 struct Welcome {
     uint8_t yourId = 0;
+    uint32_t yourIncarnation = 0;
     uint8_t hostId = 0;
     std::string serverName;
     std::string motd, motdEn;
@@ -262,6 +265,7 @@ struct Welcome {
         }
         w.Str(motdEn, 512);
         w.Bool(friendlyFire);
+        w.U32(yourIncarnation);
     }
     bool Read(Reader& r) {
         yourId = r.U8();
@@ -281,6 +285,7 @@ struct Welcome {
         }
         motdEn = r.Str(512);
         friendlyFire = r.Bool();
+        yourIncarnation = r.U32();
         return r.Ok();
     }
 };

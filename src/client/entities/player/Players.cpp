@@ -318,9 +318,33 @@ using ProcessControlFn = void(__fastcall*)(CPlayerPed*, void*);
 ProcessControlFn g_origProcessControl = nullptr;
 bool g_inRemoteContext = false;
 
+bool HasRCBody(uint8_t player) {
+    StoryRemoteRole role;
+    return CooperativeRemoteRole(player, role);
+}
+
+// RC input belongs to the native remote vehicle, not the on-foot controller's
+// task tree. Restore it before CPlane/CAutomobile processes the actual vehicle.
+struct RCBodyPadScope {
+    CControllerState current[2], previous[2];
+    bool held;
+    explicit RCBodyPadScope(bool active) : held(active) {
+        if (!held) return;
+        for (int i=0;i<2;++i) {
+            auto* pad=GetPad(i);current[i]=pad->NewState;previous[i]=pad->OldState;
+            pad->NewState={};pad->OldState={};
+        }
+    }
+    ~RCBodyPadScope() {
+        if (!held) return;
+        for (int i=0;i<2;++i) { GetPad(i)->NewState=current[i];GetPad(i)->OldState=previous[i]; }
+    }
+};
+
 void __fastcall HookPlayerProcessControl(CPlayerPed* self, void* edx) {
     RemotePlayer* rp = g_inRemoteContext ? nullptr : Players::Instance().FindByPed(self);
     if (!rp) {
+        RCBodyPadScope body(Net().Online()&&self==FindPlayerPed(0)&&HasRCBody(Net().MyId()));
         g_origProcessControl(self, edx);
         return;
     }
@@ -329,6 +353,7 @@ void __fastcall HookPlayerProcessControl(CPlayerPed* self, void* edx) {
     {
         PlayerSlotContext remoteSlot(*PlayerInfo(kRemoteSlot), rp->info);
         ApplyRemote(*rp);
+        RCBodyPadScope body(HasRCBody(rp->id));
         g_inRemoteContext = true;
         g_origProcessControl(self, edx);
         DriveBy(self);  // still under its pad and camera
@@ -1796,7 +1821,8 @@ void Players::SendLocalState() {
     st.wanted = WantedLevel(me);
     st.policeFlags = PoliceFlags(me);
     CPad* pad = GetPad(0);
-    if (pad->DisablePlayerControls == 0 && !game::MenuActive()) st.pad = PadState::From(pad->NewState);
+    if (pad->DisablePlayerControls == 0 && !game::MenuActive() && !HasRCBody(Net().MyId()))
+        st.pad = PadState::From(pad->NewState);
     CameraState& c = st.cam;
     c.mode = cam::Mode();
     c.weaponMode = cam::WeaponMode();

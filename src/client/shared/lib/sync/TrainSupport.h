@@ -10,9 +10,13 @@ struct TrainAttachment {
     void Write(Writer&w)const{w.Entity(ENTITY_TRAIN,id,ENTITY_USE|ENTITY_OPTIONAL,owner,generation);w.U8(owner);w.U8(carriage);w.U64(generation);}
     bool Read(Reader&r){id=r.U16();owner=r.U8();carriage=r.U8();generation=r.U64();return r.Ok()&&(Valid()||(!id&&owner==255&&!carriage&&!generation));}
 };
+// owner is the immutable birth scope, not the current simulation authority.
 // Attachments retain the train's incarnation, not just its reusable support key.
 bool DescribeTrainAttachment(game::CVehicle*vehicle,TrainAttachment&out);
 game::CVehicle* ResolveTrainAttachment(const TrainAttachment&attachment);
+uint8_t TrainAuthorityOf(const TrainAttachment&attachment);
+// Transfers simulation only; native carriage pointers and identity remain intact.
+bool HandoverTrainAuthority(game::CVehicle*engine,uint8_t peer);
 inline std::map<uint16_t,TrainSupport>&TrainSupports(){static std::map<uint16_t,TrainSupport>map;return map;}
 inline uint16_t TrainSupportKey(uint8_t owner,uint16_t train,uint8_t carriage){return (uint16_t)(0x8000u|((owner+1u)<<12)|((train&255u)<<4)|(carriage&15u));}
 inline game::CVehicle* ResolveTrainSupport(uint16_t id){auto it=TrainSupports().find(id);if(it==TrainSupports().end())return nullptr;auto&s=it->second;return game::IsVehicleValid(s.vehicle)&&game::GetVehicleRef(s.vehicle)==s.handle?s.vehicle:nullptr;}

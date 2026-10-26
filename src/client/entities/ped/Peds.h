@@ -97,6 +97,7 @@ struct NetPed {
     float animTime = 0;                         // owner's time of it in the latest state (restarts go back)
     bool animFull = false;                      // it is not partial: locomotion tasks must wait
     bool extraFull=false,interactionAttached=false,interactionPending=false,pairedAction=false;
+    float interactionAge=0; // signed sender-clock offset for a paired pose
     AnimationState extraLayers[PedInteraction::LayerCount];
     uint8_t handArm=255;uint16_t pairAnchor=0;game::CVector pairOffset;
     bool actionSentActive=false;

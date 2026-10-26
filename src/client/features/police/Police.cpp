@@ -83,6 +83,12 @@ void __fastcall DamageCrime(void*event,void*edx,CPed*witness){
             LOGD("Police replica damage crime suppressed source=%u witness=%d",Players::Instance().FindByPed((CPed*)source)->id,witness?GetPedRef(witness):-1);
             return; // the shooter's game reports this crime once
         }
+        // A witness may report this event from inside another suspect's AI
+        // callback. Native ReportCriminalEvent uses the focused slot, not the
+        // event's player. Keep a local offender's crime in their own slot.
+        if(source==FindPlayerPed(0)){
+            Context c(FindPlayerPed(0));originalDamageCrime(event,edx,witness);return;
+        }
     }
     originalDamageCrime(event,edx,witness);
 }
@@ -90,7 +96,7 @@ using StolenCarFn=void(__fastcall*)(void*,void*,void*,void*,void*);
 StolenCarFn originalStolenCar=nullptr;
 void __fastcall StolenCopCar(void*handler,void*edx,void*event,void*active,void*simple){
     auto*hijacker=Field<CPed*>(event,0x0C);
-    if(Net().Online()&&hijacker&&Players::Instance().FindByPed(hijacker)){
+    if(Net().Online()&&hijacker&&(hijacker==FindPlayerPed(0)||Players::Instance().FindByPed(hijacker))){
         Context c((CPlayerPed*)hijacker);originalStolenCar(handler,edx,event,active,simple);return;
     }
     originalStolenCar(handler,edx,event,active,simple);

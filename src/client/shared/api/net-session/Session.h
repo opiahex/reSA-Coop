@@ -37,6 +37,7 @@ public:
     bool Online() const { return m_state == State::Online; }
     bool IsHost() const { return Online() && m_hostId == m_myId; }
     uint8_t MyId() const { return m_myId; }
+    uint32_t MyIncarnation() const { return Online() ? m_myIncarnation : 0; }
     uint8_t HostId() const { return m_hostId; }
     const std::string& FailReason() const { return m_failReason; }
     const std::string& ServerName() const { return m_serverName; }
@@ -50,6 +51,13 @@ public:
     void Send(uint8_t channel, const Writer& w);
     uint64_t BeginEntity(uint8_t kind,uint16_t id,uint8_t scope=255){return m_entities.Begin(kind,id,kind>ENTITY_OBJECT&&scope==255?m_myId:scope);}
     bool EntityLive(uint8_t kind,uint16_t id,uint8_t scope=255)const{return m_entities.Live(kind,id,scope);}
+    // Authority-dependent removal (for example a handed-over train) is retired
+    // only after its module has validated the sender and authority revision.
+    bool RetireEntity(uint8_t kind,uint16_t id,uint8_t scope,uint64_t generation){
+        auto i=m_entities.records.find(EntityRef{kind,scope,id}.Key());
+        if(!generation||i==m_entities.records.end()||!i->second.live||i->second.generation!=generation)return false;
+        i->second.live=false;i->second.links.clear();return true;
+    }
     uint64_t ExpectedEntityGeneration(uint8_t kind,uint16_t id)const{for(auto&ref:m_entityContext)if(ref.kind==kind&&ref.id==id)return ref.generation;return m_entities.Current(kind,id);}
     uint64_t EntityGeneration(uint8_t kind,uint16_t id,uint8_t scope=255)const{return m_entities.Current(kind,id,scope);}
     bool EntityLink(uint8_t root,uint16_t id,uint8_t target,uint16_t other,uint8_t scope=255)const{return m_entities.Link(root,id,target,other,scope);}
@@ -60,8 +68,9 @@ public:
     size_t EntityPacketsWaiting()const{return m_entityWaiting.size();}
     void AdvanceWorldEpoch(){if(++m_worldEpoch==0)++m_worldEpoch;}
     uint32_t WorldEpoch()const{return m_worldEpoch;}
+    uint32_t PeerWorldEpoch(uint8_t peer)const{return peer<m_epochs.peers.size()?m_epochs.peers[peer]:0;}
     uint64_t StalePacketsDiscarded()const{return m_epochs.discarded;}
-    uint64_t QueuedPacketsDiscarded()const{return m_expiredPackets;}
+    uint64_t QueuedPacketsDiscarded()const{return m_expiredPackets+m_net.ExpiredReceivePackets();}
     void SendChat(const std::string& text);
 
     void SetHandler(uint8_t msgId, Handler h) { m_handlers[msgId] = h; }
@@ -87,7 +96,7 @@ public:
 
 private:
     void HandleService(uint8_t id, Reader& r);
-    bool DispatchGame(uint8_t from,uint8_t id,uint8_t channel,uint32_t epoch,uint32_t connection,const std::vector<EntityRef>&refs,const uint8_t*data,size_t size,bool queue);
+    bool DispatchGame(uint8_t from,uint8_t id,uint8_t channel,uint32_t epoch,uint32_t connection,const std::vector<EntityRef>&refs,const uint8_t*data,size_t size,uint64_t received,bool queue);
     struct DeferredEntityPacket{uint8_t from=0,id=0,channel=0;uint32_t epoch=0,connection=0;uint64_t received=0;std::vector<EntityRef> refs;std::vector<uint8_t> data;};
     EntityGenerations m_entities;
     std::vector<EntityRef> m_entityContext;
@@ -99,6 +108,7 @@ private:
     std::string m_nick, m_password;
     bool m_wantsHost = false;
     uint8_t m_myId = 255, m_hostId = 255;
+    uint32_t m_myIncarnation = 0;
     std::string m_serverName;
     bool m_friendlyFire = false;
     std::string m_inviteCode;
@@ -108,6 +118,7 @@ private:
     uint32_t m_worldEpoch=1;
     EpochFence m_epochs;
     uint64_t m_expiredPackets=0;
+    uint64_t m_connectionRevision=0;
     // world download
     std::vector<uint8_t> m_world;
     uint32_t m_worldExpected = 0, m_worldRecv = 0, m_worldCrc = 0;

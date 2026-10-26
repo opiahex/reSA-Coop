@@ -27,6 +27,8 @@
 #include "shared/api/story-loadout/StoryLoadout.h"
 #include "shared/api/story-coop/StoryCoop.h"
 #include "shared/api/story-rc/StoryRC.h"
+#include "shared/api/story-rc-flight/StoryRCFlight.h"
+#include "shared/api/airport-gates/AirportGates.h"
 #include "shared/api/story-stage/StoryStage.h"
 #include "shared/lib/sync/StoryPosition.h"
 #include "shared/lib/sync/StoryContinuation.h"
@@ -105,7 +107,7 @@ bool PersonalActivity(void* script) {
         if (ip && Field<uint16_t>(ip, 0) == 0x03A4 && ip[2] == 9) name = (const char*)ip + 3;
     }
     static const char* const own[] = {"none", "dual", "shtr", "grav", "otb", "pool2", "lowr", "zero5", "truck", "boat", "blood", "tria", "bcour", "stunt", "oddveh", "taxiodd", "ambulan", "firetru", "copcar", "pimp", "freight", "trainsl",
-        "trace", "hotr", "kicks", "kicksta", "bloodr", "dskool", "bskool", "bschoo", "psch", "bikes",
+        "trace", "hotr", "kicks", "kicksta", "bloodr", "dskool", "bskool", "bschoo", "psch", "desert5", "bikes",
         "gym", "gymls", "gymsf", "gymlv", "shoot", "shrange", "trucks", "quarry", "quarrys", "burgjb", "valet_l", "mtbiker", "cprace", "bbchal", "barb", "tatto", "blackj", "roulete", "bandit", "vidpok", "wheelo"};
     static const char*const prefixes[]={"gym","shop","food","pizza","chick","burger","barber","tattoo","wardrob","warrobe","psave","buypro","intman","entext","barguy","barstaf","amunat","browse","car_mod","carmod","vending","fodvend","hotdog","gfdate","gfmeet"};
     for(auto prefix:prefixes)if(!_strnicmp(name,prefix,strlen(prefix)))return true;
@@ -368,9 +370,10 @@ bool Replicating() { return Net().Online() && Net().IsHost() && !Net().Peers().e
 
 // ---------------------------------------------------------------- partner: no mission triggers
 void ScriptFaded(int16_t dir, float seconds);
-enum : uint8_t { WEAPON_GIVE = 1, WEAPON_TAKE = 2, WEAPON_FINAL = 3 };
+enum : uint8_t { WEAPON_GIVE = 1, WEAPON_TAKE = 2, WEAPON_FINAL = 3, WEAPON_STRIP = 4 };
 std::set<int> g_hostMissionWeapons;
 uint64_t g_hostWeaponRun = 0;
+uint32_t g_storyStripSequence = 0;
 
 // What the host's mission does to its CJ's weapons (GIVE_WEAPON_TO_CHAR $PLAYER_ACTOR, REMOVE_WEAPON_FROM_CHAR) the
 // partner gets as well: the spray can of "Tagging Up Turf", the guns some missions hand out. Seen as the change of CJ's
@@ -475,7 +478,9 @@ void __fastcall HookScriptProcess(void* script, void* edx) {
     }
     auto timersBefore=Field<std::array<int32_t,2>>(script,0xBC);
     bool personalDriving=BeginPersonalDrivingSchool(script);
+    BeginAirportGateScript(script);
     g_origScriptProcess(script, edx);
+    EndAirportGateScript(script);
     if(personalDriving)EndPersonalDrivingSchool();
     if(!Field<uint8_t>(script,0xC4))CancelCooperativeStage(script);
     if(CooperativeStageWaiting(script))Field<std::array<int32_t,2>>(script,0xBC)=timersBefore;
@@ -533,6 +538,12 @@ void HandleMissionWeapon(uint8_t from, Reader& r) {
     int weapon = r.U8();
     int ammo = r.I32();
     bool inHand = r.U8() != 0;
+    if (op == WEAPON_STRIP) {
+        auto world = r.U32(), phase = r.U32(), sequence = r.U32(), incarnation = r.U32();
+        if (r.Ok() && weapon == 0 && ammo == 0 && !inHand)
+            ApplyStoryMissionStrip(from, world, run, phase, sequence, target, incarnation);
+        return;
+    }
     if (!r.Ok() || from != Net().HostId() || Net().IsHost() || !core::IsPlayerReady() || !flow::InHostWorld() ||
         !run || run != StoryRunId() || (target != proto::kServerId && target != Net().MyId()) || op < WEAPON_GIVE || op > WEAPON_FINAL || weapon <= 0 || weapon > 46 ||
         ammo < (op == WEAPON_FINAL ? -1 : 0)) return;
@@ -737,8 +748,28 @@ ObjectCommand ReadStoryObject(void*script,int opcode){
 CommandsFn g_objectCommands[27]{};
 template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int opcode){
     const int chainOp=opcode&0x7FFF;
+    // These are native main.scm helpers, not children of a story mission.
+    // Only their qualified airport commands may replace native movement.
+    if (script == g_currentScript) {
+        int count = AirportGateOperandCount(script, chainOp);
+        if (count > 0 && count <= 8) {
+            alignas(16) uint8_t copy[0xE0]; memcpy(copy, script, sizeof copy);
+            uint32_t saved[32]; memcpy(saved, (void*)0xA43C78, sizeof saved);
+            int32_t parameters[8]{};
+            CallMethod<0x464080>(copy, count);
+            memcpy(parameters, (void*)0xA43C78, count * 4);
+            auto* next = Field<uint8_t*>(copy, 0x14);
+            memcpy((void*)0xA43C78, saved, sizeof saved);
+            bool value = false;
+            if (HandleAirportGateCommand(script, chainOp, parameters, value)) {
+                Field<uint8_t*>(script, 0x14) = next;
+                if (chainOp == 0x0018 || chainOp == 0x0038 || chainOp == 0x034E || chainOp == 0x0471) CallMethod<0x4859D0>(script, value);
+                return 0;
+            }
+        }
+    }
     bool story=script==g_currentScript&&SharedStoryScript(script)&&Replicating();
-    if(story)ObserveCooperativeRCMissionScript(script);
+    if(story){ObserveCooperativeRCMissionScript(script);ObserveCooperativeRCFlightScript(script);}
     if(story&&(chainOp==0x05EB||chainOp==0x0705||chainOp==0x085E||chainOp==0x014E||chainOp==0x03C3||chainOp==0x01B4||chainOp==0x0715||(chainOp==0x01BD&&CooperativeStageArmed(script)))){
         uint32_t saved[32];memcpy(saved,(void*)0xA43C78,sizeof saved);alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);int count=chainOp==0x01B4||chainOp==0x0715?2:1;CallMethod<0x464080>(copy,count);int first=Ref<int32_t>(0xA43C78),second=Ref<int32_t>(0xA43C7C);memcpy((void*)0xA43C78,saved,sizeof saved);
         // Scripts such as SYN1 enable control in their per-frame loop. Only
@@ -761,6 +792,24 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
         if(player==0&&!enabled&&!BeginNativeInteraction(script)){Field<uint8_t*>(script,0x14)-=2;Field<uint32_t>(script,0xCC)=Ref<uint32_t>(addr::TimeInMs)+1;return 1;}
         if(player==0&&enabled)EndNativeInteraction(script);
     }
+    if (story && chainOp == 0x0672) { // TASK_DESTROY_CAR: retain the car which caused the story condition.
+        alignas(16) uint8_t copy[0xE0]; memcpy(copy, script, sizeof copy);
+        uint32_t saved[32]; memcpy(saved, (void*)0xA43C78, sizeof saved);
+        CallMethod<0x464080>(copy, 2);
+        int32_t parameters[2]; memcpy(parameters, (void*)0xA43C78, sizeof parameters);
+        auto* next = Field<uint8_t*>(copy, 0x14);
+        memcpy((void*)0xA43C78, saved, sizeof saved);
+        int source = CooperativeStorySourceVehicle(script, parameters[1]);
+        if (source >= 0) {
+            parameters[1] = source;
+            uint8_t args[10]{};
+            for (int i = 0; i < 2; ++i) { args[i * 5] = 1; memcpy(args + i * 5 + 1, parameters + i, 4); }
+            Field<uint8_t*>(script, 0x14) = args;
+            auto result = g_objectCommands[Group](script, edx, opcode);
+            Field<uint8_t*>(script, 0x14) = next;
+            return result;
+        }
+    }
     int follow=chainOp==0x05BF?3:(chainOp==0x0639||chainOp==0x0859)?2:(chainOp==0x0677||chainOp==0x0823)?4:0;
     if(story&&follow){
         alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);uint32_t saved[32];memcpy(saved,(void*)0xA43C78,sizeof saved);int32_t parameters[4]{};
@@ -770,6 +819,48 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
             parameters[1]=actor;uint8_t args[20]{};for(int i=0;i<follow;++i){args[i*5]=1;memcpy(args+i*5+1,parameters+i,4);}
             Field<uint8_t*>(script,0x14)=args;auto result=g_objectCommands[Group](script,edx,opcode);Field<uint8_t*>(script,0x14)=next;
             LOGD("Story follow-up opcode=%04X npc=%d participant=%d",chainOp,parameters[0],actor);return result;
+        }
+    }
+    int participantCheck = chainOp == 0x0448 ? 2 : (chainOp == 0x044B || chainOp == 0x047A) ? 1 : 0;
+    if (story && participantCheck) {
+        alignas(16) uint8_t copy[0xE0]; memcpy(copy, script, sizeof copy);
+        uint32_t saved[32]; memcpy(saved, (void*)0xA43C78, sizeof saved);
+        int32_t parameters[2]{};
+        CallMethod<0x464080>(copy, participantCheck);
+        memcpy(parameters, (void*)0xA43C78, participantCheck * 4);
+        auto* next = Field<uint8_t*>(copy, 0x14);
+        memcpy((void*)0xA43C78, saved, sizeof saved);
+        int actor = CooperativeStoryActor(script, chainOp, parameters[0]);
+        if (actor >= 0) {
+            // Evaluate the exact participant in native code, including NOT.
+            // OR-ing a guest result cannot represent NOT IS_CHAR_ON_FOOT.
+            parameters[0] = actor;
+            uint8_t args[10]{};
+            for (int i = 0; i < participantCheck; ++i) { args[i * 5] = 1; memcpy(args + i * 5 + 1, parameters + i, 4); }
+            Field<uint8_t*>(script, 0x14) = args;
+            auto result = g_objectCommands[Group](script, edx, opcode);
+            Field<uint8_t*>(script, 0x14) = next;
+            return result;
+        }
+    }
+    if (story && chainOp == 0x0605) {
+        alignas(16) uint8_t copy[0xE0]; memcpy(copy, script, sizeof copy);
+        uint32_t saved[32]; memcpy(saved, (void*)0xA43C78, sizeof saved);
+        CallMethod<0x464080>(copy, 1); int actor = Ref<int32_t>(0xA43C78);
+        // Use the game's typed string reader on a script copy. Pascal labels
+        // may exceed the native task's small name buffer, so keep full space.
+        char name[256]{}, block[256]{};
+        CallMethod<0x463D50>(copy, name, (uint8_t)255);
+        CallMethod<0x463D50>(copy, block, (uint8_t)255);
+        int32_t parameters[6]{};
+        CallMethod<0x464080>(copy, 6); memcpy(parameters, (void*)0xA43C78, sizeof parameters);
+        auto* next = Field<uint8_t*>(copy, 0x14);
+        memcpy((void*)0xA43C78, saved, sizeof saved);
+        float blend; memcpy(&blend, parameters, sizeof blend);
+        if (CooperativeStoryAnimation(script, actor, name, block, blend,
+                                      parameters[1], parameters[2], parameters[3], parameters[4], parameters[5])) {
+            Field<uint8_t*>(script, 0x14) = next;
+            return 0;
         }
     }
     auto query=StoryContinuationQuery(chainOp);
@@ -817,19 +908,21 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
         CallMethod<0x464080>(copy,chainOp==0x03CB?3:chainOp==0x04BB?1:2);bool arm=chainOp!=0x01B4||(Ref<int32_t>(0xA43C78)==0&&Ref<int32_t>(0xA43C7C)==0);memcpy((void*)0xA43C78,saved,sizeof saved);if(arm)ArmCooperativeStage(script);
     }
     if(story){
-        int taskCount=chainOp==0x0713?10:chainOp==0x05CA?4:(chainOp==0x0632||chainOp==0x0633||chainOp==0x05CD||chainOp==0x0622||chainOp==0x05BA||chainOp==0x05D3||chainOp==0x0605||chainOp==0x0792||chainOp==0x0687)?1:(chainOp==0x05E2||chainOp==0x0630||chainOp==0x0631)?2:(chainOp==0x0635||chainOp==0x074D||chainOp==0x07A5)?3:chainOp==0x0634?5:0;
+        int taskCount=chainOp==0x0713?10:chainOp==0x05CA?4:(chainOp==0x0632||chainOp==0x0633||chainOp==0x05CD||chainOp==0x0622||chainOp==0x05BA||chainOp==0x05D3||chainOp==0x0605||chainOp==0x0792||chainOp==0x0687||chainOp==0x0465)?1:(chainOp==0x05E2||chainOp==0x0630||chainOp==0x0631)?2:(chainOp==0x0635||chainOp==0x074D||chainOp==0x07A5)?3:chainOp==0x0634?5:0;
         if(taskCount){alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);uint32_t saved[32];memcpy(saved,(void*)0xA43C78,sizeof saved);int32_t params[10]{};
             CallMethod<0x464080>(copy,taskCount);memcpy(params,(void*)0xA43C78,taskCount*4);memcpy((void*)0xA43C78,saved,sizeof saved);ObserveStoryCommand(chainOp,params);}
         if(chainOp==0x0318)MarkCooperativeStoryPassed();
     }
     auto object=ReadStoryObject(script,opcode);
     uint8_t before=Field<uint8_t>(script,0xC5);int16_t logic=Field<int16_t>(script,0xD0);bool coop=story&&chainOp==0x09C8;bool rcOverride=false,rcValue=false;int32_t*killOutput=nullptr;int killModel=-1;
-    int op=opcode&0x7FFF;int count=(op==0x00A3||op==0x02D6||(op>=0x00EC&&op<=0x00EE))?6:(op==0x00A4||op==0x04E6||(op>=0x00FE&&op<=0x0100))?8:(op==0x0480||op==0x00E1||op==0x0179||op==0x023B||op==0x031E||op==0x051C||op==0x08FF||op==0x09ED||op==0x06B7||op==0x02D8||op==0x0737||op==0x0364||op==0x031D||op==0x00DB||op==0x00DD||op==0x051A||op==0x0298||op==0x0897)?2:(op==0x04C5||op==0x0833||op==0x054E||op==0x0467||op==0x0468||op==0x054F||op==0x0900||op==0x0366||op==0x0297||op==0x00DF||op==0x02CC)?1:0;
+    int op=opcode&0x7FFF;int count=(op==0x00A3||op==0x02D6||op==0x0474||(op>=0x00EC&&op<=0x00EE))?6:(op==0x00A4||op==0x04E6||op==0x01AF||(op>=0x00FE&&op<=0x0100))?8:(op==0x0480||op==0x00E1||op==0x0179||op==0x023B||op==0x031E||op==0x051C||op==0x051D||op==0x0448||op==0x08FF||op==0x09ED||op==0x06B7||op==0x02D8||op==0x0737||op==0x0364||op==0x031D||op==0x00DB||op==0x00DD||op==0x051A||op==0x0298||op==0x0897)?2:(op==0x04C5||op==0x0833||op==0x054E||op==0x0467||op==0x0468||op==0x054F||op==0x0900||op==0x0366||op==0x0297||op==0x044B||op==0x00DF||op==0x02CC)?1:0;
+    int clearedDamageCar = -1;
     if((count||op==0x04DC)&&script==g_currentScript&&SharedStoryScript(script)&&Replicating()){
         alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);uint32_t saved[32];memcpy(saved,(void*)0xA43C78,sizeof saved);
         int32_t params[10]{};if(count){CallMethod<0x464080>(copy,count);memcpy(params,(void*)0xA43C78,count*4);}memcpy((void*)0xA43C78,saved,sizeof saved);
         if(op==0x054E||op==0x0467)ClearStoryDamage(params[0]);
-        else if(op==0x0468||op==0x054F)ClearStoryEntityDamage(ENTITY_VEHICLE,params[0]);
+        else if(op==0x0468)ClearStoryEntityDamage(ENTITY_VEHICLE,params[0],false);
+        else if(op==0x054F)clearedDamageCar=params[0];
         else if(op==0x0900)ClearStoryEntityDamage(ENTITY_OBJECT,params[0]);
         else if(op==0x0297&&params[0]==0)ResetCooperativeKills();
         else if(op==0x0298&&params[0]==0){
@@ -840,15 +933,53 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
                 if(killOutput&&(uint8_t*)killOutput>=copy&&(uint8_t*)killOutput<copy+sizeof(copy))
                     killOutput=(int32_t*)((uint8_t*)script+((uint8_t*)killOutput-copy));
                 killModel=params[1];}
-        }else{rcOverride=CooperativeRCCondition(script,op,params,rcValue);if(!rcOverride)coop=CooperativeStoryCondition(op,params,script);}
+        }else{
+            ObserveCooperativeRCFlightCommand(script, op, params);
+            rcOverride=CooperativeRCCondition(script,op,params,rcValue);
+            if(!rcOverride)rcOverride=CooperativeRCFlightCondition(script,op,params,rcValue);
+            if(!rcOverride&&op==0x00E1)rcOverride=CooperativeStoryButton(script,params[0],params[1],rcValue);
+            if(!rcOverride)coop=CooperativeStoryCondition(op,params,script);
+        }
     }
     int mapParams[6]{};bool mapEdit=story&&(chainOp==0x0363||chainOp==0x088D||chainOp==0x03B6);
     if(mapEdit){alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);uint32_t saved[32];memcpy(saved,(void*)0xA43C78,sizeof saved);CallMethod<0x464080>(copy,6);memcpy(mapParams,(void*)0xA43C78,sizeof mapParams);memcpy((void*)0xA43C78,saved,sizeof saved);}
     if(mapEdit)mapEdit=ResolveStoryMapTarget(chainOp,mapParams);
+    std::vector<std::pair<uint8_t,uint32_t>> stripParticipants;
+    uint64_t stripRun = 0; uint32_t stripWorld = 0, stripPhase = 0;
+    if (story && chainOp == 0x048F) {
+        alignas(16) uint8_t copy[0xE0]; memcpy(copy, script, sizeof copy);
+        uint32_t saved[32]; memcpy(saved, (void*)0xA43C78, sizeof saved);
+        CallMethod<0x464080>(copy, 1); int actor = Ref<int32_t>(0xA43C78);
+        memcpy((void*)0xA43C78, saved, sizeof saved);
+        auto* cj = FindPlayerPed(0);
+        if (cj && actor == GetPedRef(cj)) {
+            stripRun = StoryRunId(); stripWorld = Net().WorldEpoch(); stripPhase = CooperativeStoryPhase();
+            for (const auto& [id, peer] : Net().Peers())
+                if (peer.incarnation && CooperativeInventoryParticipant(id)) stripParticipants.push_back({id, peer.incarnation});
+        }
+    }
     auto savedSubtitleSetting=Ref<uint8_t>(0xBA678C);int previousPreference=g_storySubtitlePreference;
     if(story){g_storySubtitlePreference=savedSubtitleSetting;Ref<uint8_t>(0xBA678C)=1;}
     auto result=g_objectCommands[Group](script,edx,opcode);
     if(story){Ref<uint8_t>(0xBA678C)=savedSubtitleSetting;g_storySubtitlePreference=previousPreference;}
+    if (stripRun && stripRun == StoryRunId() && stripWorld == Net().WorldEpoch() && stripPhase == CooperativeStoryPhase()) {
+        // Native loss is permanent. Retire role snapshots before issuing the
+        // strip, so later detach/profile restore cannot return the old guns.
+        RetireCooperativeStoryRoles();
+        if (++g_storyStripSequence == 0) ++g_storyStripSequence;
+        for (auto [id, incarnation] : stripParticipants) {
+            Writer w(proto::G_MISSION_WEAPON);
+            w.U64(stripRun); w.U8(id); w.U8(WEAPON_STRIP); w.U8(0); w.I32(0); w.U8(0);
+            w.U32(stripWorld); w.U32(stripPhase); w.U32(g_storyStripSequence); w.U32(incarnation);
+            Net().Send(proto::CH_RELIABLE, w);
+        }
+        LOGI("Story native inventory stripped run=%llu phase=%u participants=%zu", (unsigned long long)stripRun, stripPhase, stripParticipants.size());
+    }
+    if (clearedDamageCar >= 0) {
+        ClearStoryEntityDamage(ENTITY_VEHICLE, clearedDamageCar);
+        if (auto* car = GetVehicle(clearedDamageCar))
+            if (auto* nv = Vehicles::Instance().Find(car); nv && nv->owner == Net().MyId()) RecordStoryVehicleDamage(car, nullptr);
+    }
     if(mapEdit)RecordStoryMapCommand(chainOp,mapParams);
     if(story&&(chainOp==0x015A||chainOp==0x02EB))g_sceneScriptCamera=false;
     if(killOutput)*killOutput=std::clamp<int64_t>((int64_t)*killOutput+CooperativeGuestKills(killModel),0,1000000);
@@ -857,6 +988,7 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
     return result;
 }
 void InstallStoryObjectCommands(){
+    g_objectCommands[0]=Ref<CommandsFn>(0x8A6168+0*4);mem::Put(0x8A6168+0*4,&HookStoryObjects<0>);
     g_objectCommands[1]=Ref<CommandsFn>(0x8A6168+1*4);mem::Put(0x8A6168+1*4,&HookStoryObjects<1>);
     g_objectCommands[2]=Ref<CommandsFn>(0x8A6168+2*4);mem::Put(0x8A6168+2*4,&HookStoryObjects<2>);
     g_objectCommands[3]=Ref<CommandsFn>(0x8A6168+3*4);mem::Put(0x8A6168+3*4,&HookStoryObjects<3>);
@@ -2162,11 +2294,13 @@ void StopScriptCamera() {
     RestoreCooperativeRoleCamera();
 }
 struct StoryWarp {
-    bool pending=false,prepared=false;uint32_t sequence=0,phase=0;uint64_t received=0,run=0,loaded=0,warned=0;
+    bool pending=false,prepared=false,closing=false;uint32_t sequence=0,phase=0,world=0;uint64_t received=0,run=0,loaded=0,warned=0;
     CVector position;float heading=0;int8_t area=0;uint16_t vehicle=0;uint8_t flags=0;
     std::vector<EntityRef>refs;
 }g_storyWarp;
 uint32_t g_storyWarpSequence=0,g_storyWarpLatest=0;
+struct SentStoryWarp { uint64_t run=0; uint32_t sequence=0; };
+std::array<SentStoryWarp,proto::kMaxPlayers> g_sentStoryWarps{};
 uint64_t g_lastWarpSent=0,g_lastWarpRun=0;CVector g_lastWarpPosition;int8_t g_lastWarpArea=0;
 bool g_warpFrozen=false;uint16_t g_warpControls=0;
 void ReleaseStoryWarpHold(){
@@ -2192,6 +2326,8 @@ void SendStoryWarp(CPlayerPed*cj,uint8_t target,bool advance){
     Writer w(proto::G_STORY_WARP);w.U64(StoryRunId());w.U32(CooperativeStoryPhase());w.U32(++g_storyWarpSequence);w.U8(target);
     w.Vec({p.x,p.y,p.z});w.F32(cj->CurrentRotation());w.I8(cj->AreaCode());w.Entity(ENTITY_VEHICLE,vehicle);w.U8(flags);
     Net().Send(proto::CH_RELIABLE,w);
+    for (const auto& [id, peer] : Net().Peers())
+        if (id < g_sentStoryWarps.size() && (target == 255 || target == id)) g_sentStoryWarps[id] = {StoryRunId(), g_storyWarpSequence};
     LOGI("Story group warp %u sent: %.1f %.1f %.1f area=%d phase=%u vehicle=%04X",g_storyWarpSequence,p.x,p.y,p.z,cj->AreaCode(),CooperativeStoryPhase(),vehicle);
 }
 void HandleStoryWarp(uint8_t from,Reader&r){
@@ -2199,9 +2335,15 @@ void HandleStoryWarp(uint8_t from,Reader&r){
     if(!r.Ok()||(target!=255&&target!=Net().MyId())||from!=Net().HostId()||Net().IsHost()||!next.run||next.run!=StoryRunId()||!next.phase||next.phase<CooperativeStoryPhase()||next.flags>3||!next.sequence||(int32_t)(next.sequence-g_storyWarpLatest)<=0||
        !std::isfinite(p.x)||!std::isfinite(p.y)||!std::isfinite(p.z)||std::fabs(p.x)>20000||std::fabs(p.y)>20000||std::fabs(p.z)>5000||!std::isfinite(next.heading))return;
     AdoptCooperativeStoryPhase(next.run,next.phase);
-    g_storyWarpLatest=next.sequence;next.position={p.x,p.y,p.z};next.pending=true;next.received=NowMs();next.refs=Net().EntityContext();g_storyWarp=std::move(next);SetLocalStoryTransitionPending(true);
+    g_storyWarpLatest=next.sequence;next.position={p.x,p.y,p.z};next.pending=true;next.world=Net().WorldEpoch();next.received=NowMs();next.refs=Net().EntityContext();g_storyWarp=std::move(next);SetLocalStoryTransitionPending(true);
 }
-bool StoryWarpFootSpot(const StoryWarp&next,CPlayerPed*me,CVector&out){
+void SendMissionEnd(uint64_t run, uint32_t phase) {
+    Writer w(proto::G_MISSION_END); w.U64(run); w.U32(phase);
+    for (const auto& sent : g_sentStoryWarps) w.U32(sent.run == run ? sent.sequence : 0);
+    Net().Send(proto::CH_RELIABLE, w);
+}
+bool StoryWarpFootSpot(const StoryWarp&next,CPlayerPed*me,CVector&out,bool&water){
+    water=false;
     if(next.flags){out=next.position+CVector{Net().MyId()==1?2.f:-2.f,0,0};return true;}
     float sign=Net().MyId()%2?-1.0f:1.0f;
     float offsets[][2]={{sign*.35f,-.8f},{-sign*.35f,-.8f},{sign*.7f,0},{0,-1.2f},{0,0}};
@@ -2216,11 +2358,29 @@ bool StoryWarpFootSpot(const StoryWarp&next,CPlayerPed*me,CVector&out){
         if(Call<0x569E20,CEntity*>(p.x,p.y,p.z,.28f,(CEntity*)me,true,true,false,true,true,false))continue;
         out=p;return true;
     }
+    // A scripted swim entry has no floor near the actor. Keep the ordinary
+    // collision requirement above; only an actual native water surface at the
+    // requested height can supply this alternative (Da Nang's crash entry).
+    if (!next.vehicle && next.area == 0) for (auto& offset : offsets) {
+        auto p=next.position;float sn=std::sin(next.heading),cs=std::cos(next.heading);
+        p.x+=cs*offset[0]-sn*offset[1];p.y+=sn*offset[0]+cs*offset[1];
+        float level=0;
+        if (!Call<0x6EB690,bool>(p.x,p.y,p.z,&level,(uint8_t)0,(CVector*)nullptr) ||
+            !std::isfinite(level) || std::fabs(next.position.z-level)>3.f) continue;
+        if(Call<0x569E20,CEntity*>(p.x,p.y,level+.75f,.28f,(CEntity*)me,true,true,false,true,true,false))continue;
+        p.z=level+.15f;out=p;water=true;return true;
+    }
     return false; // never release a guest over unloaded or missing floor
 }
 void ApplyStoryWarp(){
     if(!g_storyWarp.pending)return;
-    if(g_storyWarp.run!=StoryRunId()||g_storyWarp.phase<CooperativeStoryPhase()||!Net().EntityContextValid(g_storyWarp.refs)){
+    const auto activeRun = StoryRunId();
+    bool current = g_storyWarp.run == activeRun && g_storyWarp.phase >= CooperativeStoryPhase();
+    // The inactive role snapshot and the mission-end packet can arrive in the
+    // same network drain as its final warp. Keep only the accepted, explicitly
+    // acknowledged endpoint; later warps and another run remain inadmissible.
+    bool finalEndpoint = !activeRun && g_storyWarp.closing;
+    if((!current&&!finalEndpoint)||g_storyWarp.world!=Net().WorldEpoch()||!Net().EntityContextValid(g_storyWarp.refs)){
         LOGI("Obsolete story warp discarded seq=%u",g_storyWarp.sequence);g_storyWarp={};ReleaseStoryWarpHold();return;}
     if(g_csState!=0||CutsceneRunning())return;
     auto*me=FindPlayerPed(0);if(!me||me->Health()<=0)return;auto&next=g_storyWarp;
@@ -2245,7 +2405,7 @@ void ApplyStoryWarp(){
         Cmd(0x04BB).I(next.area).Run();Cmd(0x0860).I(GetPedRef(me)).I(next.area).Run();
         Cmd(0x04E4).F(next.position.x).F(next.position.y).Run();Cmd(0x03CB).F(next.position.x).F(next.position.y).F(next.position.z).Run();next.loaded=NowMs();next.prepared=true;
     }
-    CVector p;if(!StoryWarpFootSpot(next,me,p)){
+    CVector p;bool water=false;if(!StoryWarpFootSpot(next,me,p,water)){
         if(NowMs()-next.warned>3000){LOGI("Story warp blocked seq=%u phase=%u reason=floor area=%d target=%.1f,%.1f,%.1f",next.sequence,next.phase,next.area,next.position.x,next.position.y,next.position.z);next.warned=NowMs();}return;
     }
     if(next.flags&1){if(!IsModelLoaded(370)){RequestModel(370);return;}Cmd(0x07A7).I(GetPedRef(me)).Run();}
@@ -2255,7 +2415,7 @@ void ApplyStoryWarp(){
     Cmd(0x00A1).I(GetPedRef(me)).F(p.x).F(p.y).F(p.z-1).Run();
     me->MoveSpeed()={};me->CurrentRotation()=me->AimingRotation()=next.heading;
     next.pending=false;ReleaseStoryWarpHold();
-    LOGI("Story group warp %u applied: %.1f %.1f %.1f area=%d phase=%u",next.sequence,p.x,p.y,p.z,next.area,next.phase);
+    LOGI("Story group warp %u applied: %.1f %.1f %.1f area=%d phase=%u surface=%s",next.sequence,p.x,p.y,p.z,next.area,next.phase,water?"water":"floor");
 }
 
 void HostSendScriptCamera() {
@@ -2599,8 +2759,15 @@ void TimerWithHostValues(TimerFn original,void*self,void*edx,bool tick){
     if(!g_onscreenSet||Net().IsHost()||!flow::InHostWorld()||NowMs()<g_localActivityUntil){original(self,edx);return;}
     std::array<uint32_t,5>offsets{};offsets[0]=Ref<uint32_t>(kOnscreenTimer);
     for(size_t i=0;i<4;++i)offsets[i+1]=Ref<uint32_t>(kOnscreenTimer+0x40+i*0x44);
-    ScriptValueOverlay<5>scope((int32_t*)addr::ScriptSpace,(uint32_t)std::max(0,Ref<int32_t>(kMainScriptSize)),offsets,g_partnerTimerValues);
-    original(self,edx);if(tick)scope.Capture(g_partnerTimerValues);
+    auto values = g_partnerTimerValues;
+    std::array<bool,5> personal{};
+    for (size_t i = 0; i < values.size(); ++i) personal[i] = CooperativeRCFlightCounter(offsets[i], values[i]);
+    ScriptValueOverlay<5>scope((int32_t*)addr::ScriptSpace,(uint32_t)std::max(0,Ref<int32_t>(kMainScriptSize)),offsets,values);
+    original(self,edx);
+    if(tick){
+        auto old = g_partnerTimerValues; scope.Capture(g_partnerTimerValues);
+        for (size_t i = 0; i < values.size(); ++i) if (personal[i]) g_partnerTimerValues[i] = old[i];
+    }
 }
 void __fastcall SharedTimerProcess(void*self,void*edx){if(CooperativeStageWaiting())return;TimerWithHostValues(g_originalTimerProcess,self,edx,true);}
 void __fastcall SharedTimerDisplay(void*self,void*edx){TimerWithHostValues(g_originalTimerDisplay,self,edx,false);}
@@ -2688,8 +2855,19 @@ void PartnerMissionCleanup() {
     g_weFaded = g_weWide = false;
 }
 
-void HandleMissionEnd(uint8_t from, Reader&) {
-    if (from != Net().HostId() || Net().IsHost()) return;
+void HandleMissionEnd(uint8_t from, Reader& r) {
+    auto run = r.U64(); auto phase = r.U32();
+    std::array<uint32_t,proto::kMaxPlayers> sequences{};
+    for (auto& sequence : sequences) sequence = r.U32();
+    if (!r.Ok() || from != Net().HostId() || Net().IsHost() || !flow::InHostWorld() ||
+        (run && (!phase || (StoryRunId() && StoryRunId() != run)))) return;
+    if (g_storyWarp.pending) {
+        auto id = Net().MyId();
+        g_storyWarp.closing = run && run == g_storyWarp.run && phase >= g_storyWarp.phase &&
+                             id < sequences.size() && sequences[id] == g_storyWarp.sequence &&
+                             g_storyWarp.world == Net().WorldEpoch();
+        if (!g_storyWarp.closing) { g_storyWarp = {}; ReleaseStoryWarpHold(); }
+    }
     if (g_partnerMission) ui::TheChat().AddSystem(TR("Миссия закончилась.", "The mission is over."));
     g_partnerMission = false;
     g_hostWaits=false;g_partnerAreasMs=0;
@@ -2906,7 +3084,7 @@ public:
         for(auto&s:g_gymSelections)s={};
         if(Net().Online()&&Net().IsHost()){
             if(g_hostCutscene)SendCutscene(CS_END);
-            if(g_active){Writer w(proto::G_BLIP);w.U8(BLIP_CLEAR);Net().Send(proto::CH_RELIABLE,w);Net().Send(proto::CH_RELIABLE,Writer(proto::G_MISSION_END));}
+            if(g_active){Writer w(proto::G_BLIP);w.U8(BLIP_CLEAR);Net().Send(proto::CH_RELIABLE,w);SendMissionEnd(0,0);}
             if(g_waitSent)SendWait(false);
         }
         g_cameraApplied = false;
@@ -2924,7 +3102,7 @@ private:
         g_missionPayout=0;g_inheritedFlagMs=0;g_sceneBypassed=false;
         g_missionRevision=g_partnerRevision=0;g_missionHeartbeat=0;g_recentMissionText.clear();
         g_pendingAudio.clear();for(auto&targets:g_audioTargets)targets.clear();
-        g_deadMissionPartner=-1;ReleaseStoryWarpHold();g_storyWarp={};g_storyWarpLatest=g_storyWarpSequence=0;g_lastWarpRun=g_lastWarpSent=0;
+        g_deadMissionPartner=-1;ReleaseStoryWarpHold();g_storyWarp={};g_storyWarpLatest=g_storyWarpSequence=0;g_sentStoryWarps={};g_lastWarpRun=g_lastWarpSent=0;
         for (auto& a : g_audioSlots) a = {};
         for (auto& token : g_hostAudioToken) token = 0;
         for (auto& event : g_hostAudio) event = -1;
@@ -3000,6 +3178,7 @@ private:
             Net().Send(proto::CH_RELIABLE, w);
         }
         if (!active && g_active) {
+            const auto endingRun = StoryRunId(); const auto endingPhase = CooperativeStoryPhase();
             // Native cleanup has finished. Confirm only the supplies it kept.
             if (g_hostWeaponRun == StoryRunId()) {
                 auto* cj = FindPlayerPed(0);
@@ -3019,7 +3198,7 @@ private:
             Writer w(proto::G_BLIP);
             w.U8(BLIP_CLEAR);
             Net().Send(proto::CH_RELIABLE, w);
-            Net().Send(proto::CH_RELIABLE, Writer(proto::G_MISSION_END));
+            SendMissionEnd(endingRun, endingPhase);
             g_missionPayout=0;
             HostSendScreen(false);
             g_sentMarked.clear();  // the partner clears its copies at the mission's end

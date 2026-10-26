@@ -51,6 +51,7 @@ struct NetObject {
     uint8_t flags=3;
     bool adopted = false;  // partner: its world had this object already (the host's world brought it)
     bool trainParentHeld = false;
+    bool remotePhysics = false;  // host copy stays a replica through remote release/cleanup
     uint64_t sentMs = 0;
     ObjectMotion motion;
     uint64_t lease=0,claimSent=0,claimBegan=0,claimDeniedUntil=0,cargoTouch=0,cargoAsk=0;
@@ -82,6 +83,16 @@ bool Broken(CObject* o) {
 uint8_t ObjectFlags(CObject*o){return (o->IsVisible()?1:0)|((o->Flags()&1u)?2:0);}
 void ApplyFlags(CObject*o,uint8_t f){o->Flags()=(o->Flags()&~129u)|((f&1)?128u:0)|((f&2)?1u:0);}
 Quat RotationOf(CObject* o) { return o->Matrix() ? Quat::FromMatrix(*o->Matrix()) : Quat{}; }
+ObjectPhysics PhysicsOf(CObject*o){
+    ObjectPhysics p;p.mass=o->Mass();p.turnMass=Field<float>(o,0x90);
+    p.physicalFlags=o->PhysicalFlags()&ObjectPhysics::PhysicalMask;
+    p.interactionFlags=Field<uint32_t>(o,0x140)&ObjectPhysics::InteractionMask;return p;
+}
+void ApplyPhysics(CObject*o,const ObjectPhysics&p){
+    o->Mass()=p.mass;Field<float>(o,0x90)=p.turnMass;
+    o->PhysicalFlags()=(o->PhysicalFlags()&~ObjectPhysics::PhysicalMask)|p.physicalFlags;
+    auto&flags=Field<uint32_t>(o,0x140);flags=(flags&~ObjectPhysics::InteractionMask)|p.interactionFlags;
+}
 
 void Place(CObject* o, const CVector& pos, const Quat& rot) {
     CMatrix* m = o->Matrix();
@@ -149,6 +160,7 @@ void* Holding(CPed*p,CObject*o){
 Quat Product(const Quat&a,const Quat&b){return {a.w*b.x+a.x*b.w+a.y*b.z-a.z*b.y,a.w*b.y-a.x*b.z+a.y*b.w+a.z*b.x,a.w*b.z+a.x*b.y-a.y*b.x+a.z*b.w,a.w*b.w-a.x*b.x-a.y*b.y-a.z*b.z};}
 void CaptureMotion(NetObject&n){
     auto*o=n.obj;n.motion.velocity=o->MoveSpeed();n.motion.turn=o->TurnSpeed();
+    n.motion.physics=PhysicsOf(o);
     n.motion.dynamic=!(o->Flags()&4u);n.motion.parentKind=0;n.motion.parentId=0;n.motion.train={};
     auto*parent=o->AttachedTo();
     if(parent&&parent->IsVehicle()){
@@ -195,30 +207,44 @@ void __fastcall AttachedPosition(CPhysical*object,void*edx){
     }
     originalAttachedPosition(object,edx);
 }
+void DetachForMotion(NetObject&n){
+    auto*o=n.obj;if(!o->AttachedTo())return;
+    // A remote simulator/holder owns the native detach. Replaying its parent
+    // change through 0682 on a frozen copy otherwise restores ObjectInfo's
+    // default mass and clears DisableCollisionForce. Keep the authoritative
+    // configured physics and this copy's local freeze exactly as received.
+    bool replica=(!Net().IsHost()||n.remotePhysics||n.motion.simulator!=255||n.motion.holder!=255)&&
+        n.motion.simulator!=Net().MyId()&&n.motion.holder!=Net().MyId();
+    const auto freeze=o->PhysicalFlags()&0x2004u;
+    Cmd(0x0682).I(n.handle).F(0).F(0).F(0).I(0).Run();
+    if(replica){ApplyPhysics(o,n.motion.physics);o->PhysicalFlags()=(o->PhysicalFlags()&~0x2004u)|freeze;}
+}
 void ApplyMotion(NetObject&n,bool simulator=false){
     if(!Alive(n))return;auto*o=n.obj;
     if((n.motion.holder==Net().MyId()&&Holding(FindPlayerPed(0),o))||(!simulator&&n.motion.simulator==Net().MyId()))return;
+    if(Net().IsHost()&&((n.motion.simulator!=255&&n.motion.simulator!=Net().MyId())||
+        (n.motion.holder!=255&&n.motion.holder!=Net().MyId())))n.remotePhysics=true;
     if(n.motion.parentKind){
         auto*parent=Parent(n.motion,n.netId);
         if(!parent){
-            if(o->AttachedTo())Cmd(0x0682).I(n.handle).F(0).F(0).F(0).I(0).Run();
+            DetachForMotion(n);
             // Keep the relationship while the native consist streams. Solid
             // cargo must not remain floating at an outdated world position.
             if(n.motion.parentKind==5){ApplyFlags(o,0);n.trainParentHeld=true;}
             return;
         }
         if(n.trainParentHeld){if(!n.broken)ApplyFlags(o,n.flags);n.trainParentHeld=false;}
-        if(o->AttachedTo()!=parent){if(o->AttachedTo())Cmd(0x0682).I(n.handle).F(0).F(0).F(0).I(0).Run();CallMethod<0x54D690>(o,parent,&n.motion.offset,&n.motion.rotation);}
+        if(o->AttachedTo()!=parent){DetachForMotion(n);CallMethod<0x54D690>(o,parent,&n.motion.offset,&n.motion.rotation);}
         Field<CVector>(o,0x100)=n.motion.offset;Field<CVector>(o,0x10C)=n.motion.euler;Field<Quat>(o,0x118)=n.motion.rotation;AttachedPosition(o,nullptr);
     }else{
-        if(o->AttachedTo())Cmd(0x0682).I(n.handle).F(0).F(0).F(0).I(0).Run();
+        DetachForMotion(n);
         if(n.trainParentHeld){if(!n.broken)ApplyFlags(o,n.flags);n.trainParentHeld=false;}
     }
-    if(simulator){Cmd(0x0550).I(n.handle).I(n.motion.dynamic?0:1).Run();o->MoveSpeed()=n.motion.velocity;o->TurnSpeed()=n.motion.turn;}
+    if(simulator){Cmd(0x0550).I(n.handle).I(n.motion.dynamic?0:1).Run();o->MoveSpeed()=n.motion.velocity;o->TurnSpeed()=n.motion.turn;n.remotePhysics=false;}
 }
 enum:uint8_t{CLAIM=1,GRANT=2,CARRY_POSE=3,RELEASE=4,DENY=5,PUSH=6,CARGO_CLAIM=7,CARGO_POSE=8,CARGO_RELEASE=9};
 void Decision(NetObject&n,uint8_t op=GRANT){
-    Writer w(proto::G_OBJ_CARRY);w.U64(StoryRunId());w.U32(CooperativeStoryPhase());w.U8(op);w.Entity(ENTITY_OBJECT,n.netId);w.U32(n.motion.revision);w.U8(n.motion.holder);w.U8(n.motion.simulator);w.Entity(ENTITY_VEHICLE,n.motion.supportVehicle);Net().Send(proto::CH_RELIABLE,w);
+    Writer w(proto::G_OBJ_CARRY);w.U64(StoryRunId());w.U32(CooperativeStoryPhase());w.U8(op);w.Entity(ENTITY_OBJECT,n.netId);w.U32(n.motion.revision);w.U8(n.motion.holder);w.U8(n.motion.simulator);w.Entity(ENTITY_VEHICLE,n.motion.supportVehicle);n.motion.physics.Write(w);Net().Send(proto::CH_RELIABLE,w);
 }
 bool Claim(NetObject&n,uint8_t from){
     if(!Alive(n)||n.broken)return false;
@@ -264,8 +290,9 @@ bool __fastcall HoldPosition(void*task,void*edx,CPed*ped){
     return originalHoldPosition(task,edx,ped);
 }
 CVector LimitCargo(CVector v,float max){auto size=v.Length();return size>max?v*(max/size):v;}
-bool PhysicalCargo(const NetObject&n){return !n.broken&&n.motion.holder==255&&n.motion.simulator==255&&!n.motion.parentKind&&
+bool MovableCargo(const NetObject&n){return !n.broken&&n.motion.holder==255&&(n.obj->Flags()&1u)&&
     (n.motion.dynamic||(n.obj->Mass()>0&&n.obj->Mass()<99998.f))&&!(n.obj->PhysicalFlags()&(32u|64u));}
+bool PhysicalCargo(const NetObject&n){return MovableCargo(n)&&n.motion.simulator==255&&!n.motion.parentKind;}
 void CargoTick(){
     if(NowMs()-g_pushSent>=33){g_pushSent=NowMs();int budget=8;
         for(auto i=g_pushes.begin();i!=g_pushes.end()&&budget-->0;){auto c=i->second;i=g_pushes.erase(i);
@@ -304,7 +331,7 @@ void SimulateCargo(){
         // Pre-authorize a liftable box under the local forklift's forks. GTA's
         // moving-component contacts need the cargo to be dynamic before they
         // can lift it, so forwarding only velocity impulses is insufficient.
-        if(n.motion.simulator==255&&!n.motion.parentKind&&(n.motion.dynamic||(n.obj->Mass()>0&&n.obj->Mass()<99998.f))&&now-n.cargoAsk>500){
+        if(n.motion.simulator==255&&!n.motion.parentKind&&MovableCargo(n)&&now-n.cargoAsk>500){
             auto*car=FindPlayerPed(0)->VehicleIfIn();auto*v=car?Vehicles::Instance().Find(car):nullptr;
             if(v&&v->owner==Net().MyId()&&v->model==530&&car->Matrix()){
                 auto d=n.obj->GetPosition()-car->GetPosition();auto&m=*car->Matrix();float x=d.x*m.right.x+d.y*m.right.y;float y=d.x*m.forward.x+d.y*m.forward.y;
@@ -348,12 +375,12 @@ void HandleCarry(uint8_t from,Reader&r){
     if(Net().IsHost()){
         auto i=g_owned.find(id);if(i==g_owned.end()||!Alive(i->second))return;auto&n=i->second;
         if(op==CARGO_CLAIM){
-            uint16_t vehicle=r.U16();auto*v=Vehicles::Instance().Find(vehicle);
-            if(!r.Ok()||revision!=n.motion.revision||n.motion.holder!=255||n.motion.parentKind||
+            uint16_t vehicle=r.U16();auto*v=Vehicles::Instance().Find(vehicle);auto*driver=Players::Instance().Get(from);
+            if(!r.Ok()||revision!=n.motion.revision||!MovableCargo(n)||n.motion.parentKind||
                (n.motion.simulator!=255&&n.motion.simulator!=from)||!v||!Vehicles::Alive(*v)||v->owner!=from||
+               !driver||!driver->hasState||NowMs()-driver->stateRecvMs>1500||driver->mode!=RemotePlayer::Mode::Driver||driver->vehNetId!=vehicle||
                (n.obj->AreaCode()!=13&&v->veh->AreaCode()!=n.obj->AreaCode())||
-               (v->veh->GetPosition()-n.obj->GetPosition()).Length()>10||
-               !(n.motion.dynamic||(n.obj->Mass()>0&&n.obj->Mass()<99998.f)))return;
+               (v->veh->GetPosition()-n.obj->GetPosition()).Length()>10)return;
             CaptureMotion(n);n.motion.simulator=from;n.motion.supportVehicle=vehicle;++n.motion.revision;n.lease=NowMs()+2500;
             n.pos=n.obj->GetPosition();n.rot=RotationOf(n.obj);Cmd(0x0550).I(n.handle).I(1).Run();Decision(n);
             LOGI("Shared cargo %04X simulator granted to %u vehicle %04X",id,from,vehicle);return;
@@ -363,7 +390,7 @@ void HandleCarry(uint8_t from,Reader&r){
             auto*v=Vehicles::Instance().Find(n.motion.supportVehicle);CVector pos{p.x,p.y,p.z};
             if(!r.Ok()||n.motion.holder!=255||n.motion.simulator!=from||revision!=n.motion.revision||!v||!Vehicles::Alive(*v)||
                (op==CARGO_POSE&&v->owner!=from)||(pos-v->veh->GetPosition()).Length()>50||(m.parentKind&&(m.parentKind!=1||m.parentId!=n.motion.supportVehicle)))return;
-            uint16_t support=n.motion.supportVehicle;n.motion=m;n.motion.simulator=from;n.motion.supportVehicle=support;n.motion.revision=revision;
+            uint16_t support=n.motion.supportVehicle;auto physics=PhysicsOf(n.obj);n.motion=m;n.motion.physics=physics;n.motion.simulator=from;n.motion.supportVehicle=support;n.motion.revision=revision;
             n.pos=pos;n.rot=q;n.area=v->veh->AreaCode();n.obj->AreaCode()=n.area;n.flags=flags;n.lease=NowMs()+2500;
             Place(n.obj,pos,q);ApplyFlags(n.obj,flags);ApplyMotion(n);n.sentMs=0;
             if(op==CARGO_RELEASE){n.motion.simulator=255;n.motion.supportVehicle=0;++n.motion.revision;ApplyMotion(n,true);Decision(n);}
@@ -387,12 +414,12 @@ void HandleCarry(uint8_t from,Reader&r){
         if(!r.Ok()||n.broken||n.motion.holder!=from||revision!=n.motion.revision)return;
         auto*player=Players::Instance().Get(from);CVector pos{p.x,p.y,p.z};
         if(!player||!player->hasState||NowMs()-player->stateRecvMs>1500||(pos-player->state.pos).Length()>6)return;
-        n.pos=pos;n.rot=q;n.motion=motion;n.motion.holder=from;n.motion.revision=revision;n.lease=NowMs()+2500;
+        n.pos=pos;n.rot=q;auto physics=PhysicsOf(n.obj);n.motion=motion;n.motion.physics=physics;n.motion.holder=from;n.motion.revision=revision;n.lease=NowMs()+2500;
         Place(n.obj,pos,q);n.area=player->state.area;n.obj->AreaCode()=n.area;n.flags=flags;ApplyFlags(n.obj,flags);n.sentMs=0;
         if(op==RELEASE){n.motion.holder=255;++n.motion.revision;ApplyMotion(n,true);Decision(n);}
     }else if(from==Net().HostId()&&(op==GRANT||op==DENY)){
-        uint8_t holder=r.U8(),simulator=r.U8();uint16_t support=r.U16();if(!r.Ok()||(holder>=3&&holder!=255)||(simulator>=3&&simulator!=255))return;
-        for(auto*map:{&g_mirrors,&g_pending})if(auto i=map->find(id);i!=map->end()&&(int32_t)(revision-i->second.motion.revision)>=0){auto&n=i->second;n.motion.holder=holder;n.motion.revision=revision;n.motion.simulator=simulator;n.motion.supportVehicle=support;
+        uint8_t holder=r.U8(),simulator=r.U8();uint16_t support=r.U16();ObjectPhysics physics;if(!physics.Read(r)||(holder>=3&&holder!=255)||(simulator>=3&&simulator!=255))return;
+        for(auto*map:{&g_mirrors,&g_pending})if(auto i=map->find(id);i!=map->end()&&(int32_t)(revision-i->second.motion.revision)>=0){auto&n=i->second;n.motion.holder=holder;n.motion.revision=revision;n.motion.simulator=simulator;n.motion.supportVehicle=support;n.motion.physics=physics;if(Alive(n))ApplyPhysics(n.obj,physics);
             if(Alive(n)&&simulator==Net().MyId()){Cmd(0x0392).I(n.handle).I(1).Run();Cmd(0x0550).I(n.handle).I(0).Run();n.motion.dynamic=true;n.cargoTouch=NowMs();}
             else if(Alive(n)&&holder!=Net().MyId())Cmd(0x0550).I(n.handle).I(1).Run();}
     }
@@ -429,8 +456,9 @@ void HostScan() {
             float turn = std::fabs(rot.x - no.rot.x) + std::fabs(rot.y - no.rot.y) + std::fabs(rot.z - no.rot.z) +
                          std::fabs(rot.w - no.rot.w);
             auto previous=no.motion;
+            no.motion.physics=PhysicsOf(no.obj);
             if(no.motion.simulator==255&&(no.motion.holder==255||no.motion.holder==Net().MyId()))CaptureMotion(no);
-            bool discrete=no.area!=no.obj->AreaCode()||no.flags!=ObjectFlags(no.obj)||previous.parentKind!=no.motion.parentKind||previous.parentId!=no.motion.parentId||previous.revision!=no.motion.revision||
+            bool discrete=no.area!=no.obj->AreaCode()||no.flags!=ObjectFlags(no.obj)||!previous.physics.SameAs(no.motion.physics)||previous.parentKind!=no.motion.parentKind||previous.parentId!=no.motion.parentId||previous.revision!=no.motion.revision||
                 previous.train.owner!=no.motion.train.owner||previous.train.carriage!=no.motion.train.carriage||previous.train.generation!=no.motion.train.generation;
             if ((discrete||(pos - no.pos).Length() > 0.02f || turn > 0.01f||NowMs()-no.sentMs>1000) && NowMs() - no.sentMs >= 100) {
                 no.pos = pos;
@@ -513,6 +541,7 @@ void CreatePending() {
         o->AreaCode() = no.area;
         Place(o, no.pos, no.rot);
         ApplyFlags(o,no.flags);
+        ApplyPhysics(o,no.motion.physics);
         no.obj = o;
         no.handle = h;
         bool broken = no.broken;
@@ -614,7 +643,7 @@ public:
                 auto& copy=it->second;
                 if(Alive(copy)&&copy.model==no.model){
                     if((int32_t)(no.motion.revision-copy.motion.revision)<0)return;
-                    copy.pos=no.pos;copy.rot=no.rot;copy.area=no.area;copy.flags=no.flags;copy.motion=no.motion;
+                    copy.pos=no.pos;copy.rot=no.rot;copy.area=no.area;copy.flags=no.flags;copy.motion=no.motion;ApplyPhysics(copy.obj,copy.motion.physics);
                     copy.obj->AreaCode()=no.area;if(copy.motion.holder!=Net().MyId()&&copy.motion.simulator!=Net().MyId())Place(copy.obj,no.pos,no.rot);
                     if(no.broken)BreakCopy(copy,0);else ApplyFlags(copy.obj,no.flags);
                     copy.broken=no.broken;ApplyMotion(copy);return;
@@ -637,7 +666,7 @@ public:
                 it->second.rot = q;it->second.area=area;it->second.flags=flags;it->second.motion=motion;
             } else if (auto m = g_mirrors.find(id); m != g_mirrors.end() && Alive(m->second)) {
                 auto&copy=m->second;if((int32_t)(motion.revision-copy.motion.revision)<0)return;
-                copy.pos={p.x,p.y,p.z};copy.rot=q;copy.area=area;copy.flags=flags;copy.motion=motion;
+                copy.pos={p.x,p.y,p.z};copy.rot=q;copy.area=area;copy.flags=flags;copy.motion=motion;ApplyPhysics(copy.obj,copy.motion.physics);
                 copy.obj->AreaCode()=area;
                 if(copy.motion.holder!=Net().MyId()&&copy.motion.simulator!=Net().MyId()){Place(copy.obj,copy.pos,q);ApplyFlags(copy.obj,flags);}
                 ApplyMotion(copy);
@@ -797,10 +826,12 @@ bool ProcessSharedCargoContact(CargoContactFn original,CPhysical*a,void*edx,CPhy
     // Calculate the real mass/contact response on the driver's copy. Freeze
     // it again after the calculation; the host applies the resulting impulse.
     auto flags=object->Flags();auto physical=object->PhysicalFlags();auto before=object->MoveSpeed(),turn=object->TurnSpeed();
-    object->Flags()&=~4u;object->PhysicalFlags()&=~0x2000u;
+    // FREEZE_OBJECT_POSITION sets both flags (native 0x0550). Clearing only
+    // DontApplySpeed still suppresses the crate's collision-force response.
+    object->Flags()&=~4u;object->PhysicalFlags()&=~0x2004u;
     bool result=nativeContact();
     auto move=(object->MoveSpeed()-before)*50.f,spin=(object->TurnSpeed()-turn)*50.f;
-    object->Flags()=(object->Flags()&~4u)|(flags&4u);object->PhysicalFlags()=(object->PhysicalFlags()&~0x2000u)|(physical&0x2000u);
+    object->Flags()=(object->Flags()&~4u)|(flags&4u);object->PhysicalFlags()=(object->PhysicalFlags()&~0x2004u)|(physical&0x2004u);
     object->MoveSpeed()=before;object->TurnSpeed()=turn;
     if(move.Length()>.00001f||spin.Length()>.00001f){uint32_t key=((uint32_t)v->netId<<16)|n->netId;
         if(g_pushes.size()<256||g_pushes.count(key)){auto&c=g_pushes[key];c.object=n->netId;c.vehicle=v->netId;c.revision=n->motion.revision;c.move+=move;c.turn+=spin;}}

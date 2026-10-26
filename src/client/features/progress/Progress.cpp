@@ -42,7 +42,7 @@ using namespace game;
 using game::script::Cmd;
 
 constexpr uint32_t kProfileMagic = 0x46504353;  // "SCPF"
-constexpr uint16_t kProfileVersion = 6;  // 6: personal service-job completion; older profiles remain readable
+constexpr uint16_t kProfileVersion = 7;  // 7: personal flight, bike and boat school records
 constexpr uintptr_t kStatsBlock = 0xB79000;  // CStats::StatTypesInt + StatTypesFloat
 constexpr size_t kStatsSize = 0x4C8;
 // stats the world owns, not the player (CStats::StatTypesInt, id - 120): the profile keeps the values of the world it was
@@ -63,6 +63,60 @@ bool ReadDrivingRecords(Reader&r,bool stored){
     if(stored){if(r.U32()!=0x4C4F4F48)return false;for(auto&value:values)value=r.I32();
         for(size_t i=0;i<values.size();++i)if(values[i]<0||values[i]>(i?100:1))return false;}
     if(!r.Ok())return false;g_driving=values;g_drivingReady=true;return true;
+}
+
+// These are persistent lesson records in the original SCM, not handles,
+// timers or the temporary globals shared by the exercise interpreters.
+// The boat school records time/distance and medal flags, rather than scores
+// out of 100. Keep its native initial values and reward-notification states.
+struct SchoolGlobal { uint16_t offset;int32_t initial,maximum; };
+constexpr SchoolGlobal kOtherSchoolGlobals[]={
+    {348,0,1},{7808,1,12},
+    {7768,0,100},{7772,0,100},{7776,0,100},{7780,0,100},{7784,0,100},
+    {7788,0,100},{7792,0,100},{7796,0,100},{7800,0,100},{7804,0,100},
+    {8648,0,6},{8656,0,100},{8660,0,100},{8664,0,100},{8668,0,100},
+    {8672,0,100},{8676,0,100},{8680,0,1},
+    {7848,1,5},{7852,60000,3600000},{7856,80000,3600000},
+    {7860,180000,3600000},{7864,10,100000},{7868,200000,3600000},{7876,0,1},
+    {7880,0,1},{7884,0,1},{7888,0,1},{7892,0,1},{7896,0,1},{7900,0,1},
+    {7904,0,1},{7908,0,1},{7912,0,1},{7916,0,1},{7920,0,1},{7924,0,1},
+    {7928,0,1},{7932,0,1},{7936,0,1},{7940,0,99},{7944,0,99},{7948,0,2},
+    // Native once-only lesson/reward checks must travel with the grades.
+    {7816,0,1},{7820,0,1},{7836,0,1},{7840,0,1},{7844,0,1},
+    {8684,0,1},{8688,0,1},{8692,0,1},{8696,0,1},{8700,0,1},{8704,0,1},
+    {8708,0,1},{8712,0,1},{8716,0,1},{8720,0,1},{8724,0,1},{8728,0,1},
+    {8732,0,1},{8736,0,1},{8740,0,1},{8744,0,1},{8748,0,1},{8752,0,1},
+    {8756,0,2},{8760,0,2},{8764,0,2},{8804,0,1}
+};
+using OtherSchoolRecords=std::array<int32_t,std::size(kOtherSchoolGlobals)>;
+OtherSchoolRecords g_otherSchools{},g_otherSchoolWorld{};
+std::array<uint8_t,kStatsSize> g_schoolStatsBefore{};
+OtherSchoolRecords InitialOtherSchools(){
+    OtherSchoolRecords values{};
+    for(size_t i=0;i<values.size();++i)values[i]=kOtherSchoolGlobals[i].initial;
+    return values;
+}
+OtherSchoolRecords ReadOtherSchoolGlobals(){
+    OtherSchoolRecords values{};
+    for(size_t i=0;i<values.size();++i)values[i]=Ref<int32_t>(addr::ScriptSpace+kOtherSchoolGlobals[i].offset);
+    return values;
+}
+void PutOtherSchoolGlobals(const OtherSchoolRecords&values){
+    for(size_t i=0;i<values.size();++i)Ref<int32_t>(addr::ScriptSpace+kOtherSchoolGlobals[i].offset)=values[i];
+}
+void WriteOtherSchoolRecords(Writer&w){w.U32(0x53475244);for(auto value:g_otherSchools)w.I32(value);}
+bool ReadOtherSchoolRecords(Reader&r,bool stored){
+    auto values=InitialOtherSchools();
+    if(stored){
+        if(r.U32()!=0x53475244)return false;
+        for(size_t i=0;i<values.size();++i){
+            values[i]=r.I32();
+            if(values[i]<0||values[i]>kOtherSchoolGlobals[i].maximum)return false;
+            if((kOtherSchoolGlobals[i].offset==7940||kOtherSchoolGlobals[i].offset==7944)&&
+               values[i]!=0&&values[i]!=1&&values[i]!=2&&values[i]!=99)return false;
+        }
+    }
+    if(!r.Ok())return false;g_otherSchools=values;return true;
 }
 
 constexpr std::array<uint16_t,3> kJobGlobals={5948,5952,5956}; // paramedic, vigilante, firefighter
@@ -210,6 +264,7 @@ std::vector<uint8_t> CaptureProfile() {
     WriteStoryRewardHistory(w);
     WriteDrivingRecords(w);
     WriteJobRecords(w);
+    WriteOtherSchoolRecords(w);
     return w.Buffer();
 }
 
@@ -236,6 +291,7 @@ bool ApplyProfile(const std::vector<uint8_t>& blob, bool& lookOwn) {
     if(!ReadDrivingRecords(r,version>=5))return false;
     JobRecords jobs{};
     if(version>=6&&!ReadJobRecords(r,jobs))return false;
+    if(!ReadOtherSchoolRecords(r,version>=7))return false;
     if(version<5)LOGI("Legacy profile has no personal driving-school records; initialized separately from host (skills retained)");
     if (!r.Ok() || stats.size() != kStatsSize || clothes.size() != kClothesSize) return false;
     if(version<6){jobs=LegacyJobRecords(stats,maxArmour,version>=2&&perks[2]!=0);LOGI("Legacy personal service-job completion restored from saved benefits");}
@@ -371,6 +427,7 @@ public:
         m_profile.clear();
         g_looks.clear();
         ResetDrivingRecords();
+        g_otherSchools=InitialOtherSchools();
         m_jobRecords={};
     }
     void OnPeerJoin(uint8_t) override { ResendAppearance(); }
@@ -407,6 +464,7 @@ public:
             if (m_profile.empty()) {
                 InitialJobBaseline(m_reset);
                 g_driving={};g_drivingReady=true;
+                g_otherSchools=InitialOtherSchools();
                 ui::TheChat().AddSystem(m_reset ? TR("Хост начал новую игру. Деньги, оружие и навыки у вас тоже начинаются заново.",
                                                      "The host started a new game. Your money, weapons and skills start over too.")
                                                 : TR("Вы здесь впервые. Дальше деньги, навыки и внешность у вас будут свои.",
@@ -421,6 +479,7 @@ public:
                 LOGW("Profile rejected (bad format), starting from the world's state");
                 InitialJobBaseline();
                 g_driving={};g_drivingReady=true;
+                g_otherSchools=InitialOtherSchools();
             }
             g_lookOwn = own || WearOwnLook(m_profile.empty());
             if (!g_lookOwn) memcpy(g_givenKeys, me->ClothesDesc(), sizeof g_givenKeys);
@@ -546,9 +605,14 @@ void SaveProfileNow(bool always) { Progress::Instance().SaveNow(always); }
 bool BeginPersonalDrivingSchool(void*script){
     if(!script||!g_drivingReady||!Net().Online()||Net().IsHost()||!flow::InHostWorld())return false;
     const auto*name=game::Field<char[8]>(script,8);
-    if(_strnicmp(name,"dskool",8)&&_strnicmp(name,"trace",8))return false;
+    if(_strnicmp(name,"dskool",8)&&_strnicmp(name,"trace",8)&&
+       _strnicmp(name,"desert5",8)&&_strnicmp(name,"psch",8)&&
+       _strnicmp(name,"bskool",8)&&_strnicmp(name,"bikes",8)&&
+       _strnicmp(name,"boat",8)&&_strnicmp(name,"bschoo",8))return false;
     if(g_drivingDepth++==0){
         g_drivingWorld=ReadDrivingGlobals();PutDrivingGlobals(g_driving);
+        g_otherSchoolWorld=ReadOtherSchoolGlobals();PutOtherSchoolGlobals(g_otherSchools);
+        memcpy(g_schoolStatsBefore.data(),(void*)kStatsBlock,kStatsSize);
         g_drivingSkillBefore=game::Ref<int32_t>(kStatsBlock+(160-120)*4);
     }
     return true;
@@ -556,9 +620,12 @@ bool BeginPersonalDrivingSchool(void*script){
 void EndPersonalDrivingSchool(){
     if(!g_drivingDepth||--g_drivingDepth)return;
     auto now=ReadDrivingGlobals();bool changed=now!=g_driving||
-        g_drivingSkillBefore!=game::Ref<int32_t>(kStatsBlock+(160-120)*4);
+        g_drivingSkillBefore!=game::Ref<int32_t>(kStatsBlock+(160-120)*4)||
+        memcmp(g_schoolStatsBefore.data(),(void*)kStatsBlock,kStatsSize)!=0;
+    auto other=ReadOtherSchoolGlobals();changed|=other!=g_otherSchools;
+    g_otherSchools=other;PutOtherSchoolGlobals(g_otherSchoolWorld);
     g_driving=now;PutDrivingGlobals(g_drivingWorld);
-    if(changed){LOGI("Personal driving-school progress changed; skill=%d completed=%d",game::Ref<int32_t>(kStatsBlock+(160-120)*4),g_driving[0]);SaveProfileNow(true);}
+    if(changed){LOGI("Personal school progress changed; driving_skill=%d driving_complete=%d flight_complete=%d bike_complete=%d boat_complete=%d",game::Ref<int32_t>(kStatsBlock+(160-120)*4),g_driving[0],g_otherSchools[0],g_otherSchools[19],g_otherSchools[26]);SaveProfileNow(true);}
 }
 
 }  // namespace coop

@@ -329,6 +329,7 @@ void Server::HandleHello(Player& p, Reader& r) {
 
     Welcome wel;
     wel.yourId = p.id;
+    wel.yourIncarnation = p.peer->connectID;
     wel.hostId = 255;
     for (auto& o : m_players) {
         if (!o.joined) continue;

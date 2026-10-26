@@ -1,12 +1,15 @@
 #include <algorithm>
 #include <array>
 #include <map>
+#include <vector>
 #include "shared/api/story-loadout/StoryLoadout.h"
 #include "shared/api/story-coop/StoryCoop.h"
+#include "shared/api/story-stage/StoryStage.h"
 #include "shared/api/net-session/Session.h"
 #include "shared/game/Script.h"
 #include "shared/lib/core/Core.h"
 #include "entities/session/Flow.h"
+#include "entities/profile/Profile.h"
 #include "common/lib/log/Log.h"
 namespace coop { namespace {
 using namespace game;
@@ -30,6 +33,14 @@ struct NativeInventory {
 std::map<uint32_t,NativeInventory> nativeInventory;
 uint32_t nativeToken=0;
 unsigned nativeDepth=0;
+struct InventoryStrip {
+    uint32_t world=0,phase=0,sequence=0,incarnation=0,localWorld=0;
+    uint64_t run=0;
+    uint8_t host=255,target=255;
+};
+InventoryStrip pendingStrip,lastStrip;
+struct DeferredWeapon {uint8_t operation=0;int weapon=0,ammo=0;bool inHand=false;};
+std::vector<DeferredWeapon> stripWeapons;
 CPlayerPed* Local(){return core::IsPlayerReady()?FindPlayerPed(0):nullptr;}
 int ClampAmmo(int ammo){return std::clamp(ammo,0,99999);}
 bool Current(const Loan&loan,CPed*me){return me&&me->Health()>0&&GetPedRef(me)==loan.handle&&loan.slot>=0&&loan.slot<NUM_WEAPON_SLOTS&&me->Weapons()[loan.slot].type==loan.weapon;}
@@ -123,21 +134,72 @@ void EndNativeInventory(uint32_t token){
     }
     if(nativeDepth)--nativeDepth;
 }
+const char* StripContextFailure(const InventoryStrip&strip,bool accepted){
+    if(!Net().Online()||Net().IsHost())return "session";
+    if(strip.host!=Net().HostId())return "host";
+    if(strip.target!=Net().MyId())return "target";
+    // Each client advances its own world counter when loading. The packet's
+    // world belongs to its sender; transport has already accepted that epoch.
+    if(!strip.world||strip.world!=Net().PeerWorldEpoch(strip.host))return "sender-world";
+    if(accepted&&strip.localWorld!=Net().WorldEpoch())return "receiver-world";
+    if(!strip.run||strip.run!=StoryRunId())return "run";
+    // Once accepted in order, a permanent loss still has to apply after a
+    // later phase if the personal profile was not ready at receipt time.
+    if(!strip.phase||(!accepted&&strip.phase!=CooperativeStoryPhase()))return "phase";
+    if(!strip.sequence)return "sequence";
+    if(!strip.incarnation||strip.incarnation!=Net().MyIncarnation())return "connection";
+    return nullptr;
+}
+void LogStripContext(const char*action,const InventoryStrip&strip,const char*reason){
+    LOGD("Story inventory strip %s reason=%s from=%u host=%u target=%u local=%u world=%u senderWorld=%u receiverWorld=%u acceptedWorld=%u run=%llu currentRun=%llu phase=%u currentPhase=%u sequence=%u connection=%u localConnection=%u",
+        action,reason,strip.host,Net().HostId(),strip.target,Net().MyId(),strip.world,Net().PeerWorldEpoch(strip.host),
+        Net().WorldEpoch(),strip.localWorld,(unsigned long long)strip.run,(unsigned long long)StoryRunId(),
+        strip.phase,CooperativeStoryPhase(),strip.sequence,strip.incarnation,Net().MyIncarnation());
+}
+bool FlushInventoryStrip(){
+    if(!pendingStrip.sequence)return true;
+    if(const char*reason=StripContextFailure(pendingStrip,true)){
+        LogStripContext("expired",pendingStrip,reason);
+        pendingStrip={};stripWeapons.clear();return true;
+    }
+    auto*me=Local();
+    // The profile is applied over the host world before this permanent loss;
+    // otherwise its old inventory could put the stripped weapons back.
+    if(!me||!flow::InHostWorld()||!CooperativeStoryInventoryReady())return false;
+    if(me->Health()<=0){pendingStrip={};stripWeapons.clear();return true;}
+    auto strip=pendingStrip;pendingStrip={};auto weapons=std::move(stripWeapons);stripWeapons.clear();
+    // Returning a loan or a still-unwinding native attachment scope must not
+    // resurrect inventory which the screenplay has explicitly destroyed.
+    loans.clear();nativeInventory.clear();nativeDepth=0;
+    Cmd(0x048F).I(GetPedRef(me)).Run();
+    lastStrip=strip;
+    SaveProfileNow(true);
+    LOGI("Story inventory stripped world=%u run=%llu phase=%u sequence=%u player=%u connection=%u",
+        strip.world,(unsigned long long)strip.run,strip.phase,strip.sequence,strip.target,strip.incarnation);
+    for(const auto&weapon:weapons)ApplyStoryMissionWeapon(weapon.operation,weapon.weapon,weapon.ammo,weapon.inHand);
+    return true;
+}
 class Loadout:public Module {
     const char*Name()const override{return "StoryLoadout";}
     void OnPostProcess()override{
+        if(!FlushInventoryStrip())return;
         if(loans.empty())return;
         SampleAll();
         for(auto&[slot,loan]:loans)if(loan.run!=StoryRunId()){RestoreStoryMissionWeapons();break;}
     }
-    void OnGameShutdown()override{loans.clear();nativeInventory.clear();nativeDepth=0;}
-    void OnSessionEnd()override{RestoreStoryMissionWeapons();}
+    void OnGameShutdown()override{loans.clear();nativeInventory.clear();nativeDepth=0;pendingStrip={};stripWeapons.clear();}
+    void OnSessionEnd()override{pendingStrip=lastStrip={};stripWeapons.clear();RestoreStoryMissionWeapons();}
 } feature;
 struct Register{Register(){core::RegisterModule(&feature);}}registration;
 }
 void ApplyStoryMissionWeapon(uint8_t operation,int weapon,int ammo,bool inHand){
     if(operation<GIVE||operation>FINAL||weapon<=0||weapon>46)return;
     auto*me=Local();if(!me||me->Health()<=0||Net().IsHost()||!flow::InHostWorld())return;
+    if(!FlushInventoryStrip()){
+        if(stripWeapons.size()<64)stripWeapons.push_back({operation,weapon,ammo,inHand});
+        else LOGW("Story inventory strip deferred weapon limit reached");
+        return;
+    }
     SampleAll();
     int slot=-1;Cmd(0x0782).I(weapon).Out(&slot).Run();if(slot<0||slot>=NUM_WEAPON_SLOTS)return;
     auto found=loans.find(slot);
@@ -165,6 +227,24 @@ void ApplyStoryMissionWeapon(uint8_t operation,int weapon,int ammo,bool inHand){
     int count=std::max(loan.personal,ClampAmmo(ammo));
     Give(me,weapon,count);loan.borrowed=std::max(0,count-loan.personal);loan.lastAmmo=count;
     if(inHand){loan.selectedByStory=true;Cmd(0x01B9).I(loan.handle).I(weapon).Run();}
+}
+void ApplyStoryMissionStrip(uint8_t from,uint32_t world,uint64_t run,uint32_t phase,
+                            uint32_t sequence,uint8_t target,uint32_t targetIncarnation){
+    InventoryStrip strip;strip.world=world;strip.phase=phase;strip.sequence=sequence;strip.incarnation=targetIncarnation;
+    strip.localWorld=Net().WorldEpoch();strip.run=run;strip.host=from;strip.target=target;
+    if(const char*reason=StripContextFailure(strip,false)){
+        LogStripContext("rejected",strip,reason);
+        return;
+    }
+    auto seen=[&](const InventoryStrip&prior){return prior.sequence&&prior.host==from&&prior.world==world&&prior.run==run&&prior.incarnation==targetIncarnation&&
+        (int32_t)(sequence-prior.sequence)<=0;};
+    if(seen(lastStrip)||seen(pendingStrip)){
+        LOGD("Story inventory strip replay rejected run=%llu phase=%u sequence=%u",(unsigned long long)run,phase,sequence);
+        return;
+    }
+    pendingStrip=strip;stripWeapons.clear();
+    if(!FlushInventoryStrip())LOGD("Story inventory strip queued run=%llu phase=%u sequence=%u ready=%d inHostWorld=%d",
+        (unsigned long long)run,phase,sequence,CooperativeStoryInventoryReady(),flow::InHostWorld());
 }
 void RestoreStoryMissionWeapons(){auto*me=Local();for(auto&[slot,loan]:loans){Sample(loan,me);Withdraw(loan,me);}loans.clear();}
 void PersonalStoryWeapon(int slot,int&weapon,int&ammo){

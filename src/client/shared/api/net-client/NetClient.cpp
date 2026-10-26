@@ -8,6 +8,7 @@
 #include "common/lib/log/Log.h"
 #include "common/lib/util/Util.h"
 #include "shared/config/Config.h"
+#include "shared/lib/sync/ReceiveBacklog.h"
 
 namespace coop {
 
@@ -104,8 +105,14 @@ void PrepareNat(ENetHost* client, ENetAddress& server, ENetAddress& relay, const
 
 bool NetClient::Start(const std::string& host, uint16_t port) {
     Stop();
+    m_failure = Failure::None;
+    m_expiredReceivePackets = 0;
+    m_lastPoll = NowMs();
+    m_connectEvent = false;
+    m_disconnectEvent = false;
     if (!net::Init()) {
         LOGE("enet init failed");
+        m_failure = Failure::Setup;
         return false;
     }
     m_quit = false;
@@ -137,7 +144,9 @@ void NetClient::Send(uint8_t channel, const uint8_t* data, size_t size) {
     if (m_state != State::Connected || size == 0) return;
     std::lock_guard<std::mutex> lock(m_outMutex);
     if(size>32*1024*1024||m_outBytes+size>32*1024*1024||m_out.size()>=32768){
-        LOGW("Network outgoing queue limit reached; terminating the stalled connection");m_quit=true;m_state=State::Disconnected;m_disconnectEvent=true;return;
+        LOGW("Network outgoing queue limit reached packets=%u bytes=%llu incoming=%llu", (unsigned)m_out.size(),
+             (unsigned long long)m_outBytes.load(), (unsigned long long)m_inBytes.load());
+        m_failure=Failure::OutgoingBacklog;m_quit=true;m_state=State::Disconnected;m_disconnectEvent=true;return;
     }
     m_out.push_back(Packet{channel, std::vector<uint8_t>(data, data + size)});
     m_outBytes+=size;
@@ -145,6 +154,7 @@ void NetClient::Send(uint8_t channel, const uint8_t* data, size_t size) {
 
 void NetClient::Poll(std::vector<Packet>& out) {
     std::lock_guard<std::mutex> lock(m_inMutex);
+    m_lastPoll = NowMs();
     m_inBytes=0;
     if (m_in.empty()) return;
     if (out.empty()) {
@@ -160,7 +170,8 @@ void NetClient::ThreadMain(std::string host, uint16_t port) {
         auto*pkt=net::MakePacket(p.data.data(),p.data.size(),p.channel);
         if(pkt&&(pkt->flags&ENET_PACKET_FLAG_RELIABLE)){
             if(m_reliableBytes+pkt->dataLength>32*1024*1024){
-                enet_packet_destroy(pkt);LOGW("ENet reliable queue limit reached");m_quit=true;m_state=State::Disconnected;m_disconnectEvent=true;return nullptr;
+                enet_packet_destroy(pkt);LOGW("ENet reliable queue limit reached bytes=%llu", (unsigned long long)m_reliableBytes.load());
+                m_failure=Failure::ReliableBacklog;m_quit=true;m_state=State::Disconnected;m_disconnectEvent=true;return nullptr;
             }
             m_reliableBytes+=pkt->dataLength;pkt->userData=&m_reliableBytes;
             pkt->freeCallback=[](ENetPacket*p){((std::atomic<uint64_t>*)p->userData)->fetch_sub(p->dataLength);};
@@ -170,6 +181,7 @@ void NetClient::ThreadMain(std::string host, uint16_t port) {
     ENetHost* client = enet_host_create(nullptr, 1, proto::CH_COUNT, 0, 0);
     if (!client) {
         LOGE("enet_host_create failed");
+        m_failure = Failure::Setup;
         m_state = State::Disconnected;
         m_disconnectEvent = true;
         return;
@@ -187,6 +199,7 @@ void NetClient::ThreadMain(std::string host, uint16_t port) {
     } else if (enet_address_set_host(&addr, host.c_str()) != 0) {
         LOGE("Не удалось определить адрес сервера \"%s\"", host.c_str());
         enet_host_destroy(client);
+        m_failure = Failure::Setup;
         m_state = State::Disconnected;
         m_disconnectEvent = true;
         return;
@@ -198,6 +211,7 @@ void NetClient::ThreadMain(std::string host, uint16_t port) {
     ENetPeer* peer = enet_host_connect(client, useRelay ? &relay : &addr, proto::CH_COUNT, 0);
     if (!peer) {
         enet_host_destroy(client);
+        m_failure = Failure::Setup;
         m_state = State::Disconnected;
         m_disconnectEvent = true;
         return;
@@ -209,7 +223,22 @@ void NetClient::ThreadMain(std::string host, uint16_t port) {
     bool connected = false;
     // the connection just before it ended, for the log: ENet resets the peer before it reports the end
     enet_uint32 lastLoss = 0, lastInTransit = 0, lastHeard = 0;
+    uint64_t servicedAt = NowMs(), longestServiceGap = 0;
+    auto logHealth = [&](const char* cause) {
+        auto now = NowMs();
+        LOGW("Network end cause=%s rtt=%u receive_age=%u game_poll_age=%llu service_gap_max=%llu queued_in=%llu queued_out=%llu reliable=%llu expired_state=%llu",
+             cause, m_rtt.load(), lastHeard ? enet_time_get() - lastHeard : 0,
+             (unsigned long long)(now - m_lastPoll.load()), (unsigned long long)longestServiceGap,
+             (unsigned long long)m_inBytes.load(), (unsigned long long)m_outBytes.load(),
+             (unsigned long long)m_reliableBytes.load(), (unsigned long long)m_expiredReceivePackets.load());
+    };
     while (!m_quit) {
+        auto now = NowMs();
+        auto serviceGap = now - servicedAt;
+        if (serviceGap > longestServiceGap) longestServiceGap = serviceGap;
+        if (connected && serviceGap > 1000)
+            LOGW("Network service resumed after %llu ms without servicing the socket", (unsigned long long)serviceGap);
+        servicedAt = now;
         // flush outgoing
         {
             std::lock_guard<std::mutex> lock(m_outMutex);
@@ -217,7 +246,7 @@ void NetClient::ThreadMain(std::string host, uint16_t port) {
         }
         if (connected) {
             for (auto& p : outLocal) {
-                ENetPacket* pkt = makePacket(p);if(!pkt)continue;
+                ENetPacket* pkt = makePacket(p);if(!pkt){if(m_quit)break;continue;}
                 if (enet_peer_send(peer, p.channel, pkt) != 0) enet_packet_destroy(pkt);
                 m_bytesOut += p.data.size();
             }
@@ -229,7 +258,13 @@ void NetClient::ThreadMain(std::string host, uint16_t port) {
             enet_peer_reset(peer);
             peer = enet_host_connect(client, &relay, proto::CH_COUNT, 0);
             relayAt = 0;
-            if (!peer) break;
+            if (!peer) {
+                LOGE("Could not allocate an ENet peer for the relay connection");
+                m_failure = Failure::Setup;
+                m_state = State::Disconnected;
+                m_disconnectEvent = true;
+                break;
+            }
             enet_peer_timeout(peer, 0, 10000, 20000);
         }
 
@@ -254,6 +289,8 @@ void NetClient::ThreadMain(std::string host, uint16_t port) {
                              m_rtt.load(), lastLoss * 100.0 / (double)ENET_PEER_PACKET_LOSS_SCALE, lastInTransit,
                              enet_time_get() - lastHeard, ev.data);
                     connected = false;
+                    m_failure = Failure::Transport;
+                    logHealth("transport-disconnect");
                     m_state = State::Disconnected;
                     m_disconnectEvent = true;
                     m_quit = true;
@@ -263,11 +300,15 @@ void NetClient::ThreadMain(std::string host, uint16_t port) {
                     Packet p{ev.channelID, std::vector<uint8_t>(ev.packet->data, ev.packet->data + ev.packet->dataLength),NowMs()};
                     enet_packet_destroy(ev.packet);
                     std::lock_guard<std::mutex> lock(m_inMutex);
-                    // a game that stands (a long load, a hang, alt-tab without run_in_background) piled up every state
-                    // and applied them all at once, stale: past a few thousand only the reliable ones are kept
-                    if (m_in.size() > 4000 && (p.channel == proto::CH_STATE || p.channel == proto::CH_STATE_PLAYER1 || p.channel == proto::CH_STATE_PLAYER2 || p.channel == proto::CH_VOICE)) break;
+                    if (m_in.size() >= 4000 || m_inBytes + p.data.size() > 32 * 1024 * 1024) {
+                        uint64_t bytes = m_inBytes.load();
+                        m_expiredReceivePackets += ExpireReceiveBacklog(m_in, p.received, bytes);
+                        m_inBytes = bytes;
+                    }
                     if(m_inBytes+p.data.size()>32*1024*1024||m_in.size()>=32768){
-                        LOGW("Network incoming queue limit reached; terminating the stalled connection");m_quit=true;m_state=State::Disconnected;m_disconnectEvent=true;break;
+                        LOGW("Network incoming queue limit reached packets=%u bytes=%llu poll_age=%llu", (unsigned)m_in.size(),
+                             (unsigned long long)m_inBytes.load(), (unsigned long long)(NowMs() - m_lastPoll.load()));
+                        m_failure=Failure::IncomingBacklog;m_quit=true;m_state=State::Disconnected;m_disconnectEvent=true;break;
                     }
                     m_inBytes+=p.data.size();
                     m_in.push_back(std::move(p));
@@ -279,6 +320,14 @@ void NetClient::ThreadMain(std::string host, uint16_t port) {
             if (m_quit) break;
             rc = enet_host_check_events(client, &ev);
         }
+        if (rc < 0) {
+            LOGE("ENet socket service failed (WSA %d)", WSAGetLastError());
+            m_failure = Failure::Socket;
+            m_state = State::Disconnected;
+            m_disconnectEvent = true;
+            m_quit = true;
+            logHealth("socket-service-error");
+        }
         if (connected) {
             m_rtt = peer->roundTripTime;
             lastLoss = peer->packetLoss;
@@ -287,7 +336,11 @@ void NetClient::ThreadMain(std::string host, uint16_t port) {
         }
     }
 
-    if (connected) {
+    if (m_failure == Failure::OutgoingBacklog) logHealth("outgoing-backlog");
+    else if (m_failure == Failure::IncomingBacklog) logHealth("incoming-backlog");
+    else if (m_failure == Failure::ReliableBacklog) logHealth("reliable-backlog");
+
+    if (connected && m_failure == Failure::None) {
         // what the game queued last goes first (the partner's profile on leaving): enet_peer_disconnect drops the
         // queues, enet_peer_disconnect_later sends them and then disconnects
         {
@@ -295,7 +348,7 @@ void NetClient::ThreadMain(std::string host, uint16_t port) {
             outLocal.swap(m_out);m_outBytes=0;
         }
         for (auto& p : outLocal) {
-            ENetPacket* pkt = makePacket(p);if(!pkt)continue;
+            ENetPacket* pkt = makePacket(p);if(!pkt){if(m_quit)break;continue;}
             if (enet_peer_send(peer, p.channel, pkt) != 0) enet_packet_destroy(pkt);
         }
         outLocal.clear();
@@ -308,6 +361,8 @@ void NetClient::ThreadMain(std::string host, uint16_t port) {
             if (ev.type == ENET_EVENT_TYPE_DISCONNECT) break;
         }
         enet_peer_reset(peer);
+    } else if (connected) {
+        enet_peer_disconnect_now(peer, 2);
     }
     enet_host_destroy(client);
     if (m_state != State::Disconnected) {

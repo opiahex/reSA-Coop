@@ -15,6 +15,7 @@ namespace coop {
 class NetClient {
 public:
     enum class State { Idle, Connecting, Connected, Disconnected };
+    enum class Failure { None, Transport, Socket, OutgoingBacklog, IncomingBacklog, ReliableBacklog, Setup };
 
     struct Packet {
         uint8_t channel;
@@ -41,6 +42,8 @@ public:
     uint64_t BytesOut() const { return m_bytesOut.load(); }
     uint64_t QueuedInBytes()const{return m_inBytes.load();}
     uint64_t QueuedOutBytes()const{return m_outBytes.load()+m_reliableBytes.load();}
+    uint64_t ExpiredReceivePackets() const { return m_expiredReceivePackets.load(); }
+    Failure LastFailure() const { return m_failure.load(); }
 
 private:
     void ThreadMain(std::string host, uint16_t port);
@@ -53,6 +56,8 @@ private:
     std::atomic<bool> m_connectEvent{false};
     std::atomic<uint64_t> m_bytesIn{0}, m_bytesOut{0};
     std::atomic<uint64_t> m_inBytes{0},m_outBytes{0},m_reliableBytes{0};
+    std::atomic<uint64_t> m_expiredReceivePackets{0}, m_lastPoll{0};
+    std::atomic<Failure> m_failure{Failure::None};
 
     std::mutex m_outMutex;
     std::vector<Packet> m_out;

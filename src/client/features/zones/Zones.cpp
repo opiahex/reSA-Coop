@@ -1,7 +1,7 @@
 // Gang territories follow the host. The host's game runs the gang wars and the story; whenever a territory's gangs,
 // colour or radar mode (flashing while it is attacked) change there, the partner's copy of that zone info changes too.
-// The partner's game starts no gang wars of its own: its player's kills feed only its own provocation, and two games
-// picking their own waves and winners would split the map.
+// GangWarCoop forwards confirmed kills and borrows the participating player's
+// native context on the host. Guests never pick a second set of waves or winners.
 #include <algorithm>
 #include <cstring>
 #include <vector>

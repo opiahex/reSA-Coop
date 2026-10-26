@@ -56,6 +56,45 @@ constexpr int TASK_ENTER_CAR_AS_PASSENGER = 700, TASK_ENTER_CAR_AS_DRIVER = 701,
 constexpr int TASK_SIMPLE_USE_GUN = 1017;
 constexpr uint64_t kCarTaskGraceMs = 6000;  // let enter/leave animations finish before warping
 constexpr uint16_t kNoAnim = 0xFFFF;
+struct WeaponAnimationBlock{bool ready=false,keep=false;};
+std::map<int,WeaponAnimationBlock> weaponAnimationBlocks;
+void ReleaseWeaponAnimationKeep(int block,WeaponAnimationBlock&held){
+    if(!held.keep)return;
+    auto&flags=Ref<uint8_t>(addr::StreamingInfo+(uintptr_t)(anim::kIfpBase+block)*0x14+6);
+    flags&=~8u;held.keep=false; // clear only the KEEP_IN_MEMORY bit we added
+    if(!(flags&6))Call<0x409C10>(anim::kIfpBase+block);
+}
+bool WeaponAnimationsReady(CPed*ped,int weapon){
+    if(!weapon)return true;
+    int skill=CallMethod<0x5E3B60,uint8_t>(ped,weapon); // native eWeaponSkill returns AL only
+    auto*info=Call<0x743C60,void*>(weapon,skill);
+    int group=Field<int32_t>(info,0x1C); // CWeaponInfo::m_eAnimGroup
+    if(group<0||group>=Ref<int32_t>(0xB4EA28))return false;
+    auto*name=Call<0x4D3A30,const char*>(group); // definition exists before its IFP is loaded
+    int block=Call<0x4D3990,int>(name);
+    if(block<0||block>=Ref<int32_t>(0xB4EA30))return false;
+    auto[i,added]=weaponAnimationBlocks.try_emplace(block);
+    if(added)Call<0x4D3FB0>(block); // pin while these native NPCs/tasks can use the group
+    if(!anim::BlockLoaded(block)){
+        auto flags=Ref<uint8_t>(addr::StreamingInfo+(uintptr_t)(anim::kIfpBase+block)*0x14+6);
+        if(!(flags&8))i->second.keep=true;
+        // ConvertBufferToObject discards an IFP with no streaming requirement,
+        // even when its animation block reference count is already nonzero.
+        RequestModel(anim::kIfpBase+block,8);return false;
+    }
+    auto*groups=Ref<uint8_t*>(0xB4EA34);
+    auto*associations=groups?groups+group*0x14:nullptr;
+    // A loaded hierarchy alone is insufficient: native UseGun indexes this
+    // group's static associations directly (CAnimManager::BlendAnimation).
+    if(!associations||!Field<void*>(associations,4)||!Field<uint32_t>(associations,8))return false;
+    ReleaseWeaponAnimationKeep(block,i->second);
+    if(!i->second.ready){i->second.ready=true;LOGD("NPC weapon animations ready weapon=%d skill=%d group=%d block=%d",weapon,skill,group,block);}
+    return true;
+}
+void ReleaseWeaponAnimations(){
+    for(auto&[block,held]:weaponAnimationBlocks){ReleaseWeaponAnimationKeep(block,held);Call<0x4D3FD0>(block);}
+    weaponAnimationBlocks.clear();
+}
 void RequestDrivebyAnimations() {
     static int block=-1;
     if(block<0)block=Call<0x4D3990,int>("drivebys");
@@ -120,6 +159,64 @@ void* FindTask(CPed* ped, int type) {
 // plays over a full-body one (the fight stance) and is the action while it lasts: the mirror keeps the stance under it.
 struct HandContact{int handle=-1,target=-1;uint64_t at=0;uint8_t arm=255;int16_t bone=0;CVector offset;float speed=.25f;int blend=250;};
 std::map<uint16_t,HandContact>handContacts;
+struct CouplePose {
+    uint32_t time=0;
+    CVector position[2],velocity[2];
+    float heading[2]{};
+};
+struct CoupleClock {
+    uint64_t generations[2]{},seen=0;
+    SnapshotBuffer<CouplePose> poses;
+};
+std::map<uint64_t,CoupleClock>coupleClocks;
+void AlignContactHeading(NetPed&np,float heading);
+
+// Both native actors are sampled in the same owner frame. A single playout
+// clock keeps their contact together; neither actor follows the other copy's
+// locally generated walk or collision response.
+bool CoupleFrame(NetPed&np,CouplePose&pose,int&side){
+    const auto&s=np.state;const auto&contact=s.interaction;
+    if((s.flags&(PedSyncState::F_DEAD|PedSyncState::F_IN_VEHICLE))||!contact.couple||contact.partnerKind!=1||!contact.partnerId||contact.partnerId==np.netId||
+       !Net().EntityLink(ENTITY_PED,np.netId,ENTITY_PED,contact.partnerId))return false;
+    auto*other=Peds::Instance().Find(GetPed(Peds::Instance().HandleOf(contact.partnerId)));
+    if(!other||!IsAlive(*other)||other->owner!=np.owner||!other->hasState||
+       (other->state.flags&(PedSyncState::F_DEAD|PedSyncState::F_IN_VEHICLE))||
+       other->state.area!=s.area||NowMs()-other->recvMs>1000||NowMs()-np.recvMs>1000||
+       !other->state.interaction.couple||other->state.interaction.partnerKind!=1||
+       other->state.interaction.partnerId!=np.netId||contact.partnerOffset.Length()>3.5f)return false;
+    uint16_t first=std::min(np.netId,contact.partnerId),second=std::max(np.netId,contact.partnerId);
+    uint64_t key=((uint64_t)np.owner<<32)|((uint64_t)first<<16)|second;
+    auto&clock=coupleClocks[key];
+    uint64_t generations[2]{Net().EntityGeneration(ENTITY_PED,first),Net().EntityGeneration(ENTITY_PED,second)};
+    if(clock.generations[0]!=generations[0]||clock.generations[1]!=generations[1]){
+        clock={};clock.generations[0]=generations[0];clock.generations[1]=generations[1];
+    }
+    side=np.netId==first?0:1;
+    CouplePose sample;sample.time=s.time;sample.position[side]=s.pos;sample.velocity[side]=s.vel;sample.heading[side]=s.heading;
+    int partnerSide=1-side;float h=s.heading-contact.partnerHeading,c=std::cos(h),sn=std::sin(h);
+    auto offset=contact.partnerOffset;
+    sample.position[partnerSide]=s.pos-CVector{c*offset.x-sn*offset.y,sn*offset.x+c*offset.y,offset.z};
+    sample.velocity[partnerSide]=contact.partnerVelocity;sample.heading[partnerSide]=h;
+    clock.poses.Push(sample,NowMs());clock.seen=NowMs();
+    pose=clock.poses.At(NowMs(),[](const CouplePose&a,const CouplePose&b,float t){
+        auto p=b;p.time=a.time+(uint32_t)((int32_t)(b.time-a.time)*t);
+        for(int i=0;i<2;++i)if((b.position[i]-a.position[i]).Length()<8){
+            p.position[i]=a.position[i]+(b.position[i]-a.position[i])*t;
+            p.velocity[i]=a.velocity[i]+(b.velocity[i]-a.velocity[i])*t;
+            p.heading[i]=LerpAngle(a.heading[i],b.heading[i],t);
+        }
+        return p;
+    },[](CouplePose&p,float age,bool stale){if(!stale){
+        p.time+=(uint32_t)(age*1000);for(int i=0;i<2;++i)p.position[i]=p.position[i]+p.velocity[i]*age;
+    }});
+    return true;
+}
+
+void* ReplayInteractionPose(void*clump,const AnimationState&source,float age){
+    auto pose=source;
+    pose.time=std::max(0.f,pose.time+age*pose.speed*((pose.flags&1)?1.f:0.f));
+    return anim::Replay(clump,pose,0);
+}
 void* CoupleTask(CPed*ped){
     if(!ped||!ped->Intelligence())return nullptr;
     auto*manager=(uint8_t*)ped->Intelligence()+4;
@@ -179,6 +276,7 @@ void CaptureInteraction(NetPed&np,PedSyncState&s){
         }
     }
     if(partner&&partner!=ped&&IsPedValid(partner)){
+        if(out.couple)out.partnerVelocity=partner->MoveSpeed()*50.f;
         if(out.couple)if(auto i=handContacts.find(np.netId);i!=handContacts.end()&&i->second.handle==np.handle&&i->second.target==GetPedRef(partner)&&CallStd<0x6182B0,bool>((int)i->second.arm,ped)){
             auto&h=i->second;out.handArm=h.arm;out.handBone=h.bone;out.handOffset=h.offset;out.handSpeed=h.speed;out.handBlend=h.blend;}
         if(partner==FindPlayerPed(0)){out.partnerKind=2;out.partnerId=Net().MyId();}
@@ -227,22 +325,35 @@ void CaptureInteraction(NetPed&np,PedSyncState&s){
 }
 bool ApplyInteraction(NetPed&np,float age){
     auto*ped=np.ped;const auto&state=np.state.interaction;bool wasExtra=np.extraFull;np.extraFull=false;np.interactionPending=false;
-    if(np.handArm<2&&(state.handArm!=np.handArm||!state.couple||!state.partnerKind))CallStd<0x6182F0>((int)np.handArm,ped,250);
-    np.handArm=state.handArm;
-    if(state.couple&&state.partnerKind==1){auto*partner=GetPed(Peds::Instance().HandleOf(state.partnerId));
+    CouplePose couplePose;int coupleSide=0;bool coupleBound=CoupleFrame(np,couplePose,coupleSide);
+    if(coupleBound){
+        age=std::clamp((int32_t)(couplePose.time-np.state.time)/1000.f,-1.f,.2f);
+        SetEntityPosition(ped,couplePose.position[coupleSide]);
+        AlignContactHeading(np,couplePose.heading[coupleSide]);
+        ped->MoveSpeed()=couplePose.velocity[coupleSide]*(1.f/50.f);ped->Flags()&=~1u;
+    }
+    np.interactionAge=age;
+    bool handApplied=false;
+    if(state.couple&&state.partnerKind==1&&ped->Health()>0){auto*partner=GetPed(Peds::Instance().HandleOf(state.partnerId));
         if(partner&&IsPedValid(partner)&&Net().EntityLink(ENTITY_PED,np.netId,ENTITY_PED,state.partnerId)&&partner->Health()>0&&(partner->GetPosition()-ped->GetPosition()).Length()<4){
             if(state.handArm<2){auto offset=state.handOffset;CEntity*target=(CEntity*)partner;
                 if(state.handBone==-1){float h=partner->CurrentRotation();offset=partner->GetPosition()+CVector{offset.x*std::cos(h)-offset.y*std::sin(h),offset.x*std::sin(h)+offset.y*std::cos(h),offset.z};target=nullptr;}
-                originalPointArm((void*)0xC15448,nullptr,"coop couple",state.handArm,ped,target,(int)state.handBone,&offset,state.handSpeed,state.handBlend,999.f);}
-            if(np.state.motion.Present())anim::Replay(ped->RwObject(),np.state.motion,age);
+                originalPointArm((void*)0xC15448,nullptr,"coop couple",state.handArm,ped,target,(int)state.handBone,&offset,state.handSpeed,state.handBlend,999.f);handApplied=true;}
+            if(np.state.motion.Present())ReplayInteractionPose(ped->RwObject(),np.state.motion,age);
         }}
+    uint8_t wantedArm=handApplied?state.handArm:255;
+    // CLEAR_CHAR_TASKS can already have destroyed task 5, the native IK
+    // manager. AbortPointArm assumes it exists; IsArmPointing checks it.
+    if(np.handArm<2&&np.handArm!=wantedArm&&CallStd<0x6182B0,bool>((int)np.handArm,ped))
+        CallStd<0x6182F0>((int)np.handArm,ped,250);
+    np.handArm=wantedArm;
     if(np.state.motion.Present()&&np.state.animBlock!=kNoAnim&&(np.state.animFlags&anim::F_PARTIAL))
-        anim::Replay(ped->RwObject(),np.state.motion,age);
+        ReplayInteractionPose(ped->RwObject(),np.state.motion,age);
     for(int i=0;i<PedInteraction::LayerCount;++i){
         auto&old=np.extraLayers[i];const auto&pose=state.layers[i];
         bool retained=false;for(auto&layer:state.layers)if(layer.Present()&&layer.Same(old))retained=true;
         if(old.Present()&&!retained)if(auto*a=anim::Find(ped->RwObject(),old))anim::FadeOut(a);
-        if(pose.Present())if(auto*a=anim::Replay(ped->RwObject(),pose,age)){
+        if(pose.Present())if(auto*a=ReplayInteractionPose(ped->RwObject(),pose,age)){
             if(std::fabs(anim::BlendAmount(a)-state.weights[i])>.1f)anim::BlendAmount(a)=state.weights[i];
             if(!(pose.flags&anim::F_PARTIAL))np.extraFull=true;
         }
@@ -260,6 +371,7 @@ bool ApplyInteraction(NetPed&np,float age){
         if(!Net().EntityLink(ENTITY_PED,np.netId,kind,state.parentId)){parent=nullptr;if(np.interactionAttached&&ped->AttachedTo()){CallMethod<0x5E7EC0>(ped);np.interactionAttached=false;}}
     }
     if(parent&&parent!=ped){
+        if(state.turret&&!WeaponAnimationsReady(ped,np.state.weapon)){np.interactionPending=true;return false;}
         if(ped->AttachedTo()!=parent){
             if(np.interactionAttached&&ped->AttachedTo())CallMethod<0x5E7EC0>(ped);
             if(state.turret)CallMethod<0x5E7CB0,CEntity*>(ped,parent,state.offset,state.turretAngle,state.turretRange,(int)np.state.weapon);
@@ -272,6 +384,7 @@ bool ApplyInteraction(NetPed&np,float age){
     }
     if(!state.parentKind&&np.interactionAttached){if(ped->AttachedTo())CallMethod<0x5E7EC0>(ped);np.interactionAttached=false;}
     if(state.parentKind){np.interactionPending=true;ped->Flags()&=~129u;}
+    if(coupleBound)return true;
     if(!state.parentKind&&state.partnerKind&&!(np.state.flags&(PedSyncState::F_DEAD|PedSyncState::F_IN_VEHICLE))){
         CPed*partner=nullptr;CVector point,velocity;float heading=0;bool fresh=false;
         if(state.partnerKind==1&&Net().EntityLink(ENTITY_PED,np.netId,ENTITY_PED,state.partnerId)){
@@ -346,7 +459,7 @@ void ReplayBoundAction(NetPed&np,float age){
     else np.baseBlock=kNoAnim;
     if(st.animBlock!=kNoAnim){
         AnimationState pose;pose.block=st.animBlock;pose.index=st.animIdx;pose.flags=st.animFlags;pose.time=st.animTime;pose.speed=st.animSpeed;
-        anim::Replay(ped->RwObject(),pose,age);
+        ReplayInteractionPose(ped->RwObject(),pose,age);
         if(st.interaction.partnerKind||(st.flags&PedSyncState::F_DEAD)){
             for(void*a=anim::First(ped->RwObject());a;a=anim::Next(a)){
                 auto present=anim::Capture(a);bool retained=pose.Same(present)||st.motion.Same(present);
@@ -824,7 +937,14 @@ void Peds::HandleCreate(uint8_t from, Reader& r) {
     PedSyncState st;
     if(!ReadState(r,st))return;
     if (!r.Ok() || from == Net().MyId() || !core::IsPlayerReady()) return;
-    if(auto it=m_byId.find(id);it!=m_byId.end()){if(it->second.owner==from&&it->second.model==model&&(!it->second.hasState||(int32_t)(st.time-it->second.state.time)>=0)){it->second.state=st;it->second.hasState=true;it->second.recvMs=NowMs();}return;}
+    if(auto it=m_byId.find(id);it!=m_byId.end()){
+        auto&known=it->second;
+        if(known.owner==from&&known.model==model&&(!known.hasState||((int32_t)(st.time-known.state.time)>=0&&
+           (int32_t)(st.interaction.revision-known.state.interaction.revision)>=0))){
+            known.state=st;known.hasState=true;known.recvMs=NowMs();known.poses.Push({st.time,st.pos,st.vel,st.heading},known.recvMs);
+        }
+        return;
+    }
     NetPed& np = m_byId[id];
     np.netId = id;
     np.owner = from;
@@ -957,6 +1077,7 @@ void Peds::HandleSync(uint8_t from, Reader& r) {
     if (it == m_byId.end() || it->second.owner != from) return;
     NetPed& np = it->second;
     if (np.hasState && (int32_t)(st.time - np.state.time) < 0) return;  // reordered
+    if(np.hasState&&(int32_t)(st.interaction.revision-np.state.interaction.revision)<0)return;
     np.state = st;
     np.hasState = true;
     np.recvMs = NowMs();
@@ -966,9 +1087,17 @@ void Peds::HandleSync(uint8_t from, Reader& r) {
 void Peds::HandleAction(uint8_t from,Reader&r){
     auto id=r.U16();PedSyncState st;if(!st.Read(r))return;auto i=m_byId.find(id);if(i==m_byId.end()||i->second.owner!=from)return;
     auto&n=i->second;if(n.hasState&&(int32_t)(st.interaction.revision-n.state.interaction.revision)<=0){LOGD("NPC action revision ignored id=%04X incoming=%u current=%u",id,st.interaction.revision,n.state.interaction.revision);return;}
-    if(!n.hasState){n.state=st;n.hasState=true;n.recvMs=NowMs();return;}
+    // A reliable action can overtake the preceding state-channel sample.
+    // Advance its transform clock too, so that older samples cannot revive
+    // the previous partner/task or overwrite the first contact pose.
+    if(!n.hasState||(int32_t)(st.time-n.state.time)>=0){
+        Net().RememberEntityLinks(ENTITY_PED,id);n.state=st;n.hasState=true;n.recvMs=NowMs();
+        n.poses.Push({st.time,st.pos,st.vel,st.heading},n.recvMs);return;
+    }
     Net().RememberEntityLinks(ENTITY_PED,id);n.state.interaction=st.interaction;n.state.animBlock=st.animBlock;n.state.animIdx=st.animIdx;n.state.animFlags=st.animFlags;
-    n.state.animTime=st.animTime+std::clamp((int32_t)(n.state.time-st.time)/1000.f,0.f,.75f)*st.animSpeed;n.state.animSpeed=st.animSpeed;
+    float elapsed=std::clamp((int32_t)(n.state.time-st.time)/1000.f,0.f,.75f);
+    n.state.animTime=st.animTime+elapsed*st.animSpeed*((st.animFlags&1)?1.f:0.f);n.state.animSpeed=st.animSpeed;
+    for(auto&layer:n.state.interaction.layers)if(layer.Present()&&(layer.flags&1))layer.time+=elapsed*layer.speed;
 }
 
 void Peds::ApplyMirror(NetPed& np) {
@@ -1057,6 +1186,10 @@ void Peds::ApplyMirror(NetPed& np) {
     np.lastClip = ped->ActiveWeapon().ammoInClip;
     np.lastWeapon = (uint8_t)ped->ActiveWeapon().type;
 
+    // Attached gun turrets also create UseGun internally, even without a
+    // replicated aim flag. Load and retain the actual skill group's IFP before
+    // equipping its weapon or letting either native task path start.
+    if(!WeaponAnimationsReady(ped,st.weapon))return;
     if (ped->ActiveWeapon().type != st.weapon && now - np.weaponMs > 1000) {
         np.weaponMs = now;
         if (st.weapon != 0) {
@@ -1078,14 +1211,15 @@ void Peds::ApplyMirror(NetPed& np) {
         np.enterVeh=0;np.enterTaskMs=np.leaveTaskMs=0;
         LOGD("Paired actor released stale passenger seat id=%04X",np.netId);
     }
-    bool paired=!(st.flags&PedSyncState::F_IN_VEHICLE)&&!st.interaction.parentKind&&st.interaction.partnerKind&&st.animBlock!=kNoAnim;
+    bool paired=!(st.flags&PedSyncState::F_IN_VEHICLE)&&!st.interaction.parentKind&&st.interaction.partnerKind&&
+        (st.interaction.couple||st.animBlock!=kNoAnim);
     if(paired&&!np.pairedAction){Cmd(0x0792).I(np.handle).Run();np.lastTaskMove=0;}
     np.pairedAction=paired;
     if(paired)AlignContactHeading(np,st.heading);
     bool bound=ApplyInteraction(np,std::min(.2f,(now-np.recvMs)/1000.f));
     if(np.interactionPending){if(np.gunMode){Cmd(0x0687).I(np.handle).Run();np.gunMode=0;}return;}
     if(bound&&!(st.flags&PedSyncState::F_AIMING)){
-        ReplayBoundAction(np,std::min(.2f,(now-np.recvMs)/1000.f));
+        ReplayBoundAction(np,np.interactionAge);
         return;
     }
     // ---- vehicles: the game's own enter/leave tasks, warps only as a fallback
@@ -1431,17 +1565,25 @@ void Peds::OnPreProcess() {
 }
 
 void Peds::OnPostProcess() {
+    for(auto i=coupleClocks.begin();i!=coupleClocks.end();)i=NowMs()-i->second.seen>2500?coupleClocks.erase(i):std::next(i);
     for(auto i=handContacts.begin();i!=handContacts.end();){auto*p=GetPed(i->second.handle);
         i=!p||!GetPed(i->second.target)||!CallStd<0x6182B0,bool>((int)i->second.arm,p)?handContacts.erase(i):std::next(i);
     }
     bool ready = Net().Online() && core::IsPlayerReady();
+    if(ready)for(auto&[id,np]:m_byId)
+        if(np.owner!=Net().MyId()&&np.pairedAction&&np.state.interaction.couple&&IsAlive(np)&&
+           !(np.state.flags&(PedSyncState::F_DEAD|PedSyncState::F_IN_VEHICLE))){
+            ApplyInteraction(np,std::min(.2f,(NowMs()-np.recvMs)/1000.f));
+            ReplayBoundAction(np,np.interactionAge);
+        }
     // Native SetMoveAnim can replace a replica's gait with its local idle or
     // walk clock during ProcessControl. Restore the owner's clock as well as
     // its rate afterwards, before the next rendered frame.
     if (ready) for (auto& [id, np] : m_byId)
         if (np.owner != Net().MyId() && IsAlive(np) && !np.animFull && !np.extraFull &&
             !(np.state.flags & (PedSyncState::F_DEAD | PedSyncState::F_IN_VEHICLE | PedSyncState::F_ENTERING | PedSyncState::F_AIMING)))
-            anim::Replay(np.ped->RwObject(),np.state.motion,std::min(.2f,(NowMs()-np.recvMs)/1000.f));
+            ReplayInteractionPose(np.ped->RwObject(),np.state.motion,np.pairedAction&&np.state.interaction.couple?
+                np.interactionAge:std::min(.2f,(NowMs()-np.recvMs)/1000.f));
     if (!ready || NowMs() - m_lastScan < 50) return;
     m_lastScan = NowMs();
     ScanOwned();
@@ -1467,6 +1609,7 @@ void Peds::OnPostProcess() {
 
 void Peds::OnSessionEnd() {
     handContacts.clear();
+    coupleClocks.clear();
     for(auto&[id,np]:m_byId)HoldCorpseOutside(np,false);
     // mirrors stay in the world as ordinary random peds
     for (auto& [id, np] : m_byId)
@@ -1507,6 +1650,8 @@ void Peds::DropMirrorsOf(uint8_t id, bool keep) {
 }
 
 void Peds::OnGameStarted() {
+    weaponAnimationBlocks.clear();
+    coupleClocks.clear();
     m_byId.clear();
     m_byPtr.clear();
     m_giveAway.clear();
@@ -1514,6 +1659,9 @@ void Peds::OnGameStarted() {
 }
 
 void Peds::OnGameShutdown() {
+    // Session end leaves mirrors alive as ordinary native peds, so retain their
+    // weapon blocks until the native world (and its tasks) is actually unloaded.
+    ReleaseWeaponAnimations();
     handContacts.clear();
     Net().AdvanceWorldEpoch(); OnGameStarted(); }
 

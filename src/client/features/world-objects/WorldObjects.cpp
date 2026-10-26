@@ -20,6 +20,7 @@
 #include "shared/api/net-session/Session.h"
 #include "shared/game/Game.h"
 #include "shared/lib/core/Core.h"
+#include "shared/lib/memory/Memory.h"
 
 namespace coop {
 
@@ -29,6 +30,7 @@ using namespace game;
 constexpr float kRange = 150.0f;               // objects this far from our player are looked at
 constexpr uint64_t kFollowMs = 1500;           // the other game's moves stop: it lies still (or the message got lost)
 constexpr int kMaxSendsPerScan = 16;           // an explosion knocks dozens loose at once
+constexpr uint32_t kTrainCrossEnabled = 0x800; // CObject::objectFlags.bTrainCrossEnabled
 enum : uint8_t { F_MOVED = 1, F_MOVING = 2, F_CONTROLLED=4 };  // not where the map put it; still moving
 
 struct MechanismPose{uint32_t time=0;CVector pos;Quat rot;};
@@ -37,7 +39,9 @@ struct Thing {
     CVector origin;        // where its map entry puts it: the same in both games
     uint8_t stage = 0;     // 0 whole, 1 damaged (its damaged model, a cracked window), 2 broken (smashed, in pieces)
     bool moved = false, moving = false,controlled=false;uint8_t entityFlags=129;
+    uint32_t mechanismFlags = 0;
     SnapshotBuffer<MechanismPose>history;int heldHandle=-1;bool wasStatic=false;
+    int nativeFlagsHandle=-1;uint32_t nativeFlagsApplied=~0u;uint64_t pathApplyMs=0;
     CVector pos, speed, turn;
     Quat rot;
     uint8_t weapon = 0;    // what broke it (CObject::m_nLastWeaponDamage): the same proofs decide in the other game
@@ -66,10 +70,19 @@ CEntity* Dummy(CObject* o) {                                           // CObjec
     return d;
 }
 
+bool Crossing(uint16_t model) {
+    return model == Ref<uint16_t>(0x8CD6B4) || model == Ref<uint16_t>(0x8CD6B8);
+}
+bool CrossingLights(uint16_t model) { return model == Ref<uint16_t>(0x8CD6B8); }
 bool Controlled(CObject*o){auto special=Field<uint8_t>(o,0x145);return Field<void*>(o,0x138)||(special>=6&&special<=8);}
 uint8_t ControlSource(CObject*o){
-    auto at=o->GetPosition();uint8_t source=255;
-    auto add=[&](uint8_t id,int8_t area,const CVector&pos){if((area==o->AreaCode()||o->AreaCode()==13)&&(pos-at).Length()<200)source=std::min(source,id);};
+    // A map crossing has AREA_CODE_13, but a player upstairs in an interior must
+    // not become the simulator of a railway crossing on the street below.
+    auto*d=Dummy(o);auto at=d?d->GetPosition():o->GetPosition();uint8_t source=255;
+    auto add=[&](uint8_t id,int8_t area,const CVector&pos){
+        bool sameArea=Crossing(o->ModelIndex())?area==0:(area==o->AreaCode()||o->AreaCode()==13);
+        if(sameArea&&(pos-at).Length()<200)source=std::min(source,id);
+    };
     if(auto*me=FindPlayerPed(0))add(Net().MyId(),me->AreaCode(),me->GetPosition());
     for(auto&[id,p]:Players::Instance().All())if(p.hasState&&NowMs()-p.stateRecvMs<1500)add(id,p.state.area,p.state.pos);
     return source;
@@ -109,7 +122,7 @@ void Send(const Thing& t, bool reliable) {
     w.Vec({t.origin.x, t.origin.y, t.origin.z});
     w.U8(t.stage);
     w.U8((t.moved ? F_MOVED : 0) | (t.moving ? F_MOVING : 0) | (t.controlled?F_CONTROLLED:0));
-    w.U8(t.weapon);if(t.controlled)w.U8(t.entityFlags);
+    w.U8(t.weapon);if(t.controlled){w.U8(t.entityFlags);w.U32(t.mechanismFlags);}
     if (t.moved) {
         w.Vec({t.pos.x, t.pos.y, t.pos.z});
         t.rot.Write(w);
@@ -164,23 +177,60 @@ void CatchUp(CObject* o, Thing& t, bool driven) {
 }
 
 void ReleaseMechanism(Thing&t){
-    if(auto*o=GetObject(t.heldHandle);o&&!t.wasStatic)CallVirtual<4>(o,false);
+    if(auto*o=GetObject(t.heldHandle);o&&!t.wasStatic&&o->ModelIndex()==t.model){
+        if(auto*d=Dummy(o);d&&Key(t.model,d->GetPosition())==Key(t.model,t.origin))CallVirtual<4>(o,false);
+    }
     t.heldHandle=-1;
+}
+void ApplyMechanismFlags(CObject*o,Thing&t){
+    if(!Crossing(o->ModelIndex()))return;
+    auto&flags=Field<uint32_t>(o,0x140);
+    flags=(flags&~kTrainCrossEnabled)|(t.mechanismFlags&kTrainCrossEnabled);
+    // The warning-light object also stops road traffic through path-link state.
+    // Its matrix does not move, so copying the barrier's pose cannot do this.
+    const auto now=NowMs();const int handle=GetObjectRef(o);
+    if(CrossingLights(o->ModelIndex())&&(t.nativeFlagsHandle!=handle||t.nativeFlagsApplied!=t.mechanismFlags||now-t.pathApplyMs>=1000)){
+        auto*d=Dummy(o);if(!d)return;const auto p=d->GetPosition();
+        CallMethod<0x44D960>((void*)0x96F050,p.x-12.0f,p.x+12.0f,p.y-12.0f,p.y+12.0f,bool(flags&kTrainCrossEnabled));
+        t.nativeFlagsHandle=handle;t.nativeFlagsApplied=t.mechanismFlags;t.pathApplyMs=now;
+    }
 }
 void FollowMechanism(CObject*o,Thing&t){
     if(t.heldHandle!=GetObjectRef(o)){t.heldHandle=GetObjectRef(o);t.wasStatic=(o->Flags()&4)!=0;}
     auto pose=t.history.At(NowMs(),[](const MechanismPose&a,const MechanismPose&b,float f){return MechanismPose{b.time,a.pos+(b.pos-a.pos)*f,Quat::Slerp(a.rot,b.rot,f)};},[](MechanismPose&,float,bool){});
     Place(o,pose.pos,pose.rot,false,{},{});o->Flags()=(o->Flags()&~129u)|(t.entityFlags&129u);
+    ApplyMechanismFlags(o,t);
 }
 void FollowMechanisms(){
     auto*pool=ObjectPool();if(!pool)return;
     for(int i=0;i<pool->size;++i)if(pool->byteMap[i]>=0){auto*o=(CObject*)(pool->objects+(size_t)i*kObjectPoolElemSize);
         auto*d=Dummy(o);if(!d)continue;auto*t=Find(o->ModelIndex(),d->GetPosition());
         if(t&&t->controlled&&t->remote){
-            if(ControlSource(o)==Net().MyId()){ReleaseMechanism(*t);t->remote=false;}
+            if(!Shared(o)){ReleaseMechanism(*t);continue;} // a story subsystem adopted this instance
+            if(ControlSource(o)==Net().MyId()){ApplyMechanismFlags(o,*t);ReleaseMechanism(*t);t->remote=false;t->history.Clear();}
             else if(NowMs()-t->updatedMs<kFollowMs)FollowMechanism(o,*t);
+            else ReleaseMechanism(*t);
         }
     }
+}
+
+using CrossingFn=void(__fastcall*)(CObject*,void*);
+CrossingFn g_originalCrossing=nullptr;
+void __fastcall ProcessCrossing(CObject*o,void*edx){
+    if(Net().Online()&&core::IsPlayerReady()&&Shared(o)&&Crossing(o->ModelIndex())){
+        auto*d=Dummy(o);auto*t=d?Find(o->ModelIndex(),d->GetPosition()):nullptr;
+        if(t&&t->controlled&&t->remote){
+            if(ControlSource(o)==Net().MyId()){
+                // Continue the last accepted crossing state on handover. Native
+                // train detection then owns both the barrier and warning state.
+                ApplyMechanismFlags(o,*t);ReleaseMechanism(*t);t->remote=false;t->history.Clear();
+            }else if(NowMs()-t->updatedMs<kFollowMs){
+                ApplyMechanismFlags(o,*t);
+                return; // SetIsStatic does not stop ProcessControlLogic.
+            }else ReleaseMechanism(*t);
+        }
+    }
+    g_originalCrossing(o,edx);
 }
 
 void Scan() {
@@ -218,13 +268,14 @@ void Scan() {
         if (!t) {
             t=Remember(o->ModelIndex(),origin);
         }
-        bool changed = t->remote || stage != t->stage || moved != t->moved || moving != t->moving ||
+        const uint32_t mechanismFlags=Crossing(o->ModelIndex())?(Field<uint32_t>(o,0x140)&kTrainCrossEnabled):0;
+        bool changed = t->remote || (controlled&&t->source!=Net().MyId()) || stage != t->stage || moved != t->moved || moving != t->moving || mechanismFlags!=t->mechanismFlags ||
                        (moved && !moving && (at - t->pos).Length() > 0.1f);
         if (!changed && !(moving && now - t->sentMs >= 100)) continue;
         if (sends >= kMaxSendsPerScan){scanCursor=i;break;}
         ++sends;
         if (t->remote) LOGD("World object %d at %.1f,%.1f: ours now", t->model, origin.x, origin.y);
-        t->source=Net().MyId();t->controlled=controlled;t->entityFlags=(uint8_t)(o->Flags()&129u);
+        t->source=Net().MyId();t->controlled=controlled;t->entityFlags=(uint8_t)(o->Flags()&129u);t->mechanismFlags=mechanismFlags;
         t->remote = t->following = false;
         t->stage = stage;
         t->moved = moved;
@@ -256,6 +307,7 @@ void Handle(uint8_t from, Reader& r) {
     uint16_t model = r.U16();auto tick=r.U32();
     Vec3 o = r.Vec();
     uint8_t stage = r.U8(), flags = r.U8(), weapon = r.U8();uint8_t entityFlags=flags&F_CONTROLLED?r.U8():129;
+    uint32_t mechanismFlags=flags&F_CONTROLLED?r.U32():0;
     Vec3 p{}, s{}, tn{};
     Quat q;
     if (flags & F_MOVED) {
@@ -264,7 +316,9 @@ void Handle(uint8_t from, Reader& r) {
         s = r.Vec();
         tn = r.Vec();
     }
-    if (!r.Ok() || from == Net().MyId() || !core::IsPlayerReady() || stage > 2 || (flags&~7u) || !IsValidModel(model) || !(CVector{o.x,o.y,o.z}.Length()<25000) || ((flags&F_MOVED)&&(!(CVector{p.x,p.y,p.z}.Length()<25000)||!(CVector{s.x,s.y,s.z}.Length()<100)))) return;
+    if (!r.Ok() || from == Net().MyId() || !core::IsPlayerReady() || stage > 2 || (flags&~7u) ||
+        (entityFlags&~129u) || (mechanismFlags&~kTrainCrossEnabled) || (mechanismFlags&&!Crossing(model)) ||
+        ((flags&F_CONTROLLED)&&!(flags&F_MOVED)) || !IsValidModel(model) || !(CVector{o.x,o.y,o.z}.Length()<25000) || ((flags&F_MOVED)&&(!(CVector{p.x,p.y,p.z}.Length()<25000)||!(CVector{s.x,s.y,s.z}.Length()<100)))) return;
     ++g_received;
     CVector origin{o.x, o.y, o.z};
     Thing* t = Find(model, origin);
@@ -279,8 +333,8 @@ void Handle(uint8_t from, Reader& r) {
         if(t->source!=from)t->history.Clear();
     }
     if(t->controlled&&!(flags&F_CONTROLLED))ReleaseMechanism(*t);
-    t->source=from;t->controlled=(flags&F_CONTROLLED)!=0;t->entityFlags=entityFlags;
-    if(t->controlled&&!t->history.Push({tick,{p.x,p.y,p.z},q},NowMs()))return;
+    if((flags&F_CONTROLLED)&&!t->history.Push({tick,{p.x,p.y,p.z},q},NowMs()))return;
+    t->source=from;t->controlled=(flags&F_CONTROLLED)!=0;t->entityFlags=entityFlags;t->mechanismFlags=mechanismFlags;
     t->remote = true;
     t->stage = std::max(t->stage, stage);
     t->moved = (flags & F_MOVED) != 0;
@@ -296,15 +350,18 @@ void Handle(uint8_t from, Reader& r) {
 class WorldObjects : public Module {
 public:
     const char* Name() const override { return "WorldObjects"; }
-    void OnInstallHooks() override { Net().SetHandler(proto::G_WORLD_OBJ, &Handle); }
+    void OnInstallHooks() override {
+        Net().SetHandler(proto::G_WORLD_OBJ, &Handle);
+        mem::HookFn(0x5A0B50,&ProcessCrossing,&g_originalCrossing,"CObject::ProcessTrainCrossingBehaviour shared authority");
+    }
     void OnSessionEnd() override {for(auto&t:g_things)ReleaseMechanism(t);ClearObjects();}
-    void OnGameShutdown()override{ClearObjects();}
+    void OnGameShutdown()override{for(auto&t:g_things)ReleaseMechanism(t);ClearObjects();}
     void OnGameStarted() override {  // a new world: what was broken came back
         for (Thing& t : g_things) t.following = false;
     }
     void OnPeerResync(uint8_t) override {  // its world is new: what both games know goes again
         for (const Thing& t : g_things)
-            if (!t.moving||t.controlled) Send(t, true);
+            if ((!t.controlled&&!t.moving)||(t.controlled&&t.source==Net().MyId()&&!t.remote)) Send(t, true);
     }
     void OnPostProcess() override {
         if (!Net().Online() || !core::IsPlayerReady())return;FollowMechanisms();

@@ -13,7 +13,7 @@ struct PedInteraction {
     int8_t sequenceStep=-1;uint16_t sequenceRepeat=0;
     game::CVector partnerOffset;float partnerHeading=0;
     bool rope=false;game::CVector ropePoints[4];
-    bool couple=false;uint8_t handArm=255;int16_t handBone=0;game::CVector handOffset;float handSpeed=.25f;int32_t handBlend=250;
+    bool couple=false;game::CVector partnerVelocity;uint8_t handArm=255;int16_t handBone=0;game::CVector handOffset;float handSpeed=.25f;int32_t handBlend=250;
     uint16_t task=0xFFFF,leaf=0xFFFF;
     uint8_t parentKind=0;uint16_t parentId=0;TrainAttachment train;
     game::CVector offset,euler;Quat rotation;
@@ -23,7 +23,7 @@ struct PedInteraction {
         w.U8(leader);w.U32(revision);w.U8(depth);for(unsigned i=0;i<depth&&i<12;++i)w.U16(chain[i]);w.I8(sequenceStep);w.U16(sequenceRepeat);
         w.U8(partnerKind);if(partnerKind){if(partnerKind==1)w.Entity(ENTITY_PED,partnerId);else w.U16(partnerId);w.Vec({partnerOffset.x,partnerOffset.y,partnerOffset.z});w.F32(partnerHeading);}
         w.Bool(rope);if(rope)for(auto&p:ropePoints)w.Vec({p.x,p.y,p.z});
-        w.Bool(couple);w.U8(handArm);if(handArm<2){w.I16(handBone);w.Vec({handOffset.x,handOffset.y,handOffset.z});w.F32(handSpeed);w.I32(handBlend);}
+        w.Bool(couple);if(couple)w.Vec({partnerVelocity.x,partnerVelocity.y,partnerVelocity.z});w.U8(handArm);if(handArm<2){w.I16(handBone);w.Vec({handOffset.x,handOffset.y,handOffset.z});w.F32(handSpeed);w.I32(handBlend);}
         w.U16(task);w.U16(leaf);w.U8(parentKind);
         if(parentKind){if(parentKind==1)w.Entity(ENTITY_VEHICLE,parentId);else if(parentKind==2)w.Entity(ENTITY_PED,parentId);else if(parentKind==4)w.Entity(ENTITY_OBJECT,parentId);else if(parentKind==5)train.Write(w);else w.U16(parentId);w.Vec({offset.x,offset.y,offset.z});w.Vec({euler.x,euler.y,euler.z});rotation.Write(w);w.Bool(turret);if(turret){w.U16(turretAngle);w.F32(turretRange);w.F32(turretMode);}}
         for(int i=0;i<LayerCount;++i){layers[i].Write(w);if(layers[i].Present())w.Unit8(weights[i]);}
@@ -33,7 +33,7 @@ struct PedInteraction {
         partnerKind=r.U8();if(partnerKind>2)return false;if(partnerKind){partnerId=r.U16();auto p=r.Vec();partnerOffset={p.x,p.y,p.z};partnerHeading=r.F32();if(partnerOffset.Length()>30||std::fabs(partnerHeading)>7||(partnerKind==1&&!partnerId)||(partnerKind==2&&partnerId>=3))return false;}if(sequenceStep < -1 || sequenceStep >7)return false;
         rope=r.Bool();if(rope)for(auto&p:ropePoints){auto v=r.Vec();p={v.x,v.y,v.z};if(!std::isfinite(p.x)||!std::isfinite(p.y)||!std::isfinite(p.z)||p.Length()>25000)return false;}
         if(rope&&(ropePoints[3]-ropePoints[0]).Length()>150)return false;
-        couple=r.Bool();handArm=r.U8();if(handArm!=255&&handArm>1)return false;
+        couple=r.Bool();if(couple){auto p=r.Vec();partnerVelocity={p.x,p.y,p.z};if(!std::isfinite(p.x)||!std::isfinite(p.y)||!std::isfinite(p.z)||partnerVelocity.Length()>200)return false;}handArm=r.U8();if(handArm!=255&&handArm>1)return false;
         if(handArm<2){handBone=r.I16();auto p=r.Vec();handOffset={p.x,p.y,p.z};handSpeed=r.F32();handBlend=r.I32();if(handBone < -1||handBone>255||!std::isfinite(handOffset.x)||!std::isfinite(handOffset.y)||!std::isfinite(handOffset.z)||handOffset.Length()>3||!std::isfinite(handSpeed)||handSpeed<0||handSpeed>10||handBlend<0||handBlend>10000)return false;}
         task=r.U16();leaf=r.U16();parentKind=r.U8();
         if(parentKind){if(parentKind==5){if(!train.Read(r)||!train.Valid())return false;parentId=train.id;}else parentId=r.U16();auto p=r.Vec(),e=r.Vec();offset={p.x,p.y,p.z};euler={e.x,e.y,e.z};rotation.Read(r);turret=r.Bool();if(turret){turretAngle=r.U16();turretRange=r.F32();turretMode=r.F32();}}

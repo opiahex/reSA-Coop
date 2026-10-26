@@ -6,7 +6,7 @@ namespace coop {
 // Native SCM names, including the flight school's main-script controller.
 inline bool IsSchoolScriptName(const char* name) {
     if (!name) return false;
-    static const char* const names[]={"dskool", "psch", "bskool", "boat", "bschoo", "bikes"};
+    static const char* const names[]={"dskool", "psch", "desert5", "bskool", "boat", "bschoo", "bikes"};
     for (const char* school : names) {
         size_t i=0;
         while (i<8 && school[i] && std::tolower((unsigned char)name[i])==school[i]) ++i;

@@ -15,7 +15,7 @@
 //  * a crime is charged by the game of whoever committed it: the owner keeps its own player's wanted level when it
 //    applies the other player's hit, and the hitter's game reports the crime itself;
 //  * a kill counts (stats, respect, rampages, gang war provocation) in the killer's game: the owner of the ped tells it.
-//    The gang wars run in the host's game only, so the partner's kills of the enemy gangs near the host provoke them there;
+//    Gang-war provocation is an owner-confirmed fact evaluated in that killer's native zone context;
 //  * the players hurt each other only with friendly fire (the host's choice). The shooter's game reports its bullets
 //    and blows on the other player (it sees them hit), the victim's game lets the other player's explosions, fire and
 //    car hurt its player (the copy here is proof against them, so they never reach the shooter's game);
@@ -41,6 +41,7 @@
 #include "features/damage/HitEvidence.h"
 #include "shared/api/story-actions/StoryActions.h"
 #include "shared/api/story-coop/StoryCoop.h"
+#include "shared/api/gangwar/GangWarCoop.h"
 #include "shared/lib/sync/EventWindow.h"
 
 namespace coop {
@@ -53,9 +54,8 @@ constexpr int WEAPON_LAST_MELEE = 15, WEAPON_PISTOL = 22, WEAPON_SNIPERRIFLE = 3
               WEAPON_SPRAYCAN = 41, WEAPON_EXTINGUISHER = 42, WEAPON_RAMMEDBYCAR = 49, WEAPON_RUNOVERBYCAR = 50,
               WEAPON_EXPLOSION = 51, WEAPON_UZI_DRIVEBY = 52;
 // TARGET_PLAYER: an NPC hit the player (netId is the NPC), TARGET_PLAYER_BY_PLAYER: the sender hit the player itself,
-// KILLED_BY_YOU: the receiver's hit killed the sender's ped (piece is the headshot), GANG_KILL: the partner killed an
-// enemy gang member (weapon is its ped type) for the host's gang wars
-enum : uint8_t { TARGET_PED = 1, TARGET_VEHICLE = 2, TARGET_PLAYER = 3, TARGET_PLAYER_BY_PLAYER = 4, KILLED_BY_YOU = 5, GANG_KILL = 6 };
+// KILLED_BY_YOU: the receiver's hit killed the sender's ped (piece is the headshot).
+enum : uint8_t { TARGET_PED = 1, TARGET_VEHICLE = 2, TARGET_PLAYER = 3, TARGET_PLAYER_BY_PLAYER = 4, KILLED_BY_YOU = 5 };
 constexpr int CRIME_DAMAGED_PED = 2, CRIME_DAMAGED_COP = 3;
 
 // The engine charges a crime to the player in focus (CEventGroup::Add -> ReportCriminalEvent -> FindPlayerWanted):
@@ -99,6 +99,15 @@ bool IsSpray(int weapon) { return weapon == WEAPON_SPRAYCAN || weapon == WEAPON_
 
 CPed* DriverOf(CEntity* e) { return e && e->IsVehicle() ? ((CVehicle*)e)->Driver() : nullptr; }
 
+CVehicle* DamageSourceVehicle(CEntity* source,int weapon) {
+    if(!source)return nullptr;
+    if(source->IsVehicle())return (CVehicle*)source;
+    // A direct shot is resolved inside the current fire call. A delayed
+    // projectile must not inherit whichever car its creator entered later.
+    if(source->IsPed()&&IsDirect(weapon))return ((CPed*)source)->VehicleIfIn();
+    return nullptr;
+}
+
 bool IsLocalPlayerEntity(CEntity* e) {
     CPlayerPed* me = FindPlayerPed(0);
     return e && me && (e == me || DriverOf(e) == me || (e->IsVehicle()&&CooperativeRemoteController((CVehicle*)e)==me));
@@ -124,7 +133,7 @@ bool FromOtherSide(CEntity* e) {
 }
 
 uint32_t damageSequence=0;EventWindow damageSeen[3];
-void SendDamage(uint8_t kind, uint8_t owner, uint16_t netId, int weapon, float damage, int piece, int dir, const CVector& pos) {
+void SendDamage(uint8_t kind, uint8_t owner, uint16_t netId, int weapon, float damage, int piece, int dir, const CVector& pos,CVehicle* sourceVehicle=nullptr) {
     Writer w(proto::G_DAMAGE);
     if(++damageSequence==0)++damageSequence;w.U32(damageSequence);
     w.U8(kind);
@@ -140,6 +149,19 @@ void SendDamage(uint8_t kind, uint8_t owner, uint16_t netId, int weapon, float d
     if(kind==TARGET_VEHICLE)if(auto*n=Vehicles::Instance().Find(netId))target=n->veh;
     if(kind==TARGET_PLAYER_BY_PLAYER&&!IsCollision(weapon))if(auto*p=Players::Instance().Get(owner))target=p->ped;
     WriteHitEvidence(w,target);
+    // Keep the actual source captured at the hit. Later RC role/seat changes
+    // must not turn an unrelated player's old shot into a mission RC attack.
+    auto*source=kind==TARGET_VEHICLE&&sourceVehicle&&IsVehicleValid(sourceVehicle)&&IsLocalPlayerEntity(sourceVehicle)?Vehicles::Instance().Find(sourceVehicle):nullptr;
+    bool hasSource=source&&Vehicles::Alive(*source)&&source->owner==Net().MyId()&&Net().EntityLive(ENTITY_VEHICLE,source->netId);
+    w.Bool(hasSource);
+    if(hasSource){
+        auto generation=Net().EntityGeneration(ENTITY_VEHICLE,source->netId);
+        // The source is optional: its destruction must not discard a valid
+        // hit on the victim. A reused source ID simply loses story RC credit.
+        w.Entity(ENTITY_VEHICLE,source->netId,ENTITY_OPTIONAL,255,generation);w.U16(source->model);w.U64(generation);w.U32((uint32_t)NowMs());
+        StoryRemoteRole role;bool rc=CooperativeRemoteRole(Net().MyId(),role)&&role.car==sourceVehicle;
+        w.U64(rc?role.run:0);w.U32(rc?role.phase:0);w.U32(rc?role.assignment:0);
+    }
     Net().Send(proto::CH_RELIABLE, w);
 }
 
@@ -237,17 +259,18 @@ InflictDamageFn g_origInflictDamage = nullptr;
 // CVehicle::InflictDamage(damager, weapon, damage, position): bullets, explosions and fire on vehicles
 void __fastcall HookInflictDamage(CVehicle* v, void* edx, CEntity* damager, int weapon, float damage, CVector pos) {
     if(TrainingIgnoresContact(v,damager))return;
+    auto*sourceVehicle=DamageSourceVehicle(damager,weapon);
     if (Net().Online() && v && core::IsPlayerReady()) {
         if (!IsCollision(weapon) && IsRemotePlayerEntity(damager)) return;
         if (cam::WideScreenOn() && FromOtherSide(damager)) return;
         if (NetVehicle* nv = Vehicles::Instance().Find(v); nv && Vehicles::Instance().IsMirror(*nv)) {
             if (!IsCollision(weapon) && IsLocalPlayerEntity(damager))
-                SendDamage(TARGET_VEHICLE, nv->owner, nv->netId, weapon, damage, 0, 0, pos);
+                SendDamage(TARGET_VEHICLE, nv->owner, nv->netId, weapon, damage, 0, 0, pos,sourceVehicle);
             return;
         }
     }
     g_origInflictDamage(v, edx, damager, weapon, damage, pos);
-    if(damage>0&&IsLocalPlayerEntity(damager))RecordStoryEntityDamage(v,Net().MyId(),weapon);
+    if(damage>0&&IsLocalPlayerEntity(damager))RecordStoryEntityDamage(v,Net().MyId(),weapon,sourceVehicle);
     if (Net().Online()) if (auto* nv = Vehicles::Instance().Find(v); nv && !Vehicles::Instance().IsMirror(*nv)) {
         nv->lastChangeMs = NowMs(); nv->lastSendMs = 0; nv->lookCheckMs = 0;
     }
@@ -260,6 +283,7 @@ RegisterKillFn g_origRegisterKill = nullptr;
 // player is credited to that player's game and counts here as killed by somebody else (see the top of the file).
 void __cdecl HookRegisterKill(CPed* ped, CEntity* killer, int weapon, bool headshot) {
     CPlayerPed* me = FindPlayerPed(0);
+    RecordCooperativeGangKill(ped,killer);
     if(Net().Online()&&ped&&killer&&core::IsPlayerReady()){
         CPed*source=killer->IsPed()?(CPed*)killer:DriverOf(killer);
         if(source==me)RecordStoryKill(ped,Net().MyId());
@@ -270,9 +294,6 @@ void __cdecl HookRegisterKill(CPed* ped, CEntity* killer, int weapon, bool heads
             if (NetPed* np = Peds::Instance().Find(ped); np && np->owner == Net().MyId())
                 SendDamage(KILLED_BY_YOU, rp->id, np->netId, weapon, 1.0f, headshot, 0, ped->GetPosition());
             killer = nullptr;
-        } else if (killer == me && !Net().IsHost() && !me->InVehicle() &&
-                   (ped->PedType() == PED_TYPE_GANG1 || ped->PedType() == PED_TYPE_GANG3)) {
-            SendDamage(GANG_KILL, Net().HostId(), 0, ped->PedType(), 1.0f, 0, 0, ped->GetPosition());
         }
     }
     g_origRegisterKill(ped, killer, weapon, headshot);
@@ -316,7 +337,21 @@ void HandleDamage(uint8_t from, Reader& r) {
     CEntity* target=(kind==TARGET_PLAYER||kind==TARGET_PLAYER_BY_PLAYER)?FindPlayerPed(0):nullptr;
     if(kind==TARGET_PED)target=Peds::Instance().FindOwned(netId);
     if(kind==TARGET_VEHICLE)if(auto*nv=Vehicles::Instance().Find(netId))target=nv->veh;
-    if(from>=3||!ReadHitEvidence(r,target)||!r.Ok()||!damageSeen[from].Accept(sequence)||TrainingIgnoresContact(target,attacker))return;
+    if(from>=3||!ReadHitEvidence(r,target))return;
+    CVehicle*sourceVehicle=nullptr;
+    if(r.Bool()){
+        auto sourceId=r.U16(),sourceModel=r.U16();auto sourceGeneration=r.U64();auto sourceTime=r.U32();
+        auto sourceRun=r.U64();auto sourcePhase=r.U32(),sourceAssignment=r.U32();
+        auto*source=Vehicles::Instance().Find(sourceId);
+        StoryRemoteRole role;bool roleMatches=!sourceRun||(CooperativeRemoteRole(from,role)&&role.car==(source?source->veh:nullptr)&&role.run==sourceRun&&role.phase==sourcePhase&&role.assignment==sourceAssignment);
+        if(kind==TARGET_VEHICLE&&rp&&rp->ped&&rp->hasState&&NowMs()-rp->stateRecvMs<1500&&
+           source&&Vehicles::Alive(*source)&&source->owner==from&&source->model==sourceModel&&
+           sourceGeneration&&Net().EntityGeneration(ENTITY_VEHICLE,sourceId)==sourceGeneration&&
+           roleMatches&&(source->veh->Driver()==rp->ped||CooperativeRemoteController(source->veh)==rp->ped)&&
+           (int32_t)(rp->lastStateTime-sourceTime)<=1500&&(int32_t)(sourceTime-rp->lastStateTime)<=1500)
+            sourceVehicle=source->veh;
+    }
+    if(!r.Ok()||r.Remaining()||!damageSeen[from].Accept(sequence)||TrainingIgnoresContact(target,attacker))return;
     if (kind == TARGET_PED) {
         if (CPed* ped = Peds::Instance().FindOwned(netId)) {
             {
@@ -376,7 +411,7 @@ void HandleDamage(uint8_t from, Reader& r) {
             KeepWanted keep;
             AsPlayersHit player(nv->veh);
             g_origInflictDamage(nv->veh, nullptr, attacker, weapon, damage, CVector{p.x, p.y, p.z});
-            RecordStoryEntityDamage(nv->veh,from,weapon);
+            RecordStoryEntityDamage(nv->veh,from,weapon,sourceVehicle);
             nv->lastChangeMs = NowMs(); nv->lastSendMs = 0; nv->lookCheckMs = 0;
         }
     } else if (kind == KILLED_BY_YOU) {
@@ -389,10 +424,6 @@ void HandleDamage(uint8_t from, Reader& r) {
             ped->PedType() = type;
         }
         LOGI("We killed ped %04X of player %d: weapon %d", netId, from, weapon);
-    } else if (kind == GANG_KILL && Net().IsHost()) {
-        const CVector& me = FindPlayerPed(0)->GetPosition();
-        if ((weapon == PED_TYPE_GANG1 || weapon == PED_TYPE_GANG3) && std::hypot(me.x - p.x, me.y - p.y) < 100.0f)
-            Call<0x443950>(weapon);  // CGangWars::AddKillToProvocation
     }
 }
 
