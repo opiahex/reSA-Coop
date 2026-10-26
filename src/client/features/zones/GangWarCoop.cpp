@@ -212,6 +212,60 @@ uint8_t PickLeader(){
     return best;
 }
 
+// Update borrows a player slot only while running the gang-war state machine.
+// Native streaming runs later, after that slot is restored: its local-player
+// and SCM-cleanup scans do not include the native defensive-wave peds. Append
+// their positions to those same native load/unload passes, retaining the host's
+// region and any script requests. Offensive campaign follow-up stays deferred.
+CPlayerPed* BattleStreamParticipant(){
+    if(!Net().Online()||!Net().IsHost()||!core::IsPlayerReady()||core::IsRestarting()||
+       !Ref<int32_t>(kState2))return nullptr;
+    auto*participant=Participant(PickLeader());if(!participant)return nullptr;
+    if(Ref<int32_t>(kState2)==1&&
+       (participant->GetPosition()-Ref<CVector>(0x96ABC8)).Length2D()>=150.f)return nullptr;
+    return participant;
+}
+template<class Mark>void ForBattleStreamPosition(Mark mark){
+    auto*participant=BattleStreamParticipant();if(!participant)return;
+    mark(participant->GetPosition());
+    mark(Ref<CVector>(0x96ABC8));
+    auto*pool=PedPool();
+    for(int i=0;pool&&i<pool->size;++i){
+        if(pool->byteMap[i]<0)continue;
+        auto*ped=(CPed*)(pool->objects+(size_t)i*kPedPoolElemSize);
+        if(!(ped->PedFlags3()&0x1000u)||ped->Health()<=0||!InWarArea(ped))continue;
+        auto*np=Peds::Instance().Find(ped);
+        if(!np||np->owner==Net().MyId())mark(ped->GetPosition());
+    }
+}
+using PathMarkFn=void(__fastcall*)(void*,void*,CVector,float);
+PathMarkFn originalMarkPaths=nullptr;
+void __fastcall MarkPaths(void*paths,void*edx,CVector position,float radius){
+    originalMarkPaths(paths,edx,position,radius);
+    ForBattleStreamPosition([&](CVector p){originalMarkPaths(paths,edx,p,350.f);});
+}
+using RegionLoadFn=void(__cdecl*)(CVector,bool);
+RegionLoadFn originalLoadCollision[2]{},originalLoadIpls[2]{};
+using RequireRegionFn=void(__cdecl*)(const CVector&,int);
+template<int Site>void __cdecl LoadCollision(CVector position,bool ignoreVehicle){
+    ForBattleStreamPosition([](CVector p){reinterpret_cast<RequireRegionFn>(0x4104E0)(p,0);});
+    originalLoadCollision[Site](position,ignoreVehicle);
+}
+template<int Site>void __cdecl LoadIpls(CVector position,bool ignoreVehicle){
+    ForBattleStreamPosition([](CVector p){reinterpret_cast<RequireRegionFn>(0x404700)(p,0);});
+    originalLoadIpls[Site](position,ignoreVehicle);
+}
+using NeededGangsFn=void(__cdecl*)(uint32_t&);
+NeededGangsFn originalNeededGangs=nullptr;
+void __cdecl NeededGangs(uint32_t&flags){
+    originalNeededGangs(flags);
+    // CPopCycle still describes the host's own neighbourhood. Keep the native
+    // war's gang models requested while its participant occupies another one.
+    if(BattleStreamParticipant()){
+        int gang=Ref<int32_t>(0x96AB84);if(gang>=0&&gang<10)flags|=1u<<gang;
+    }
+}
+
 void __cdecl Update(){
     if(!Net().Online()||!core::IsPlayerReady())return originalUpdate();
     if(!Net().IsHost())return; // guests render entities/territories, never pick a second wave or winner
@@ -273,6 +327,15 @@ class GangWarCoop:public Module {
         mem::HookFn(0x446610,&Update,&originalUpdate,"CGangWars::Update co-op participant context");
         mem::HookFn(0x444530,&TellGangs,&originalTellGangs,"CGangWars::TellGangMembersTo battle area");
         mem::HookFn(0x4444B0,&ClearStreets,&originalClearStreets,"CGangWars::ClearTheStreets battle area");
+        mem::RedirectCallFn(0x450AE7,&MarkPaths,&originalMarkPaths);
+        // This EXE reads function-entry bytes as data in native allocator
+        // thunks. Redirect the ordinary streaming callers, retaining each
+        // caller's own previous chain, without changing those entry keys.
+        mem::RedirectCallFn(0x40E855,&LoadCollision<0>,&originalLoadCollision[0]);
+        mem::RedirectCallFn(0x40E8FD,&LoadCollision<1>,&originalLoadCollision[1]);
+        mem::RedirectCallFn(0x40E8B1,&LoadIpls<0>,&originalLoadIpls[0]);
+        mem::RedirectCallFn(0x40E92A,&LoadIpls<1>,&originalLoadIpls[1]);
+        mem::RedirectCallFn(0x40AABF,&NeededGangs,&originalNeededGangs);
         Net().SetHandler(proto::G_GANG_WAR,&Receive);
     }
     void OnPeerJoin(uint8_t)override{lastStateSent=0;}

@@ -152,7 +152,7 @@ enum MsgId : uint8_t {
     G_VEH_RECENT = 144,       // reliable: u8 count (max 3), u16 vehicle ids most recently used by sender
     G_SCRIPT_SOUND = 145,     // reliable: shared script sound / native movie soundtrack state
     G_RADIO = 146,            // reserved: shared radio disabled; each player uses native local radio
-    G_PLAYER_EXTRAS = 147,    // reliable: held props, phone, inventory, host-authorised reconnect restore
+    G_PLAYER_EXTRAS = 147,    // reliable: held props, inventory, reconnect restore; op3 targeted story equipment
     G_SCRIPT_LOCK = 148, // reliable host story lock independent of driver ownership
     G_STORY_WARP = 149, // reliable scripted CJ relocation, shared by the story group
     G_GARAGE_DOOR = 150, // reliable shop door state; authority chosen among all three players
@@ -191,6 +191,7 @@ enum MsgId : uint8_t {
     G_PROJECTILE_FLIGHT = 179, // authoritative guided flight/target/retirement
     G_GANG_WAR = 180, // owner-confirmed provocation and authoritative native gang-war context
     G_AIRPORT_GATE = 181, // native airport gate authority, access and movement state
+    G_VEH_ATTACHMENT = 182, // reliable host script attachment/detach claim with entity generations and revision
     G_VOICE = 200,            // unreliable: voice frame
     G_LAST = 255,
 };

@@ -10,6 +10,8 @@
 #include <vector>
 #include <map>
 #include <tuple>
+#include <string>
+#include <cstring>
 #include "shared/lib/sync/SnapshotBuffer.h"
 
 #include "common/api/protocol/Protocol.h"
@@ -21,6 +23,7 @@
 #include "shared/game/Game.h"
 #include "shared/lib/core/Core.h"
 #include "shared/lib/memory/Memory.h"
+#include "shared/api/world-objects/WorldObjects.h"
 
 namespace coop {
 
@@ -31,7 +34,7 @@ constexpr float kRange = 150.0f;               // objects this far from our play
 constexpr uint64_t kFollowMs = 1500;           // the other game's moves stop: it lies still (or the message got lost)
 constexpr int kMaxSendsPerScan = 16;           // an explosion knocks dozens loose at once
 constexpr uint32_t kTrainCrossEnabled = 0x800; // CObject::objectFlags.bTrainCrossEnabled
-enum : uint8_t { F_MOVED = 1, F_MOVING = 2, F_CONTROLLED=4 };  // not where the map put it; still moving
+enum : uint8_t { F_MOVED = 1, F_MOVING = 2, F_CONTROLLED=4, F_IPL=8 };  // not where the map put it; still moving
 
 struct MechanismPose{uint32_t time=0;CVector pos;Quat rot;};
 struct Thing {
@@ -46,18 +49,33 @@ struct Thing {
     Quat rot;
     uint8_t weapon = 0;    // what broke it (CObject::m_nLastWeaponDamage): the same proofs decide in the other game
     uint8_t source=255;
+    std::string ipl;uint32_t incarnation=0;
     bool remote = false;   // the other game's: this one follows
     bool following = false;  // our copy plays the other game's moves
     uint64_t updatedMs = 0, sentMs = 0, appliedMs = 0;
 };
 std::vector<Thing> g_things;
+std::map<std::string,uint32_t>g_iplIncarnations;
+std::map<std::string,uint32_t>g_appliedIplIncarnations;
+struct DeferredIplThing{uint8_t from=255;uint32_t tick=0;uint64_t received=0;Thing state;};
+std::vector<DeferredIplThing>g_deferredIplThings;
 using MapKey=std::tuple<uint16_t,int,int,int>;
 MapKey Key(uint16_t model,const CVector&p){return{model,(int)std::lround(p.x*10),(int)std::lround(p.y*10),(int)std::lround(p.z*10)};}
 std::map<MapKey,size_t>g_index;
 Thing*Remember(uint16_t model,const CVector&origin){g_index[Key(model,origin)]=g_things.size();g_things.emplace_back();auto&t=g_things.back();t.model=model;t.origin=origin;return &t;}
-void ClearObjects(){g_index.clear();g_things.clear();}
+void ClearObjects(){g_index.clear();g_things.clear();g_iplIncarnations.clear();g_appliedIplIncarnations.clear();g_deferredIplThings.clear();}
 uint64_t g_scanMs = 0, g_statsMs = 0;size_t scanCursor=0;
 int g_sent = 0, g_received = 0;  // messages since the last stats line
+std::string CanonicalIpl(std::string name){for(auto&c:name)if(c>='A'&&c<='Z')c=(char)(c-'A'+'a');return name;}
+bool ValidIpl(const std::string&name){return !name.empty()&&name.size()<=32&&std::all_of(name.begin(),name.end(),[](unsigned char c){return(c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_';});}
+uint32_t IplIncarnation(const std::string&name){auto i=g_iplIncarnations.find(name);return i==g_iplIncarnations.end()?0:i->second;}
+bool IplReady(const std::string&name){auto current=IplIncarnation(name);auto i=g_appliedIplIncarnations.find(name);return !current||(i!=g_appliedIplIncarnations.end()&&i->second==current);}
+std::string IplOf(CEntity*e){
+    int slot=Field<uint8_t>(e,0x2E);auto*pool=Ref<CPoolHeader*>(0x8E3FB0);
+    if(!slot||!pool||slot>=pool->size||pool->byteMap[slot]<0)return{};
+    const char*name=Call<0x404A60,const char*>(slot);if(!name||strnlen(name,33)>32)return{};
+    return ValidIpl(name)?CanonicalIpl(name):std::string{};
+}
 
 uint8_t ObjectType(CObject* o) { return Field<uint8_t>(o, 0x13C); }  // CObject::m_nObjectType: 1 the map's
 CEntity* Dummy(CObject* o) {                                           // CObject::m_pDummyObject: its map entry
@@ -121,8 +139,9 @@ void Send(const Thing& t, bool reliable) {
     w.U16(t.model);w.U32((uint32_t)NowMs());
     w.Vec({t.origin.x, t.origin.y, t.origin.z});
     w.U8(t.stage);
-    w.U8((t.moved ? F_MOVED : 0) | (t.moving ? F_MOVING : 0) | (t.controlled?F_CONTROLLED:0));
-    w.U8(t.weapon);if(t.controlled){w.U8(t.entityFlags);w.U32(t.mechanismFlags);}
+    w.U8((t.moved ? F_MOVED : 0) | (t.moving ? F_MOVING : 0) | (t.controlled?F_CONTROLLED:0) | (!t.ipl.empty()?F_IPL:0));
+    w.U8(t.weapon);if(!t.ipl.empty()){w.Str(t.ipl,32);w.U32(t.incarnation);}
+    if(t.controlled){w.U8(t.entityFlags);w.U32(t.mechanismFlags);}
     if (t.moved) {
         w.Vec({t.pos.x, t.pos.y, t.pos.z});
         t.rot.Write(w);
@@ -205,7 +224,7 @@ void FollowMechanisms(){
     auto*pool=ObjectPool();if(!pool)return;
     for(int i=0;i<pool->size;++i)if(pool->byteMap[i]>=0){auto*o=(CObject*)(pool->objects+(size_t)i*kObjectPoolElemSize);
         auto*d=Dummy(o);if(!d)continue;auto*t=Find(o->ModelIndex(),d->GetPosition());
-        if(t&&t->controlled&&t->remote){
+        if(t&&t->controlled&&t->remote&&IplReady(t->ipl)){
             if(!Shared(o)){ReleaseMechanism(*t);continue;} // a story subsystem adopted this instance
             if(ControlSource(o)==Net().MyId()){ApplyMechanismFlags(o,*t);ReleaseMechanism(*t);t->remote=false;t->history.Clear();}
             else if(NowMs()-t->updatedMs<kFollowMs)FollowMechanism(o,*t);
@@ -246,6 +265,7 @@ void Scan() {
         auto* o = (CObject*)(pool->objects + (size_t)i * kObjectPoolElemSize);
         if (!Shared(o) || (o->GetPosition() - mp).Length2D() > kRange) continue;
         CEntity* d = Dummy(o);
+        auto ipl=IplOf(d);if(!IplReady(ipl))continue;
         CVector at = o->GetPosition(), origin = d->GetPosition();
         Thing* t = Find(o->ModelIndex(), origin);
         bool controlled=Controlled(o);
@@ -267,6 +287,7 @@ void Scan() {
         if (stage == 0 && !moved) continue;  // as the map made it
         if (!t) {
             t=Remember(o->ModelIndex(),origin);
+            t->ipl=ipl;t->incarnation=IplIncarnation(t->ipl);
         }
         const uint32_t mechanismFlags=Crossing(o->ModelIndex())?(Field<uint32_t>(o,0x140)&kTrainCrossEnabled):0;
         bool changed = t->remote || (controlled&&t->source!=Net().MyId()) || stage != t->stage || moved != t->moved || moving != t->moving || mechanismFlags!=t->mechanismFlags ||
@@ -303,48 +324,77 @@ bool OursToMove(const CVector& at, uint8_t from) {
     return mine + 5.0f < theirs || (std::fabs(mine - theirs) <= 5.0f && Net().IsHost());
 }
 
-void Handle(uint8_t from, Reader& r) {
-    uint16_t model = r.U16();auto tick=r.U32();
-    Vec3 o = r.Vec();
-    uint8_t stage = r.U8(), flags = r.U8(), weapon = r.U8();uint8_t entityFlags=flags&F_CONTROLLED?r.U8():129;
-    uint32_t mechanismFlags=flags&F_CONTROLLED?r.U32():0;
-    Vec3 p{}, s{}, tn{};
-    Quat q;
-    if (flags & F_MOVED) {
-        p = r.Vec();
-        q.Read(r);
-        s = r.Vec();
-        tn = r.Vec();
+void AcceptThing(uint8_t from,uint32_t tick,const Thing&value);
+void ResetIpl(const std::string&name,uint32_t incarnation){
+    auto&current=g_iplIncarnations[name];
+    if(!incarnation||(current&&(int32_t)(incarnation-current)<=0))return;
+    current=incarnation;
+    for(auto&t:g_things)if(t.ipl==name)ReleaseMechanism(t);
+    g_things.erase(std::remove_if(g_things.begin(),g_things.end(),[&](const Thing&t){return t.ipl==name;}),g_things.end());
+    g_index.clear();for(size_t i=0;i<g_things.size();++i)g_index[Key(g_things[i].model,g_things[i].origin)]=i;
+    LOGI("World objects IPL reset name=%s incarnation=%u",name.c_str(),incarnation);
+    // A guest's fresh damage can overtake the host's reliable IPL snapshot.
+    // Keep it bounded until that authoritative reset arrives; never let a
+    // guest's proposed future incarnation clear another participant's world.
+    auto deferred=std::move(g_deferredIplThings);g_deferredIplThings.clear();
+    for(auto&pending:deferred)if(NowMs()-pending.received<10000){
+        if(pending.state.ipl==name)AcceptThing(pending.from,pending.tick,pending.state);
+        else g_deferredIplThings.push_back(std::move(pending));
     }
-    if (!r.Ok() || from == Net().MyId() || !core::IsPlayerReady() || stage > 2 || (flags&~7u) ||
-        (entityFlags&~129u) || (mechanismFlags&~kTrainCrossEnabled) || (mechanismFlags&&!Crossing(model)) ||
-        ((flags&F_CONTROLLED)&&!(flags&F_MOVED)) || !IsValidModel(model) || !(CVector{o.x,o.y,o.z}.Length()<25000) || ((flags&F_MOVED)&&(!(CVector{p.x,p.y,p.z}.Length()<25000)||!(CVector{s.x,s.y,s.z}.Length()<100)))) return;
-    ++g_received;
-    CVector origin{o.x, o.y, o.z};
+}
+void AcceptThing(uint8_t from,uint32_t tick,const Thing&value){
+    if(!value.ipl.empty()){
+        const auto current=IplIncarnation(value.ipl);
+        if(current&&(!value.incarnation||(int32_t)(value.incarnation-current)<0)){LOGD("World object old IPL state rejected model=%u incarnation=%u current=%u",value.model,value.incarnation,current);return;}
+        if(value.incarnation!=current){
+            if(from==Net().HostId())ResetIpl(value.ipl,value.incarnation);
+            else{
+                auto key=Key(value.model,value.origin);
+                for(auto&pending:g_deferredIplThings)if(pending.from==from&&pending.state.ipl==value.ipl&&Key(pending.state.model,pending.state.origin)==key){
+                    if((int32_t)(value.incarnation-pending.state.incarnation)<0)return;
+                    const auto stage=value.incarnation==pending.state.incarnation?std::max(value.stage,pending.state.stage):value.stage;
+                    pending={from,tick,NowMs(),value};pending.state.stage=stage;return;
+                }
+                if(g_deferredIplThings.size()<256)g_deferredIplThings.push_back({from,tick,NowMs(),value});
+                return;
+            }
+        }
+    }
+    const auto model=value.model;const auto&origin=value.origin;
     Thing* t = Find(model, origin);
-    if (!(flags&F_CONTROLLED)&&(flags & F_MOVING) && OursToMove(origin, from)) return;  // our physics moves it; where it lies still comes
+    if (!value.controlled&&value.moving&&OursToMove(origin, from)) return;
     if (!t) {
         t=Remember(model,origin);
     }
-    if(flags&F_CONTROLLED){
+    if(value.controlled){
         // Accept the elected simulator; reset its clock history on handover.
         auto*pool=ObjectPool();for(int i=0;pool&&i<pool->size;++i)if(pool->byteMap[i]>=0){auto*object=(CObject*)(pool->objects+(size_t)i*kObjectPoolElemSize);auto*d=Dummy(object);
             if(object->ModelIndex()==model&&d&&Key(model,d->GetPosition())==Key(model,origin)){auto source=ControlSource(object);if(source!=255&&source!=from)return;break;}}
         if(t->source!=from)t->history.Clear();
     }
-    if(t->controlled&&!(flags&F_CONTROLLED))ReleaseMechanism(*t);
-    if((flags&F_CONTROLLED)&&!t->history.Push({tick,{p.x,p.y,p.z},q},NowMs()))return;
-    t->source=from;t->controlled=(flags&F_CONTROLLED)!=0;t->entityFlags=entityFlags;t->mechanismFlags=mechanismFlags;
+    if(t->controlled&&!value.controlled)ReleaseMechanism(*t);
+    if(value.controlled&&!t->history.Push({tick,value.pos,value.rot},NowMs()))return;
+    t->source=from;t->controlled=value.controlled;t->entityFlags=value.entityFlags;t->mechanismFlags=value.mechanismFlags;
+    t->ipl=value.ipl;t->incarnation=value.incarnation;
     t->remote = true;
-    t->stage = std::max(t->stage, stage);
-    t->moved = (flags & F_MOVED) != 0;
-    t->moving = (flags & F_MOVING) != 0;
-    t->pos = {p.x, p.y, p.z};
-    t->rot = q;
-    t->speed = {s.x, s.y, s.z};
-    t->turn = {tn.x, tn.y, tn.z};
-    t->weapon = weapon;
+    t->stage = std::max(t->stage, value.stage);
+    t->moved = value.moved;t->moving = value.moving;
+    t->pos=value.pos;t->rot=value.rot;t->speed=value.speed;t->turn=value.turn;t->weapon=value.weapon;
     t->updatedMs = NowMs();
+    ++g_received;
+}
+void Handle(uint8_t from, Reader& r) {
+    Thing value;value.model=r.U16();auto tick=r.U32();auto origin=r.Vec();value.origin={origin.x,origin.y,origin.z};
+    value.stage=r.U8();auto flags=r.U8();value.weapon=r.U8();
+    if(flags&F_IPL){value.ipl=r.Str(32);value.incarnation=r.U32();if(!ValidIpl(value.ipl))return;value.ipl=CanonicalIpl(value.ipl);}
+    value.controlled=(flags&F_CONTROLLED)!=0;value.moved=(flags&F_MOVED)!=0;value.moving=(flags&F_MOVING)!=0;
+    value.entityFlags=value.controlled?r.U8():129;value.mechanismFlags=value.controlled?r.U32():0;
+    if(value.moved){auto p=r.Vec();value.pos={p.x,p.y,p.z};value.rot.Read(r);auto s=r.Vec(),t=r.Vec();value.speed={s.x,s.y,s.z};value.turn={t.x,t.y,t.z};}
+    if(!r.Ok()||from>=3||from==Net().MyId()||!core::IsPlayerReady()||value.stage>2||(flags&~15u)||
+       (value.entityFlags&~129u)||(value.mechanismFlags&~kTrainCrossEnabled)||(value.mechanismFlags&&!Crossing(value.model))||
+       (value.controlled&&!value.moved)||!IsValidModel(value.model)||!(value.origin.Length()<25000)||
+       (value.moved&&(!(value.pos.Length()<25000)||!(value.speed.Length()<100))))return;
+    AcceptThing(from,tick,value);
 }
 
 class WorldObjects : public Module {
@@ -365,6 +415,7 @@ public:
     }
     void OnPostProcess() override {
         if (!Net().Online() || !core::IsPlayerReady())return;FollowMechanisms();
+        g_deferredIplThings.erase(std::remove_if(g_deferredIplThings.begin(),g_deferredIplThings.end(),[](const DeferredIplThing&t){return NowMs()-t.received>=10000;}),g_deferredIplThings.end());
         if(NowMs()-g_scanMs<100)return;
         g_scanMs = NowMs();
         Scan();
@@ -381,5 +432,9 @@ struct Reg {
     Reg() { core::RegisterModule(&g_worldObjects); }
 } g_reg;
 }  // namespace
-
+void ResetWorldObjectIpl(const char*name,uint32_t incarnation,bool nativeResetApplied){
+    if(!name||!ValidIpl(name))return;auto key=CanonicalIpl(name);ResetIpl(key,incarnation);
+    if(nativeResetApplied&&IplIncarnation(key)==incarnation)g_appliedIplIncarnations[key]=incarnation;
+}
+uint32_t WorldObjectIplIncarnation(const char*name){return name&&ValidIpl(name)?IplIncarnation(CanonicalIpl(name)):0;}
 }  // namespace coop

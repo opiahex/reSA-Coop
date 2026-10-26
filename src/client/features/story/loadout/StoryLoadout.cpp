@@ -1,16 +1,21 @@
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <map>
 #include <vector>
+#include "common/api/protocol/Protocol.h"
 #include "shared/api/story-loadout/StoryLoadout.h"
 #include "shared/api/story-coop/StoryCoop.h"
 #include "shared/api/story-stage/StoryStage.h"
+#include "shared/api/story-scripts/StoryScripts.h"
 #include "shared/api/net-session/Session.h"
 #include "shared/game/Script.h"
 #include "shared/lib/core/Core.h"
 #include "entities/session/Flow.h"
+#include "entities/mission/Mission.h"
 #include "entities/profile/Profile.h"
 #include "common/lib/log/Log.h"
+#include "common/lib/util/Util.h"
 namespace coop { namespace {
 using namespace game;
 using game::script::Cmd;
@@ -42,6 +47,96 @@ InventoryStrip pendingStrip,lastStrip;
 struct DeferredWeapon {uint8_t operation=0;int weapon=0,ammo=0;bool inHand=false;};
 std::vector<DeferredWeapon> stripWeapons;
 CPlayerPed* Local(){return core::IsPlayerReady()?FindPlayerPed(0):nullptr;}
+enum : uint8_t { EQUIPMENT_PARACHUTE=1,EQUIPMENT_VISION=2 };
+struct EquipmentState {
+    uint64_t run=0;
+    uint32_t world=0,localWorld=0,phase=0,sequence=0,incarnation=0;
+    uint8_t kind=0,value=0,target=255,host=255;
+    int8_t area=0;
+    CVector position;
+};
+EquipmentState missionVision,pendingParachute;
+uint64_t equipmentRun=0,visionSent=0,visionReceived=0;
+uint32_t equipmentSequence=0,chuteSeen=0,visionDeclined=0;
+bool visionBorrowed=false,applyingVision=false;
+uint8_t savedVision=0,appliedVision=0;
+uint8_t NativeVision(){return Ref<uint8_t>(0xC402B9)?2:Ref<uint8_t>(0xC402B8)?1:0;}
+void SetVision(uint8_t value){
+    applyingVision=true;
+    Call<0x701120>(false);Call<0x701140>(false);
+    if(value==1)Call<0x701120>(true);else if(value==2)Call<0x701140>(true);
+    applyingVision=false;
+}
+void RestoreVision(){
+    if(visionBorrowed&&NativeVision()==appliedVision)SetVision(savedVision);
+    visionBorrowed=false;
+}
+void ClearSpecialEquipment(bool restore){
+    if(restore)RestoreVision();else visionBorrowed=false;
+    missionVision=pendingParachute={};equipmentRun=visionSent=visionReceived=0;
+    equipmentSequence=chuteSeen=visionDeclined=0;
+}
+void SendEquipment(EquipmentState state,uint8_t target=255){
+    if(!Net().IsHost()||!state.run||state.run!=StoryRunId())return;
+    for(const auto&[id,peer]:Net().Peers()){
+        if((target!=255&&target!=id)||!peer.incarnation||!CooperativeInventoryParticipant(id))continue;
+        Writer w(proto::G_PLAYER_EXTRAS);w.U8(3);w.U32((uint32_t)NowMs());
+        w.U8(state.kind);w.U32(Net().WorldEpoch());w.U64(state.run);w.U32(state.phase);w.U32(state.sequence);
+        w.U8(id);w.U32(peer.incarnation);w.U8(state.value);w.I8(state.area);
+        w.Vec({state.position.x,state.position.y,state.position.z});Net().Send(proto::CH_RELIABLE,w);
+    }
+}
+bool EquipmentContext(const EquipmentState&state){
+    return Net().Online()&&!Net().IsHost()&&state.host==Net().HostId()&&state.target==Net().MyId()&&
+        state.world&&state.world==Net().PeerWorldEpoch(state.host)&&state.localWorld==Net().WorldEpoch()&&
+        state.run&&state.run==StoryRunId()&&state.incarnation&&state.incarnation==Net().MyIncarnation();
+}
+void UpdateSpecialEquipment(){
+    auto*me=Local();const auto run=StoryRunId();
+    if(equipmentRun&&equipmentRun!=run)ClearSpecialEquipment(me!=nullptr);
+    if(Net().IsHost()){
+        if(!missionVision.run||!me)return;
+        if(missionVision.phase!=CooperativeStoryPhase()){
+            missionVision.phase=CooperativeStoryPhase();
+        }
+        if(NowMs()-visionSent>=1000){SendEquipment(missionVision);visionSent=NowMs();}
+        return;
+    }
+    if(pendingParachute.run){
+        if(!EquipmentContext(pendingParachute)||pendingParachute.phase<CooperativeStoryPhase())pendingParachute={};
+        else if(pendingParachute.phase==CooperativeStoryPhase()&&me&&me->Health()>0&&flow::InHostWorld()&&CooperativeStoryInventoryReady()){
+            // Native MANSIO1 selects a parachute even when CJ already owns it
+            // and therefore skips GIVE. Each guest has an independent slot.
+            int slot=-1;Cmd(0x0782).I(46).Out(&slot).Run();
+            if(slot>=0&&slot<NUM_WEAPON_SLOTS&&(me->Weapons()[slot].type!=46||me->Weapons()[slot].ammoTotal<=0)){
+                const int selected=me->ActiveWeapon().type,selectedSlot=me->ActiveWeaponSlot();
+                ApplyStoryMissionWeapon(GIVE,46,1,false);
+                // Native GIVE selects46 even though this event only exposes
+                // equipment. Keep the guest's own still-present selection.
+                const bool retained=selectedSlot>=0&&selectedSlot<NUM_WEAPON_SLOTS&&me->Weapons()[selectedSlot].type==selected;
+                // CPed's native setter restores both active/chosen slots now;
+                // player01B9 alone only changes the next requested slot.
+                CallMethod<0x5E61F0>(me,retained?selectedSlot:0);
+                LOGI("Story parachute available selection=%d restored=%d run=%llu",selected,retained?selected:0,(unsigned long long)pendingParachute.run);
+            }
+            pendingParachute={};
+        }
+    }
+    const bool applies=me&&me->Health()>0&&EquipmentContext(missionVision)&&missionVision.value&&
+        missionVision.phase==CooperativeStoryPhase()&&NowMs()-visionReceived<3000&&flow::InHostWorld()&&
+        !LocalStoryPresentationBlocked()&&me->AreaCode()==missionVision.area&&
+        (me->GetPosition()-missionVision.position).Length()<160&&visionDeclined!=missionVision.sequence;
+    if(!applies){RestoreVision();return;}
+    if(visionBorrowed&&NativeVision()!=appliedVision){
+        visionBorrowed=false;visionDeclined=missionVision.sequence;return;
+    }
+    if(!visionBorrowed){
+        // Personal goggles remain a local choice. Only borrow an idle view;
+        // native toggles and later source OFF release this individual loan.
+        if(NativeVision()){visionDeclined=missionVision.sequence;return;}
+        savedVision=NativeVision();appliedVision=missionVision.value;visionBorrowed=true;SetVision(appliedVision);
+    }
+}
 int ClampAmmo(int ammo){return std::clamp(ammo,0,99999);}
 bool Current(const Loan&loan,CPed*me){return me&&me->Health()>0&&GetPedRef(me)==loan.handle&&loan.slot>=0&&loan.slot<NUM_WEAPON_SLOTS&&me->Weapons()[loan.slot].type==loan.weapon;}
 void Sample(Loan&loan,CPed*me){
@@ -182,15 +277,63 @@ bool FlushInventoryStrip(){
 class Loadout:public Module {
     const char*Name()const override{return "StoryLoadout";}
     void OnPostProcess()override{
+        UpdateSpecialEquipment();
         if(!FlushInventoryStrip())return;
         if(loans.empty())return;
         SampleAll();
         for(auto&[slot,loan]:loans)if(loan.run!=StoryRunId()){RestoreStoryMissionWeapons();break;}
     }
-    void OnGameShutdown()override{loans.clear();nativeInventory.clear();nativeDepth=0;pendingStrip={};stripWeapons.clear();}
-    void OnSessionEnd()override{pendingStrip=lastStrip={};stripWeapons.clear();RestoreStoryMissionWeapons();}
+    void OnPeerResync(uint8_t id)override{
+        if(!Net().IsHost())return;
+        if(missionVision.run)SendEquipment(missionVision,id);
+    }
+    void OnGameShutdown()override{ClearSpecialEquipment(false);loans.clear();nativeInventory.clear();nativeDepth=0;pendingStrip={};stripWeapons.clear();}
+    void OnSessionEnd()override{ClearSpecialEquipment(core::IsPlayerReady());pendingStrip=lastStrip={};stripWeapons.clear();RestoreStoryMissionWeapons();}
 } feature;
 struct Register{Register(){core::RegisterModule(&feature);}}registration;
+}
+void ObserveStoryEquipmentCommand(void*script,int opcode,const int32_t*parameters){
+    auto*me=Local();
+    if(!parameters||!Net().Online()||!Net().IsHost()||!me||!StoryRunId()||
+       !IsSharedStoryScript(script)||LocalStoryPresentationBlocked())return;
+    if(equipmentRun!=StoryRunId())ClearSpecialEquipment(false);
+    equipmentRun=StoryRunId();
+    if(opcode==0x01B9&&parameters[0]==GetPedRef(me)&&parameters[1]==46){
+        EquipmentState state;state.run=equipmentRun;state.phase=CooperativeStoryPhase();state.sequence=++equipmentSequence;
+        state.kind=EQUIPMENT_PARACHUTE;state.value=1;state.area=me->AreaCode();state.position=me->GetPosition();
+        SendEquipment(state);
+        LOGI("Story parachute availability run=%llu phase=%u sequence=%u",(unsigned long long)state.run,state.phase,state.sequence);
+    }else if(opcode==0x08B1||opcode==0x08B2){
+        const uint8_t kind=opcode==0x08B1?1:2;
+        const uint8_t value=parameters[0]?kind:missionVision.value==kind?0:missionVision.value;
+        RestoreVision();missionVision={};missionVision.run=equipmentRun;missionVision.kind=EQUIPMENT_VISION;
+        missionVision.phase=CooperativeStoryPhase();missionVision.sequence=++equipmentSequence;
+        missionVision.value=value;missionVision.area=me->AreaCode();missionVision.position=me->GetPosition();
+        SendEquipment(missionVision);visionSent=NowMs();
+        LOGI("Story vision command opcode=%04X run=%llu phase=%u mode=%u",opcode,(unsigned long long)equipmentRun,missionVision.phase,missionVision.value);
+    }
+}
+void HandleStoryEquipmentEvent(uint8_t from,Reader&r){
+    EquipmentState state;state.kind=r.U8();state.world=r.U32();state.run=r.U64();state.phase=r.U32();state.sequence=r.U32();
+    state.target=r.U8();state.incarnation=r.U32();state.value=r.U8();state.area=r.I8();auto p=r.Vec();
+    state.position={p.x,p.y,p.z};state.host=from;state.localWorld=Net().WorldEpoch();
+    if(!r.Ok()||!state.phase||state.phase!=CooperativeStoryPhase()||!state.sequence||state.kind<EQUIPMENT_PARACHUTE||state.kind>EQUIPMENT_VISION||
+       state.value>2||(state.kind==EQUIPMENT_PARACHUTE&&state.value!=1)||state.area<0||state.area>18||
+       !std::isfinite(p.x)||!std::isfinite(p.y)||!std::isfinite(p.z)||state.position.Length()>25000||!EquipmentContext(state))return;
+    if(equipmentRun!=state.run)ClearSpecialEquipment(core::IsPlayerReady());
+    equipmentRun=state.run;
+    if(state.kind==EQUIPMENT_PARACHUTE){
+        if(chuteSeen&&(int32_t)(state.sequence-chuteSeen)<=0)return;
+        chuteSeen=state.sequence;pendingParachute=state;
+    }else{
+        if(missionVision.sequence&&(int32_t)(state.sequence-missionVision.sequence)<0)return;
+        if(visionBorrowed&&state.value!=missionVision.value)RestoreVision();
+        missionVision=state;visionReceived=NowMs();
+    }
+}
+void ObserveLocalStoryVision(){
+    if(applyingVision||Net().IsHost()||PlayerInFocus()!=0)return;
+    visionBorrowed=false;visionDeclined=missionVision.sequence;
 }
 void ApplyStoryMissionWeapon(uint8_t operation,int weapon,int ammo,bool inHand){
     if(operation<GIVE||operation>FINAL||weapon<=0||weapon>46)return;

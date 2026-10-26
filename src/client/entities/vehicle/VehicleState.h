@@ -37,6 +37,20 @@ struct VehicleState {
     float rotorSpeed = 0; // CHeli: native rotor spool, separate from engine-on bit
     uint16_t towChild=0,towParent=0;
     TrainAttachment train;game::CVector trainOffset;Quat trainRotation;
+    // Physical car-to-car binding (0683), distinct from a tow hitch or train.
+    uint16_t parentVehicle=0;uint64_t parentGeneration=0;
+    game::CVector parentOffset;Quat parentRotation;
+    bool parentUsesEuler=false;game::CVector parentEuler;
+    // A host native attach/detach fences older driver snapshots on both
+    // channels without changing the actual driver's simulation ownership.
+    uint64_t attachmentRun=0;uint32_t attachmentPhase=0,attachmentRevision=0;
+    bool AttachmentInStory(uint64_t run,uint32_t phase)const {
+        return !attachmentRevision||(attachmentRun==run&&attachmentPhase==phase);
+    }
+    bool FollowsAttachmentClaim(const VehicleState&claim)const {
+        return !claim.attachmentRevision||(attachmentRun==claim.attachmentRun&&attachmentPhase==claim.attachmentPhase&&
+               (int32_t)(attachmentRevision-claim.attachmentRevision)>=0);
+    }
 
     static VehicleState Capture(game::CVehicle* v);
     void Write(Writer& w) const;

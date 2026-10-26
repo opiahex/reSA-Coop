@@ -72,6 +72,9 @@ struct NetPed {
     // mirror side
     bool hasState = false;
     bool pendingAdoption=false;
+    bool adoptionSpawned=false;
+    uint64_t adoptionGeneration=0,adoptionVehicleGeneration=0,adoptionUntil=0;
+    uint32_t adoptionWorld=0;
     SpawnWait spawnWait;
     bool awayHeld=false,awayGravity=false;
     uint32_t awayPhysicsMask=0;
@@ -155,6 +158,11 @@ private:
     game::CPed* SpawnMirror(NetPed& np);
     void Forget(uint16_t netId, bool deletePed);
     void Adopt(NetPed& np);
+    void QueueAdoption(NetPed& np);
+    bool AdoptionCurrent(const NetPed& np) const;
+    bool AdoptionVehicleCurrent(const NetPed& np) const;
+    bool AdoptionRelevant(const NetPed& np) const;
+    void RetryAdoption(NetPed& np);
     void DropMirrorsOf(uint8_t id, bool keep);  // keep: this game's own people now (it left), else deleted (it restarted)
     PedSyncState Capture(NetPed& np);
 

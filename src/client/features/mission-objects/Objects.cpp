@@ -7,6 +7,7 @@
 #include "shared/lib/sync/IdAllocator.h"
 #include <map>
 #include <set>
+#include <vector>
 
 #include "common/api/protocol/Protocol.h"
 #include "common/lib/log/Log.h"
@@ -37,7 +38,7 @@ namespace {
 using namespace game;
 using game::script::Cmd;
 
-enum : uint8_t { REMOVE_GONE = 0, REMOVE_BROKE = 1 };
+enum : uint8_t { REMOVE_GONE = 0, REMOVE_BROKE = 1, REMOVE_ORIGIN = 2 };
 
 struct NetObject {
     uint16_t netId = 0;
@@ -47,6 +48,7 @@ struct NetObject {
     CVector pos;
     Quat rot;
     int8_t area = 0;
+    CVector origin;int8_t originArea=0;uint32_t originRevision=0;
     bool broken = false;
     uint8_t flags=3;
     bool adopted = false;  // partner: its world had this object already (the host's world brought it)
@@ -61,6 +63,11 @@ std::map<uint16_t, NetObject> g_owned;    // host: announced
 std::map<uint16_t, NetObject> g_mirrors;  // partner: the copies
 std::map<uint16_t, NetObject> g_pending;  // partner: waiting for the model
 std::set<int>g_storyObjects;
+struct ObjectOrigin {uint16_t model=0;CVector pos;int8_t area=0;uint32_t revision=0;bool removed=false;};
+std::vector<ObjectOrigin> g_origins;
+struct HiddenOriginal {CObject*object=nullptr;int handle=-1;uint16_t model=0;uint8_t flags=0;};
+std::vector<HiddenOriginal> g_hiddenOriginals;
+uint32_t g_originRevision=0;uint64_t g_originScan=0;
 IdAllocator<65536> g_ids;
 uint64_t g_scanMs = 0;
 bool g_applying = false;  // a damage this module applies itself
@@ -86,12 +93,47 @@ Quat RotationOf(CObject* o) { return o->Matrix() ? Quat::FromMatrix(*o->Matrix()
 ObjectPhysics PhysicsOf(CObject*o){
     ObjectPhysics p;p.mass=o->Mass();p.turnMass=Field<float>(o,0x90);
     p.physicalFlags=o->PhysicalFlags()&ObjectPhysics::PhysicalMask;
+    p.freezeFlags=(uint16_t)(o->PhysicalFlags()&ObjectPhysics::FreezeMask);
     p.interactionFlags=Field<uint32_t>(o,0x140)&ObjectPhysics::InteractionMask;return p;
 }
 void ApplyPhysics(CObject*o,const ObjectPhysics&p){
     o->Mass()=p.mass;Field<float>(o,0x90)=p.turnMass;
     o->PhysicalFlags()=(o->PhysicalFlags()&~ObjectPhysics::PhysicalMask)|p.physicalFlags;
     auto&flags=Field<uint32_t>(o,0x140);flags=(flags&~ObjectPhysics::InteractionMask)|p.interactionFlags;
+}
+ObjectPhysics CapturePhysics(const NetObject&n){
+    auto p=PhysicsOf(n.obj);
+    // Both replica freezes and native hold/attachment tasks can temporarily
+    // set these bits. Only the initial native body and observed script 0550
+    // define configured freeze; neither a pose nor a hold may overwrite it.
+    p.freezeFlags=n.motion.physics.freezeFlags;
+    return p;
+}
+bool SameOrigin(const ObjectOrigin&a,const ObjectOrigin&b){return a.model==b.model&&a.area==b.area&&(a.pos-b.pos).Length()<.25f;}
+ObjectOrigin OriginOf(const NetObject&n){return {n.model,n.origin,n.originArea,n.originRevision,false};}
+bool ValidOrigin(const ObjectOrigin&o){return o.model&&o.model<20000&&o.revision&&o.area>=0&&o.area<=18&&
+    std::isfinite(o.pos.x)&&std::isfinite(o.pos.y)&&std::isfinite(o.pos.z)&&o.pos.Length()<25000;}
+uint32_t NextOriginRevision(){if(!++g_originRevision)++g_originRevision;return g_originRevision;}
+bool RememberOrigin(const ObjectOrigin&o){
+    if(!ValidOrigin(o))return false;
+    for(auto&entry:g_origins)if(SameOrigin(entry,o)){
+        if((int32_t)(o.revision-entry.revision)<0)return false;
+        if(o.revision==entry.revision&&o.removed!=entry.removed)return false;
+        entry=o;return true;
+    }
+    if(g_origins.size()>=65536)return false;g_origins.push_back(o);return true;
+}
+void WriteOrigin(Writer&w,const ObjectOrigin&o){w.U16(o.model);w.Vec({o.pos.x,o.pos.y,o.pos.z});w.I8(o.area);w.U32(o.revision);}
+bool ReadOrigin(Reader&r,ObjectOrigin&o){o.model=r.U16();auto p=r.Vec();o.pos={p.x,p.y,p.z};o.area=r.I8();o.revision=r.U32();return r.Ok()&&ValidOrigin(o);}
+void SendOriginRemoval(const ObjectOrigin&o){
+    // Native-world deletion is an origin snapshot, not a new incarnation of
+    // the retired network object. Entity REMOVE still owns that lifecycle.
+    Writer w(proto::G_OBJ_REMOVE);w.U16(0);w.U8(REMOVE_ORIGIN);w.U8(0);WriteOrigin(w,o);Net().Send(proto::CH_RELIABLE,w);
+}
+void RetireOrigin(const NetObject&n){
+    if(!n.originRevision)return;auto origin=OriginOf(n);
+    for(auto&entry:g_origins)if(SameOrigin(entry,origin)&&entry.revision!=origin.revision)return;
+    origin.revision=NextOriginRevision();origin.removed=true;if(RememberOrigin(origin))SendOriginRemoval(origin);
 }
 
 void Place(CObject* o, const CVector& pos, const Quat& rot) {
@@ -109,6 +151,7 @@ void SendCreate(const NetObject& no) {
     Writer w(proto::G_OBJ_CREATE);
     w.Entity(ENTITY_OBJECT,no.netId,ENTITY_BIRTH|ENTITY_SNAPSHOT);
     w.U16(no.model);
+    w.Vec({no.origin.x,no.origin.y,no.origin.z});w.I8(no.originArea);w.U32(no.originRevision);
     w.Vec({no.pos.x, no.pos.y, no.pos.z});
     no.rot.Write(w);
     w.I8(no.area);
@@ -142,8 +185,11 @@ void TrackObject(int handle){
     no.pos = o->GetPosition();
     no.rot = RotationOf(o);
     no.area = o->AreaCode();
+    no.origin=no.pos;no.originArea=no.area;no.originRevision=NextOriginRevision();
+    if(!RememberOrigin(OriginOf(no))){g_ids.Retire(no.netId,NowMs());return;}
     no.broken = Broken(o);
     no.flags=ObjectFlags(o);
+    no.motion.physics=PhysicsOf(o);
     CaptureMotion(no);
     no.sentMs = NowMs();
     Net().BeginEntity(ENTITY_OBJECT,no.netId);g_owned[no.netId] = no;
@@ -160,7 +206,7 @@ void* Holding(CPed*p,CObject*o){
 Quat Product(const Quat&a,const Quat&b){return {a.w*b.x+a.x*b.w+a.y*b.z-a.z*b.y,a.w*b.y-a.x*b.z+a.y*b.w+a.z*b.x,a.w*b.z+a.x*b.y-a.y*b.x+a.z*b.w,a.w*b.w-a.x*b.x-a.y*b.y-a.z*b.z};}
 void CaptureMotion(NetObject&n){
     auto*o=n.obj;n.motion.velocity=o->MoveSpeed();n.motion.turn=o->TurnSpeed();
-    n.motion.physics=PhysicsOf(o);
+    n.motion.physics=CapturePhysics(n);
     n.motion.dynamic=!(o->Flags()&4u);n.motion.parentKind=0;n.motion.parentId=0;n.motion.train={};
     auto*parent=o->AttachedTo();
     if(parent&&parent->IsVehicle()){
@@ -240,14 +286,24 @@ void ApplyMotion(NetObject&n,bool simulator=false){
         DetachForMotion(n);
         if(n.trainParentHeld){if(!n.broken)ApplyFlags(o,n.flags);n.trainParentHeld=false;}
     }
-    if(simulator){Cmd(0x0550).I(n.handle).I(n.motion.dynamic?0:1).Run();o->MoveSpeed()=n.motion.velocity;o->TurnSpeed()=n.motion.turn;n.remotePhysics=false;}
+    // A frozen replica still needs the simulator's native velocity: SCM
+    // GET_OBJECT_SPEED reads CPhysical::MoveSpeed, not the replicated pose.
+    // DontApplySpeed keeps that velocity from integrating a second time.
+    if(simulator||!Net().IsHost()||n.remotePhysics){o->MoveSpeed()=n.motion.velocity;o->TurnSpeed()=n.motion.turn;}
+    if(simulator){
+        // CObject's resting/static state is different from script FREEZE.
+        // Restoring a sleeping source with FREEZE(1) leaves collision force
+        // disabled, so the next real vehicle cannot wake and push it.
+        Cmd(0x0550).I(n.handle).I(0).Run();o->PhysicalFlags()=(o->PhysicalFlags()&~ObjectPhysics::FreezeMask)|n.motion.physics.freezeFlags;
+        Cmd(0x0392).I(n.handle).I(n.motion.dynamic?1:0).Run();n.remotePhysics=false;
+    }
 }
 enum:uint8_t{CLAIM=1,GRANT=2,CARRY_POSE=3,RELEASE=4,DENY=5,PUSH=6,CARGO_CLAIM=7,CARGO_POSE=8,CARGO_RELEASE=9};
 void Decision(NetObject&n,uint8_t op=GRANT){
     Writer w(proto::G_OBJ_CARRY);w.U64(StoryRunId());w.U32(CooperativeStoryPhase());w.U8(op);w.Entity(ENTITY_OBJECT,n.netId);w.U32(n.motion.revision);w.U8(n.motion.holder);w.U8(n.motion.simulator);w.Entity(ENTITY_VEHICLE,n.motion.supportVehicle);n.motion.physics.Write(w);Net().Send(proto::CH_RELIABLE,w);
 }
 bool Claim(NetObject&n,uint8_t from){
-    if(!Alive(n)||n.broken)return false;
+    if(!Alive(n)||n.broken||n.motion.physics.freezeFlags)return false;
     if(n.motion.holder==from){n.lease=NowMs()+2500;Decision(n);return true;}
     if(n.motion.holder!=255){Decision(n,DENY);return false;}
     CVector at;int8_t area;
@@ -265,7 +321,7 @@ int HoldGate(void*task,CPed*ped){
     if(Net().Online()&&core::IsPlayerReady()&&ped==FindPlayerPed(0)&&e&&e->IsObject()){
         auto&map=Net().IsHost()?g_owned:g_mirrors;auto*n=FindByObject(map,(CObject*)e);
         if(n){
-            if(n->broken){CallMethod<0x6916E0>(task);return -1;}
+            if(n->broken||n->motion.physics.freezeFlags){CallMethod<0x6916E0>(task);return -1;}
             if(n->motion.holder!=Net().MyId()){
                 if(n->motion.holder!=255){CallMethod<0x6916E0>(task);return -1;}
                 if(Net().IsHost())Claim(*n,Net().MyId());
@@ -290,7 +346,7 @@ bool __fastcall HoldPosition(void*task,void*edx,CPed*ped){
     return originalHoldPosition(task,edx,ped);
 }
 CVector LimitCargo(CVector v,float max){auto size=v.Length();return size>max?v*(max/size):v;}
-bool MovableCargo(const NetObject&n){return !n.broken&&n.motion.holder==255&&(n.obj->Flags()&1u)&&
+bool MovableCargo(const NetObject&n){return !n.broken&&!n.motion.physics.freezeFlags&&n.motion.holder==255&&(n.obj->Flags()&1u)&&
     (n.motion.dynamic||(n.obj->Mass()>0&&n.obj->Mass()<99998.f))&&!(n.obj->PhysicalFlags()&(32u|64u));}
 bool PhysicalCargo(const NetObject&n){return MovableCargo(n)&&n.motion.simulator==255&&!n.motion.parentKind;}
 void CargoTick(){
@@ -390,7 +446,7 @@ void HandleCarry(uint8_t from,Reader&r){
             auto*v=Vehicles::Instance().Find(n.motion.supportVehicle);CVector pos{p.x,p.y,p.z};
             if(!r.Ok()||n.motion.holder!=255||n.motion.simulator!=from||revision!=n.motion.revision||!v||!Vehicles::Alive(*v)||
                (op==CARGO_POSE&&v->owner!=from)||(pos-v->veh->GetPosition()).Length()>50||(m.parentKind&&(m.parentKind!=1||m.parentId!=n.motion.supportVehicle)))return;
-            uint16_t support=n.motion.supportVehicle;auto physics=PhysicsOf(n.obj);n.motion=m;n.motion.physics=physics;n.motion.simulator=from;n.motion.supportVehicle=support;n.motion.revision=revision;
+            uint16_t support=n.motion.supportVehicle;auto physics=CapturePhysics(n);n.motion=m;n.motion.physics=physics;n.motion.simulator=from;n.motion.supportVehicle=support;n.motion.revision=revision;
             n.pos=pos;n.rot=q;n.area=v->veh->AreaCode();n.obj->AreaCode()=n.area;n.flags=flags;n.lease=NowMs()+2500;
             Place(n.obj,pos,q);ApplyFlags(n.obj,flags);ApplyMotion(n);n.sentMs=0;
             if(op==CARGO_RELEASE){n.motion.simulator=255;n.motion.supportVehicle=0;++n.motion.revision;ApplyMotion(n,true);Decision(n);}
@@ -414,13 +470,13 @@ void HandleCarry(uint8_t from,Reader&r){
         if(!r.Ok()||n.broken||n.motion.holder!=from||revision!=n.motion.revision)return;
         auto*player=Players::Instance().Get(from);CVector pos{p.x,p.y,p.z};
         if(!player||!player->hasState||NowMs()-player->stateRecvMs>1500||(pos-player->state.pos).Length()>6)return;
-        n.pos=pos;n.rot=q;auto physics=PhysicsOf(n.obj);n.motion=motion;n.motion.physics=physics;n.motion.holder=from;n.motion.revision=revision;n.lease=NowMs()+2500;
+        n.pos=pos;n.rot=q;auto physics=CapturePhysics(n);n.motion=motion;n.motion.physics=physics;n.motion.holder=from;n.motion.revision=revision;n.lease=NowMs()+2500;
         Place(n.obj,pos,q);n.area=player->state.area;n.obj->AreaCode()=n.area;n.flags=flags;ApplyFlags(n.obj,flags);n.sentMs=0;
         if(op==RELEASE){n.motion.holder=255;++n.motion.revision;ApplyMotion(n,true);Decision(n);}
     }else if(from==Net().HostId()&&(op==GRANT||op==DENY)){
         uint8_t holder=r.U8(),simulator=r.U8();uint16_t support=r.U16();ObjectPhysics physics;if(!physics.Read(r)||(holder>=3&&holder!=255)||(simulator>=3&&simulator!=255))return;
         for(auto*map:{&g_mirrors,&g_pending})if(auto i=map->find(id);i!=map->end()&&(int32_t)(revision-i->second.motion.revision)>=0){auto&n=i->second;n.motion.holder=holder;n.motion.revision=revision;n.motion.simulator=simulator;n.motion.supportVehicle=support;n.motion.physics=physics;if(Alive(n))ApplyPhysics(n.obj,physics);
-            if(Alive(n)&&simulator==Net().MyId()){Cmd(0x0392).I(n.handle).I(1).Run();Cmd(0x0550).I(n.handle).I(0).Run();n.motion.dynamic=true;n.cargoTouch=NowMs();}
+            if(Alive(n)&&simulator==Net().MyId()){Cmd(0x0392).I(n.handle).I(1).Run();Cmd(0x0550).I(n.handle).I(0).Run();n.obj->PhysicalFlags()=(n.obj->PhysicalFlags()&~ObjectPhysics::FreezeMask)|physics.freezeFlags;n.motion.dynamic=true;n.cargoTouch=NowMs();}
             else if(Alive(n)&&holder!=Net().MyId())Cmd(0x0550).I(n.handle).I(1).Run();}
     }
 }
@@ -439,6 +495,7 @@ void HostScan() {
     for (auto it = g_owned.begin(); it != g_owned.end();) {
         NetObject& no = it->second;
         if (!Alive(no) || no.obj->ModelIndex() != no.model) {
+            RetireOrigin(no);
             SendRemove(no.netId, REMOVE_GONE, 0);g_storyObjects.erase(no.handle);
             g_ids.Retire(it->first,NowMs());it = g_owned.erase(it);
             continue;
@@ -456,9 +513,9 @@ void HostScan() {
             float turn = std::fabs(rot.x - no.rot.x) + std::fabs(rot.y - no.rot.y) + std::fabs(rot.z - no.rot.z) +
                          std::fabs(rot.w - no.rot.w);
             auto previous=no.motion;
-            no.motion.physics=PhysicsOf(no.obj);
+            no.motion.physics=CapturePhysics(no);
             if(no.motion.simulator==255&&(no.motion.holder==255||no.motion.holder==Net().MyId()))CaptureMotion(no);
-            bool discrete=no.area!=no.obj->AreaCode()||no.flags!=ObjectFlags(no.obj)||!previous.physics.SameAs(no.motion.physics)||previous.parentKind!=no.motion.parentKind||previous.parentId!=no.motion.parentId||previous.revision!=no.motion.revision||
+            bool discrete=no.area!=no.obj->AreaCode()||no.flags!=ObjectFlags(no.obj)||!previous.physics.SameAs(no.motion.physics)||previous.dynamic!=no.motion.dynamic||previous.parentKind!=no.motion.parentKind||previous.parentId!=no.motion.parentId||previous.revision!=no.motion.revision||
                 previous.train.owner!=no.motion.train.owner||previous.train.carriage!=no.motion.train.carriage||previous.train.generation!=no.motion.train.generation;
             if ((discrete||(pos - no.pos).Length() > 0.02f || turn > 0.01f||NowMs()-no.sentMs>1000) && NowMs() - no.sentMs >= 100) {
                 no.pos = pos;
@@ -500,21 +557,41 @@ void DeleteCopy(NetObject& no) {
 }
 
 // the same object in the same place, not a copy yet: the host's world, loaded here, brought it along
-CObject* FindTwin(const NetObject& no) {
+CObject* FindAt(const NetObject&no,const CVector&at,int8_t area){
     CPoolHeader* pool = ObjectPool();
     for (int i = 0; pool && i < pool->size; ++i) {
         if (pool->byteMap[i] < 0) continue;
         auto* o = (CObject*)(pool->objects + (size_t)i * kObjectPoolElemSize);
-        if (o->ModelIndex() != no.model || (o->GetPosition() - no.pos).Length() > 0.25f || FindByObject(g_mirrors, o)) continue;
+        if (o->ModelIndex() != no.model ||o->AreaCode()!=area|| (o->GetPosition() - at).Length() > 0.25f || FindByObject(g_mirrors, o)) continue;
         return o;
     }
     return nullptr;
+}
+CObject* FindTwin(const NetObject&no){
+    // A late snapshot carries today's pose and the immutable native origin.
+    // Prefer the closed original at that origin before creating an open copy.
+    // A replacement can move onto a deleted original's old pose (the carrier
+    // lifts do this). Never adopt that original under a different origin.
+    return no.originRevision?FindAt(no,no.origin,no.originArea):nullptr;
+}
+void ApplyRemovedOrigins(){
+    if(Net().IsHost()||NowMs()-g_originScan<100)return;g_originScan=NowMs();
+    for(auto&origin:g_origins)if(origin.removed){
+        auto*me=FindPlayerPed(0);if(!me||(origin.area!=13&&origin.area!=me->AreaCode())||(origin.pos-me->GetPosition()).Length()>350)continue;
+        NetObject no;no.model=origin.model;
+        auto*o=FindAt(no,origin.pos,origin.area);if(!o)continue;int handle=GetObjectRef(o);
+        bool known=false;for(auto&hidden:g_hiddenOriginals)if(hidden.object==o&&hidden.handle==handle){known=true;break;}
+        if(!known)g_hiddenOriginals.push_back({o,handle,o->ModelIndex(),ObjectFlags(o)});
+        ApplyFlags(o,0);
+    }
 }
 
 void ClearCopies() {
     for (auto& [id, no] : g_mirrors) DeleteCopy(no);
     g_mirrors.clear();
     g_pending.clear();
+    for(auto&hidden:g_hiddenOriginals)if(hidden.object&&IsObjectValid(hidden.object)&&GetObjectRef(hidden.object)==hidden.handle&&hidden.object->ModelIndex()==hidden.model)ApplyFlags(hidden.object,hidden.flags);
+    g_hiddenOriginals.clear();if(!Net().IsHost())g_origins.clear();
 }
 
 void CreatePending() {
@@ -629,6 +706,7 @@ public:
             NetObject no;
             no.netId = r.U16();
             no.model = r.U16();
+            auto origin=r.Vec();no.origin={origin.x,origin.y,origin.z};no.originArea=r.I8();no.originRevision=r.U32();
             Vec3 p = r.Vec();
             no.pos = {p.x, p.y, p.z};
             no.rot.Read(r);
@@ -636,7 +714,10 @@ public:
             uint8_t flags=r.U8();no.broken=(flags&4)!=0;no.flags=flags&3;
             if(!no.motion.Read(r))return;
             // not in the game yet (a partner waits in the menu): the host announces them again once it is (resync)
-            if (!r.Ok() || from != Net().HostId() || Net().IsHost() || !core::IsPlayerReady() || !IsObjectModel(no.model)) return;
+            if (!r.Ok() || from != Net().HostId() || Net().IsHost() || !core::IsPlayerReady() || !IsObjectModel(no.model)||!ValidOrigin(OriginOf(no))) return;
+            if(auto existing=g_mirrors.find(no.netId);existing!=g_mirrors.end()&&Alive(existing->second)&&existing->second.model==no.model&&
+               (existing->second.originRevision!=no.originRevision||!SameOrigin(OriginOf(existing->second),OriginOf(no))))return;
+            if(!RememberOrigin(OriginOf(no)))return;
             if (auto it = g_mirrors.find(no.netId); it != g_mirrors.end()) {
                 // A repair/resync is an update of the same object. Recreating
                 // a valid support drops standing peds and breaks attachments.
@@ -675,7 +756,9 @@ public:
         Net().SetHandler(proto::G_OBJ_REMOVE, [](uint8_t from, Reader& r) {
             uint16_t id = r.U16();
             uint8_t kind = r.U8(), weapon = r.U8();
-            if (!r.Ok() || from != Net().HostId() || !core::IsPlayerReady()) return;
+            if (!r.Ok() || from != Net().HostId() || Net().IsHost()||!core::IsPlayerReady()) return;
+            if(kind==REMOVE_ORIGIN){ObjectOrigin origin;if(id||!ReadOrigin(r,origin))return;origin.removed=true;if(RememberOrigin(origin)){g_originScan=0;ApplyRemovedOrigins();}return;}
+            if(kind!=REMOVE_GONE&&kind!=REMOVE_BROKE)return;
             if (kind == REMOVE_BROKE) {
                 if (auto it = g_pending.find(id); it != g_pending.end()) it->second.broken = true;
                 if (auto it = g_mirrors.find(id); it != g_mirrors.end()) {BreakCopy(it->second, weapon);it->second.broken=true;}
@@ -718,7 +801,7 @@ public:
 
     void OnSessionEnd() override {
         ClearCopies();
-        g_owned.clear();g_storyObjects.clear();
+        g_owned.clear();g_storyObjects.clear();g_origins.clear();g_originRevision=0;
     }
     void OnPeerLeave(uint8_t id) override {
         if(id<3){g_hitsSeen[id]={};g_pushSeen[id]={};}
@@ -736,12 +819,14 @@ public:
         for(auto&[object,n]:g_owned)if(n.motion.holder==id||n.motion.simulator==id){n.motion.holder=n.motion.simulator=255;n.motion.supportVehicle=0;n.motion.parentKind=0;n.motion.parentId=0;++n.motion.revision;ApplyMotion(n,true);Decision(n);}
         for (auto& [netId, no] : g_owned)
             if (Alive(no)) SendCreate(no);
+        for(auto&origin:g_origins)if(origin.removed)SendOriginRemoval(origin);
     }
     void OnGameStarted() override {  // a new world: the objects of the old one are gone
         for(auto&w:g_hitsSeen)w={};for(auto&w:g_pushSeen)w={};g_pushes.clear();g_nativeCargo.clear();
         g_owned.clear();g_storyObjects.clear();
         g_mirrors.clear();
         g_pending.clear();
+        g_origins.clear();g_hiddenOriginals.clear();g_originRevision=0;g_originScan=0;
     }
     void OnGameShutdown() override { OnGameStarted(); }  // nothing to touch while the world loads
 
@@ -759,6 +844,7 @@ public:
                 else ++it;
             }
             if(!g_pending.empty())CreatePending();
+            ApplyRemovedOrigins();
         }
     }
 
@@ -778,6 +864,23 @@ void ShareMissionObject(int handle){
     g_storyObjects.insert(handle);
     // Capture before the command runs: its first reference can be DELETE_OBJECT.
     TrackObject(handle);
+}
+void RecordStoryObjectFreeze(int handle,bool frozen){
+    if(!Net().IsHost()||!HostReplicating())return;auto*o=GetObject(handle);auto*n=o?FindByObject(g_owned,o):nullptr;if(!n)return;
+    auto configured=frozen?(uint16_t)ObjectPhysics::FreezeMask:uint16_t(0);
+    bool changed=n->motion.physics.freezeFlags!=configured,revoked=frozen&&(n->motion.simulator!=255||n->motion.holder!=255);
+    // Reliable configuration and state snapshots share this ordering token.
+    // Advance it once for any config/authority mutation so an older CH_STATE
+    // snapshot cannot undo a newly delivered configured freeze/unfreeze.
+    if(changed||revoked)++n->motion.revision;
+    n->motion.physics.freezeFlags=configured;n->sentMs=0;
+    if(revoked){
+        n->motion.simulator=n->motion.holder=255;n->motion.supportVehicle=0;n->motion.parentKind=0;n->motion.parentId=0;
+        ApplyMotion(*n,true);
+    }else if(n->remotePhysics)o->PhysicalFlags()|=ObjectPhysics::FreezeMask;
+    // The config was already updated before HostScan compares its snapshot.
+    // Publish the decision reliably instead of relying on a state heartbeat.
+    if(changed||revoked)Decision(*n);
 }
 
 uint8_t SharedStoryObjectHolder(CObject*object){

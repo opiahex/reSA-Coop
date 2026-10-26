@@ -18,6 +18,7 @@
 #include "shared/lib/sync/PopulationShare.h"
 #include "shared/api/net-session/Session.h"
 #include "shared/api/story-coop/StoryCoop.h"
+#include "shared/api/story-stage/StoryStage.h"
 #include "shared/game/Script.h"
 #include "shared/lib/memory/Memory.h"
 #include "shared/lib/sync/WorldResync.h"
@@ -261,6 +262,7 @@ void Vehicles::OnInstallHooks() {
     Net().SetHandler(proto::G_VEH_REMOVE, [](uint8_t from, Reader& r) { Instance().HandleRemove(from, r); });
     Net().SetHandler(proto::G_VEH_SYNC, [](uint8_t from, Reader& r) { Instance().HandleSync(from, r); });
     Net().SetHandler(proto::G_VEH_OWNER, [](uint8_t from, Reader& r) { Instance().HandleOwner(from, r); });
+    Net().SetHandler(proto::G_VEH_ATTACHMENT,[](uint8_t from,Reader&r){Instance().HandleScriptAttachment(from,r);});
     Net().SetHandler(proto::G_VEH_STATUS, [](uint8_t from, Reader& r) { Instance().HandleStatus(from, r); });
     Net().SetHandler(proto::G_VEH_HANDOVER, [](uint8_t from, Reader& r) { Instance().HandleHandover(from, r); });
     Net().SetHandler(proto::G_VEH_SCRIPT_FREE, [](uint8_t from, Reader& r) { Instance().HandleScriptFree(from, r); });
@@ -289,11 +291,76 @@ void Vehicles::RenderSearchlights() {
 
 VehicleState Vehicles::Capture(CVehicle* vehicle) {
     auto state=VehicleState::Capture(vehicle);
+    if(auto*n=Find(vehicle);n&&n->parentCollisionHeld)
+        state.flags=(state.flags&~VehicleState::F_HIDDEN)|(n->parentWasVisible?0:VehicleState::F_HIDDEN);
     auto*child=Field<CVehicle*>(vehicle,0x4C8);
     auto*parent=Field<CVehicle*>(vehicle,0x4C4);
     if(IsVehicleValid(child)&&child!=vehicle)if(auto*n=EnsureNetworked(child))state.towChild=n->netId;
     if(IsVehicleValid(parent)&&parent!=vehicle)if(auto*n=EnsureNetworked(parent))state.towParent=n->netId;
+    if(auto*physical=vehicle->AttachedTo();physical&&physical->IsVehicle()&&physical!=vehicle){
+        auto*attached=(CVehicle*)physical;
+        if(!attached->IsTrain()&&IsVehicleValid(attached))if(auto*n=EnsureNetworked(attached)){
+            state.parentVehicle=n->netId;state.parentGeneration=Net().EntityGeneration(ENTITY_VEHICLE,n->netId);
+            state.parentOffset=Field<CVector>(vehicle,0x100);state.parentRotation=Field<Quat>(vehicle,0x118);
+            const auto&q=state.parentRotation;state.parentUsesEuler=q.x==0&&q.y==0&&q.z==0&&q.w==0;
+            if(state.parentUsesEuler)state.parentEuler=Field<CVector>(vehicle,0x10C);
+        }
+    }
+    if(auto*n=Find(vehicle);n&&n->scriptAttachment.attachmentRevision&&
+       n->scriptAttachment.attachmentRun==StoryRunId()&&n->scriptAttachment.attachmentPhase==CooperativeStoryPhase()){
+        const auto&claim=n->scriptAttachment;state.attachmentRun=claim.attachmentRun;
+        state.attachmentPhase=claim.attachmentPhase;state.attachmentRevision=claim.attachmentRevision;
+        state.parentVehicle=claim.parentVehicle;state.parentGeneration=claim.parentGeneration;
+        state.parentOffset=claim.parentOffset;state.parentRotation=claim.parentRotation;
+        state.parentUsesEuler=claim.parentUsesEuler;state.parentEuler=claim.parentEuler;
+    }
     return state;
+}
+
+void Vehicles::SendScriptAttachment(NetVehicle&nv){
+    if(!Net().IsHost()||!Alive(nv)||!nv.scriptAttachment.attachmentRevision)return;
+    Writer w(proto::G_VEH_ATTACHMENT);w.Entity(ENTITY_VEHICLE,nv.netId,ENTITY_SNAPSHOT);
+    auto current=Capture(nv.veh);current.time=(uint32_t)NowMs();
+    current.Write(w);Net().Send(proto::CH_RELIABLE,w);nv.attachmentSentMs=NowMs();
+}
+
+void Vehicles::ShareScriptAttachment(CVehicle*v,bool attached){
+    if(!Net().IsHost()||!StoryRunId()||!IsVehicleValid(v)||!ScriptHolds(v))return;
+    auto*n=EnsureNetworked(v);if(!n)return;
+    // Capture the native result before replacing the previous claim. A detach
+    // must retain the engine's inherited velocity and optional release force.
+    auto prior=n->scriptAttachment;n->scriptAttachment={};auto state=Capture(v);n->scriptAttachment=prior;
+    if(attached!=bool(state.parentVehicle)||state.train.Valid())return;
+    state.time=(uint32_t)NowMs();state.attachmentRun=StoryRunId();state.attachmentPhase=CooperativeStoryPhase();
+    state.attachmentRevision=prior.attachmentRun==state.attachmentRun?prior.attachmentRevision+1:1;
+    if(!state.attachmentRevision)++state.attachmentRevision;
+    n->scriptAttachment=state;n->history.Clear();
+    // Mark native local attachments too: an expired run may release only the
+    // exact parent installed for this claim, never an unrelated new binding.
+    if(state.parentVehicle)if(auto*p=Find(state.parentVehicle)){n->parentAttached=true;n->parentHandle=p->handle;n->parentGeneration=state.parentGeneration;}
+    SendScriptAttachment(*n);
+    LOGI("Native vehicle attachment vehicle=%04X parent=%04X run=%llu phase=%u revision=%u",n->netId,state.parentVehicle,(unsigned long long)state.attachmentRun,state.attachmentPhase,state.attachmentRevision);
+}
+
+void Vehicles::HandleScriptAttachment(uint8_t from,Reader&r){
+    const auto id=r.U16();VehicleState state;if(!state.Read(r)||from!=Net().HostId()||Net().IsHost()||
+       !core::IsPlayerReady()||
+       !state.attachmentRevision||state.attachmentRun!=StoryRunId()||state.attachmentPhase!=CooperativeStoryPhase())return;
+    auto*n=Find(id);if(!n||!Alive(*n)||state.parentVehicle==id)return;
+    if(state.parentVehicle&&Net().ExpectedEntityGeneration(ENTITY_VEHICLE,state.parentVehicle)!=state.parentGeneration)return;
+    auto&prior=n->scriptAttachment;
+    if(prior.attachmentRun==state.attachmentRun&&prior.attachmentRevision&&
+       (int32_t)(state.attachmentRevision-prior.attachmentRevision)<=0)return;
+    prior=state;n->history.Clear();
+    if(!state.parentVehicle){
+        // This is the actual native 0684 result, not a second detach force.
+        ApplyVehicleBinding(*n,state);SetVehicleMatrix(n->veh,state.pos,state.rot);
+        n->veh->MoveSpeed()=state.vel*(1.f/50.f);n->veh->TurnSpeed()=state.turn*(1.f/50.f);
+    }else ApplyVehicleBinding(*n,state);
+    if(!n->hasState||n->state.attachmentRun!=state.attachmentRun||n->state.attachmentRevision!=state.attachmentRevision){
+        n->state=state;n->hasState=true;n->lastTime=0;n->recvMs=NowMs();
+    }
+    LOGD("Native vehicle attachment received vehicle=%04X parent=%04X revision=%u",id,state.parentVehicle,state.attachmentRevision);
 }
 
 void Vehicles::ApplyTowLinks(NetVehicle& nv) {
@@ -378,6 +445,7 @@ NetVehicle* Vehicles::EnsureNetworked(CVehicle* v) {
     nv.handle = GetVehicleRef(v);
     nv.owner = Net().MyId();
     nv.model = v->ModelIndex();
+    nv.script = nv.heldHere = ScriptHolds(v);
     nv.playerUsed = v->Driver() == FindPlayerPed(0);
     nv.firstAnnouncedMs=NowMs();
     nv.lastChangeMs = NowMs();
@@ -412,6 +480,7 @@ void Vehicles::ReannounceOne(uint16_t id) { if(auto*n=Find(id);n&&!IsMirror(*n))
 
 void Vehicles::Reannounce() {
     SendRecent();
+    if(Net().IsHost())for(auto&[id,nv]:m_byId)if(nv.scriptAttachment.attachmentRun==StoryRunId()&&nv.scriptAttachment.attachmentPhase==CooperativeStoryPhase())SendScriptAttachment(nv);
     if(Net().IsHost())for(auto&[id,lock]:m_scriptLocks){Writer w(proto::G_SCRIPT_LOCK);w.Entity(ENTITY_VEHICLE,id);w.U8(lock);Net().Send(proto::CH_RELIABLE,w);}
     for (auto& [id, nv] : m_byId)
         if (!IsMirror(nv) && IsVehicleValid(nv.veh)) {
@@ -521,6 +590,33 @@ void Vehicles::TakeOwnership(NetVehicle& nv) {
     Net().Send(proto::CH_RELIABLE, w);
     Announce(nv);  // a peer that missed the original car can rebuild this same ID
     LOGI("Took ownership of vehicle %04X", nv.netId);
+}
+
+void Vehicles::ObserveScriptOwnership(NetVehicle& nv) {
+    if(!Net().IsHost()||!Alive(nv))return;
+    const bool held=ScriptHolds(nv.veh);
+    if(held){
+        const bool changed=!nv.heldHere||!nv.script;
+        nv.heldHere=true;nv.script=true;
+        // An observer's native slot can be transiently empty while 0683 moves
+        // a guest-driven vehicle onto its parent. The real driver's accepted
+        // state remains authoritative; reclaiming this visual gap elected the
+        // host and made HandleOwner drag the actual guest into a passenger seat.
+        auto*driver=Players::Instance().Get(nv.owner);
+        const bool remoteDriving=driver&&driver->ClaimsDriver(nv.netId,
+            Net().EntityGeneration(ENTITY_VEHICLE,nv.netId),nv.veh->AreaCode(),NowMs());
+        // STORE_CAR_CHAR_IS_IN can adopt a guest's previously parked car into
+        // the native mission. Its original id prefix still belongs to that
+        // guest; creating a new host id or waiting for a host prefix loses the
+        // script's authoritative edits. Keep this id and native handle.
+        if(IsMirror(nv)&&!HasPlayerInside(nv.veh)&&!remoteDriving&&!IsCooperativeRemoteVehicle(nv.veh,nv.owner)){
+            TakeOwnership(nv);
+            if(!IsMirror(nv)){SendState(nv,true);LOGI("Native script adopted vehicle %04X with its existing identity",nv.netId);}
+        }else if(changed&&!IsMirror(nv))Announce(nv);
+        else if(changed&&remoteDriving)LOGD("Native script vehicle %04X retains fresh driver claim player=%u",nv.netId,nv.owner);
+    }else if(nv.heldHere&&!IsMirror(nv)){
+        nv.heldHere=false;nv.script=false;Announce(nv);
+    }
 }
 
 CVehicle* Vehicles::FindAdoptable(uint16_t model, const CVector& pos) {
@@ -640,6 +736,7 @@ void Vehicles::Forget(uint16_t netId, bool deleteVehicle) {
     auto it = m_byId.find(netId);
     if (it == m_byId.end()) return;
     NetVehicle& nv = it->second;
+    if(!deleteVehicle&&Alive(nv)){nv.scriptAttachment={};ApplyVehicleBinding(nv,VehicleState{});}
     LOGD("Vehicle %04X forgotten (owner %u, delete %d) native=%d generation=%llu mirror_created=%d",netId,nv.owner,deleteVehicle,nv.handle,(unsigned long long)Net().EntityGeneration(ENTITY_VEHICLE,netId),nv.createdByUs);
     if (deleteVehicle && Alive(nv)) {
         auto*me=FindPlayerPed(0);
@@ -905,6 +1002,12 @@ void Vehicles::ApplyDriverState(uint8_t from, uint16_t netId, const VehicleState
     // Driver snapshots never elect a simulator. Delayed old-driver states used to
     // take ownership back every frame on an observer, making a guest-to-guest jack jitter.
     if(nv->owner!=from)return;
+    if(st.parentVehicle&&(st.parentVehicle==netId||
+       st.parentGeneration!=Net().ExpectedEntityGeneration(ENTITY_VEHICLE,st.parentVehicle)))return;
+    if(!st.AttachmentInStory(StoryRunId(),CooperativeStoryPhase()))return;
+    const auto&claim=nv->scriptAttachment;
+    if(claim.attachmentRevision&&claim.attachmentRun==StoryRunId()&&claim.attachmentPhase==CooperativeStoryPhase()&&
+       !st.FollowsAttachmentClaim(claim))return;
     if (nv->hasState && (int32_t)(st.time - nv->lastTime) < 0) return;
     if(!nv->hasState||(st.pos-nv->state.pos).Length()>30)nv->history.Clear();
     nv->history.Push(st,NowMs());
@@ -1036,6 +1139,69 @@ bool ApplyTrainBinding(NetVehicle&nv,const VehicleState&st){
     CallMethod<0x546FF0>(v);nv.trainAttached=true;return true;
 }
 
+bool Vehicles::ApplyVehicleBinding(NetVehicle&nv,const VehicleState&sample){
+    if(!Alive(nv))return false;
+    auto*v=nv.veh;auto state=sample;
+    auto&claim=nv.scriptAttachment;
+    if(claim.attachmentRevision){
+        if(claim.attachmentRun==StoryRunId()&&claim.attachmentPhase==CooperativeStoryPhase())state=claim;
+        else claim={};
+    }
+    if(state.attachmentRevision&&(state.attachmentRun!=StoryRunId()||state.attachmentPhase!=CooperativeStoryPhase()))state.parentVehicle=0;
+    auto*n=state.parentVehicle?Find(state.parentVehicle):nullptr;
+    auto*parent=n&&Alive(*n)&&n->netId!=nv.netId&&n->veh->AreaCode()==v->AreaCode()&&
+        Net().EntityLive(ENTITY_VEHICLE,n->netId)&&Net().EntityGeneration(ENTITY_VEHICLE,n->netId)==state.parentGeneration?n->veh:nullptr;
+    // Reject native pointer cycles too, including a parent not yet represented
+    // by the current packet. A pool address is never itself an identity.
+    auto*walk=parent;for(int depth=0;walk&&depth<9;++depth){
+        if(walk==v||depth==8){parent=nullptr;break;}
+        auto*next=walk->AttachedTo();walk=next&&next->IsVehicle()&&IsVehicleValid((CVehicle*)next)?(CVehicle*)next:nullptr;
+    }
+    auto*installed=GetVehicle(nv.parentHandle);
+    bool ours=nv.parentAttached&&installed&&v->AttachedTo()==installed;
+    if(nv.parentAttached&&(!parent||parent!=installed)){
+        // An independent native task already reparented this car: do not let a
+        // stale cleanup detach that unrelated new physical parent.
+        if(ours)CallMethod<0x5442F0>(v,0.f,0.f,0.f,false);
+        nv.parentAttached=false;nv.parentHandle=-1;nv.parentGeneration=0;
+    }
+    if(state.parentVehicle&&!parent){
+        if(!nv.parentCollisionHeld){nv.parentCollisionHeld=true;nv.parentHadCollision=(v->Flags()&1)!=0;nv.parentWasVisible=v->IsVisible();
+            nv.parentHeldPhysicsMask=(~v->PhysicalFlags())&0x2000u;nv.parentHadGravity=(v->PhysicalFlags()&2)!=0;}
+        v->Flags()&=~129u;v->PhysicalFlags()=(v->PhysicalFlags()|nv.parentHeldPhysicsMask)&~2u;
+        v->MoveSpeed()={};v->TurnSpeed()={};return true;
+    }
+    if(nv.parentCollisionHeld){
+        if(nv.parentHadCollision)v->Flags()|=1u;
+        if(nv.parentWasVisible&&!(state.flags&VehicleState::F_HIDDEN))v->Flags()|=128u;
+        v->PhysicalFlags()&=~nv.parentHeldPhysicsMask;if(nv.parentHadGravity)v->PhysicalFlags()|=2u;
+        nv.parentCollisionHeld=false;
+    }
+    if(!parent)return false;
+    auto offset=state.parentOffset;auto rotation=state.parentRotation;
+    if(v->AttachedTo()!=parent){
+        if(state.parentUsesEuler)CallMethod<0x54D570>(v,parent,offset,state.parentEuler);
+        else CallMethod<0x54D690>(v,parent,&offset,&rotation);
+    }
+    Field<CVector>(v,0x100)=offset;
+    if(state.parentUsesEuler){Field<CVector>(v,0x10C)=state.parentEuler;Field<Quat>(v,0x118)={0,0,0,0};}
+    else Field<Quat>(v,0x118)=rotation;
+    CallMethod<0x546FF0>(v);nv.parentAttached=true;nv.parentHandle=n->handle;nv.parentGeneration=state.parentGeneration;
+    return true;
+}
+
+void Vehicles::UpdateVehicleBindings(){
+    std::vector<std::pair<int,uint16_t>>order;
+    for(auto&[id,nv]:m_byId)if(Alive(nv)&&(nv.parentAttached||nv.parentCollisionHeld||nv.scriptAttachment.attachmentRevision||
+       (IsMirror(nv)&&nv.hasState&&nv.state.parentVehicle))){
+        auto*walk=&nv;int depth=0;
+        for(;walk&&depth<8;++depth){const auto&st=walk->scriptAttachment.attachmentRevision?walk->scriptAttachment:walk->state;if(!st.parentVehicle)break;walk=Find(st.parentVehicle);}
+        order.push_back({depth,id});
+    }
+    std::sort(order.begin(),order.end());
+    for(auto[depth,id]:order)if(auto*n=Find(id))ApplyVehicleBinding(*n,IsMirror(*n)&&n->hasState?n->state:VehicleState{});
+}
+
 void Vehicles::ApplyMirror(NetVehicle& nv, float dt) {
     if (!nv.hasState) return;
     CVehicle* v = nv.veh;
@@ -1086,7 +1252,7 @@ void Vehicles::ApplyMirror(NetVehicle& nv, float dt) {
     // then accumulated metres of error before snapping the car and its riders.
     // Use the sampled transform each tick, retaining physical velocity for local
     // contacts. Only the owner publishes the resulting vehicle physics.
-    if(!ApplyTrainBinding(nv,st)){
+    if(!ApplyVehicleBinding(nv,st)&&!ApplyTrainBinding(nv,st)){
         SetVehicleMatrix(v, target, st.rot);
         v->MoveSpeed() = nv.groundless ? CVector{} : st.vel * (1.0f / 50.0f);
         v->TurnSpeed() = nv.groundless ? CVector{} : st.turn * (1.0f / 50.0f);
@@ -1121,6 +1287,7 @@ void Vehicles::ApplyMirror(NetVehicle& nv, float dt) {
 
 void Vehicles::OnPreProcess() {
     if (!Net().Online() || !core::IsPlayerReady()) return;
+    for(auto&[id,nv]:m_byId)ObserveScriptOwnership(nv);
     // Native entry starts the engine before Players publishes its driver packet.
     // Claim first: a mirror must never overwrite that native entry result.
     auto* localDriver=FindPlayerPed(0);
@@ -1175,6 +1342,9 @@ void Vehicles::OnPreProcess() {
     }
     // Both sampled poses must be installed before native hitch geometry runs.
     for(auto&[id,nv]:m_byId)if(IsMirror(nv)&&nv.hasState&&IsVehicleValid(nv.veh))ApplyTowLinks(nv);
+    // Parents may have larger ids than their children. Re-evaluate local-space
+    // bindings after every sampled parent pose is installed, before physics.
+    UpdateVehicleBindings();
 }
 
 void Vehicles::SendState(NetVehicle& nv,bool reliable) {
@@ -1279,6 +1449,19 @@ void Vehicles::OnPostProcess() {
     if (!Net().Online() || !core::IsPlayerReady()) return;
     CPlayerPed* me = FindPlayerPed(0);
     uint64_t now = NowMs();
+    if(Net().IsHost())for(auto&[id,nv]:m_byId)if(Alive(nv)&&nv.scriptAttachment.parentVehicle&&
+       nv.scriptAttachment.AttachmentInStory(StoryRunId(),CooperativeStoryPhase())&&!nv.parentCollisionHeld){
+        const auto&claim=nv.scriptAttachment;auto*parent=Find(claim.parentVehicle);
+        if(parent&&Alive(*parent)&&Net().EntityGeneration(ENTITY_VEHICLE,parent->netId)==claim.parentGeneration&&nv.veh->AttachedTo()!=parent->veh){
+            // Native physics can release a binding itself (tilt/collision).
+            // Publish that real result before the mirror/binding pass, rather
+            // than silently pinning it back to a parent the game released.
+            ShareScriptAttachment(nv.veh,nv.veh->AttachedTo()!=nullptr);
+        }
+    }
+    for(auto&[id,nv]:m_byId)ObserveScriptOwnership(nv);
+    if(Net().IsHost())for(auto&[id,nv]:m_byId)if(nv.scriptAttachment.attachmentRevision&&
+       nv.scriptAttachment.AttachmentInStory(StoryRunId(),CooperativeStoryPhase())&&now-nv.attachmentSentMs>1000)SendScriptAttachment(nv);
     if(auto*v=me->VehicleIfIn();v&&v->Driver()==me)
         if(auto*n=Find(v);n&&IsMirror(*n))TakeOwnership(*n);
     if (me->InVehicle() && me->Vehicle()) RememberUsed(me->Vehicle());
@@ -1385,10 +1568,12 @@ void Vehicles::OnPostProcess() {
             SendState(nv);
         }
     }
+    UpdateVehicleBindings();
 }
 
 void Vehicles::OnSessionEnd() {
     m_scriptLocks.clear();
+    for(auto&[id,nv]:m_byId){nv.scriptAttachment={};ApplyVehicleBinding(nv,VehicleState{});}
     ReleaseKeptCar();
     m_recent.clear();
     m_restoreRecent.clear();

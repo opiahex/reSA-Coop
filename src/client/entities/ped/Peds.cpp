@@ -815,14 +815,24 @@ void Peds::ScanOwned() {
 
     // owned peds that vanished or went out of the partner's range
     std::vector<uint16_t> gone;
-    for (auto& [id, np] : m_byId)
-        if (np.owner == myId && (!IsAlive(np) || (PrivateInteriorPed(np.ped)||(!StoryPed(np.ped)&&now-np.firstAnnouncedMs>3000&&RemoteDistance(np.ped->VehicleIfIn()?np.ped->Vehicle()->GetPosition():np.ped->GetPosition(), np.ped->VehicleIfIn()?np.ped->Vehicle()->AreaCode():AreaOf(np.ped)) > SyncOut(np.ped)))))
+    for (auto& [id, np] : m_byId) {
+        if(np.owner!=myId)continue;
+        // A missing native body is expected during a cold handover. Retain
+        // only that bounded, generation-fenced retry; ordinary native removal
+        // still retires an adopted ped immediately.
+        if(np.pendingAdoption){if(AdoptionCurrent(np)&&AdoptionVehicleCurrent(np)&&now<np.adoptionUntil&&(!np.adoptionSpawned||IsAlive(np)))continue;gone.push_back(id);continue;}
+        if (!IsAlive(np) || (PrivateInteriorPed(np.ped)||(!StoryPed(np.ped)&&now-np.firstAnnouncedMs>3000&&RemoteDistance(np.ped->VehicleIfIn()?np.ped->Vehicle()->GetPosition():np.ped->GetPosition(), np.ped->VehicleIfIn()?np.ped->Vehicle()->AreaCode():AreaOf(np.ped)) > SyncOut(np.ped))))
             gone.push_back(id);
+    }
     for (uint16_t id : gone) {
-        Writer w(proto::G_PED_REMOVE);
-        w.Entity(ENTITY_PED,id,ENTITY_REMOVE);
-        Net().Send(proto::CH_RELIABLE, w);
-        Forget(id, false);
+        auto&np=m_byId.at(id);bool pending=np.pendingAdoption;
+        // A reset/reused ID must not send REMOVE against the newer identity.
+        if(!pending||AdoptionCurrent(np)){
+            Writer w(proto::G_PED_REMOVE);w.Entity(ENTITY_PED,id,ENTITY_REMOVE);Net().Send(proto::CH_RELIABLE,w);
+        }
+        if(pending){const char*reason=!AdoptionCurrent(np)?"context":!AdoptionVehicleCurrent(np)?"vehicle_replaced":np.adoptionSpawned&&!IsAlive(np)?"native_deleted":"timeout";
+            LOGI("Ped adoption retired id=%04X generation=%llu reason=%s",id,(unsigned long long)np.adoptionGeneration,reason);}
+        Forget(id, pending);
     }
 
     for (int i = 0; i < pool->size; ++i) {
@@ -830,6 +840,7 @@ void Peds::ScanOwned() {
         auto* ped = (CPed*)(pool->objects + (size_t)i * kPedPoolElemSize);
         if (ped == me || ped->IsPlayer() || Players::Instance().FindByPed(ped)) continue;
         NetPed* np = Find(ped);
+        if(np&&np->pendingAdoption)continue; // do not publish a half-equipped recreated body
         if (np && np->owner != myId) continue;  // mirror
         auto*in=ped->VehicleIfIn();
         float d = RemoteDistance(in?in->GetPosition():ped->GetPosition(), in?in->AreaCode():AreaOf(ped));
@@ -1018,13 +1029,14 @@ void Peds::HandleOwner(uint8_t from, Reader& r) {
     if (it->second.owner != from) return;
     NetPed& np = it->second;
     np.owner = to;
+    np.pendingAdoption=false;
     np.hasState = false;  // the next state comes from a different clock
     np.poses.Clear();
     if (to != Net().MyId()) return;  // a third player keeps the same mirror instead of deleting it
     if (!IsAlive(np)) {
         // The old viewer may have streamed the physical copy out. Retain the
         // record and spawn it before adoption instead of globally removing it.
-        m_byPtr.erase(np.ped);np.ped=nullptr;np.handle=-1;np.pendingAdoption=true;
+        QueueAdoption(np);
         return;
     }
     if (IsPedDead(np.ped)) {
@@ -1042,7 +1054,7 @@ void Peds::Adopt(NetPed& np) {
     if(IsAlive(np)&&np.model==285&&np.pedType==PED_TYPE_COP&&np.ped->PedType()!=PED_TYPE_COP){
         auto at=np.state.pos;auto old=np.ped;m_byPtr.erase(old);Cmd(0x009B).I(np.handle).Run();np.ped=nullptr;np.handle=-1;
         int handle=-1;Cmd(0x009A).I(PED_TYPE_COP).I(285).F(at.x).F(at.y).F(at.z-1).Out(&handle).Run();
-        auto*p=GetPed(handle);if(!p){np.pendingAdoption=true;return;}
+        auto*p=GetPed(handle);if(!p){QueueAdoption(np);return;}
         np.ped=p;np.handle=handle;m_byPtr[p]=np.netId;p->AreaCode()=np.state.area;
         if(np.state.weapon>0&&np.state.weapon<=46){Cmd(0x01B2).I(handle).I(np.state.weapon).I(300).Run();Cmd(0x01B9).I(handle).I(np.state.weapon).Run();}
         LOGI("Landed SWAT native AI adopted id=%04X owner=%u",np.netId,Net().MyId());
@@ -1066,6 +1078,61 @@ void Peds::Adopt(NetPed& np) {
     if (np.pedType > PED_TYPE_COP && np.pedType != PED_TYPE_MEDIC && np.pedType != PED_TYPE_FIREMAN && np.pedType <= 31)
         np.ped->PedType() = np.pedType;
     CallMethod<0x5E06E0>(np.ped);  // CPed::SetPedDefaultDecisionMaker: the one of its stats, now that no script holds it
+}
+
+void Peds::QueueAdoption(NetPed&np){
+    if(auto i=m_byPtr.find(np.ped);i!=m_byPtr.end()&&i->second==np.netId)m_byPtr.erase(i);
+    np.ped=nullptr;np.handle=-1;
+    if(np.pendingAdoption)return; // a repeated failure must not extend its lease
+    np.pendingAdoption=true;np.adoptionSpawned=false;np.adoptionWorld=Net().WorldEpoch();
+    np.adoptionGeneration=Net().EntityGeneration(ENTITY_PED,np.netId);
+    np.adoptionVehicleGeneration=(np.state.flags&PedSyncState::F_IN_VEHICLE)?Net().EntityGeneration(ENTITY_VEHICLE,np.state.vehNetId):0;
+    np.adoptionUntil=NowMs()+15000;
+    LOGI("Ped adoption queued id=%04X generation=%llu vehicle=%04X",np.netId,(unsigned long long)np.adoptionGeneration,np.state.vehNetId);
+}
+
+bool Peds::AdoptionCurrent(const NetPed&np)const{
+    if(np.owner!=Net().MyId()||!np.adoptionGeneration||np.adoptionWorld!=Net().WorldEpoch()||
+       !Net().EntityLive(ENTITY_PED,np.netId)||Net().EntityGeneration(ENTITY_PED,np.netId)!=np.adoptionGeneration)return false;
+    return true;
+}
+
+bool Peds::AdoptionVehicleCurrent(const NetPed&np)const{
+    return !(np.state.flags&PedSyncState::F_IN_VEHICLE)||(np.adoptionVehicleGeneration&&
+        Net().EntityGeneration(ENTITY_VEHICLE,np.state.vehNetId)==np.adoptionVehicleGeneration&&
+        Net().EntityLink(ENTITY_PED,np.netId,ENTITY_VEHICLE,np.state.vehNetId));
+}
+
+bool Peds::AdoptionRelevant(const NetPed&np)const{
+    // Use the last accepted position, never extrapolate an abandoned clock.
+    // An inherited population outside every real viewer's region waits rather
+    // than creating native bodies across an otherwise unused part of the map.
+    auto near=[&](const CVector&at,int area){return (np.state.area==area||np.state.area==13||area==13)&&
+        std::fabs(at.z-np.state.pos.z)<80.f&&(at-np.state.pos).Length2D()<280.f;};
+    auto*me=FindPlayerPed(0);if(me&&near(me->GetPosition(),me->AreaCode()))return true;
+    for(auto&[id,p]:Players::Instance().All())if(p.hasState&&p.state.health>0&&NowMs()-p.stateRecvMs<1500&&near(p.state.pos,p.state.area))return true;
+    return false;
+}
+
+void Peds::RetryAdoption(NetPed&np){
+    if(!np.pendingAdoption||!AdoptionCurrent(np)||!AdoptionVehicleCurrent(np)||NowMs()>=np.adoptionUntil||!AdoptionRelevant(np))return;
+    if(!IsAlive(np)){
+        if(np.adoptionSpawned)return; // a native deletion after creation is final
+        if(!SpawnMirror(np))return;
+        np.adoptionSpawned=true;
+    }
+    // Recreated copies start unarmed. Keep the native gun task behind the same
+    // IFP/model readiness boundary as ordinary mirrors before publishing it.
+    if(!(np.state.flags&PedSyncState::F_DEAD)&&np.state.weapon&&np.ped->ActiveWeapon().type!=np.state.weapon){
+        if(!WeaponAnimationsReady(np.ped,np.state.weapon))return;
+        int model=-1;Cmd(0x0781).I(np.state.weapon).Out(&model).Run();
+        if(model>0&&!IsModelLoaded(model)){RequestModel(model,0);return;}
+        Cmd(0x01B2).I(np.handle).I(np.state.weapon).I(300).Run();Cmd(0x01B9).I(np.handle).I(np.state.weapon).Run();
+    }
+    Adopt(np);if(!IsAlive(np))return;
+    np.pendingAdoption=false;np.adoptionSpawned=false;np.firstAnnouncedMs=NowMs();np.lastSendMs=0;np.handoverUntil=NowMs()+3000;
+    Announce(np);SendState(np);
+    LOGI("Ped adoption ready id=%04X generation=%llu",np.netId,(unsigned long long)np.adoptionGeneration);
 }
 
 void Peds::HandleSync(uint8_t from, Reader& r) {
@@ -1540,7 +1607,7 @@ void Peds::OnPreProcess() {
     std::sort(order.begin(),order.end());
     for(auto[score,id]:order){auto&np=m_byId.at(id);
         if(np.pendingAdoption){
-            if(SpawnMirror(np)){np.pendingAdoption=false;Adopt(np);if(!IsAlive(np))continue;np.lastSendMs=0;np.handoverUntil=NowMs()+3000;Announce(np);SendState(np);}
+            RetryAdoption(np);
             continue;
         }
         if(np.owner==Net().MyId()){
@@ -1616,6 +1683,9 @@ void Peds::OnSessionEnd() {
     handContacts.clear();
     coupleClocks.clear();
     for(auto&[id,np]:m_byId)HoldCorpseOutside(np,false);
+    // A provisional body still has mirror proofs/decision maker. Disconnect
+    // cancels its lease; it must not remain as an invulnerable local mission ped.
+    for(auto&[id,np]:m_byId)if(np.pendingAdoption&&IsAlive(np))Cmd(0x009B).I(np.handle).Run();
     // mirrors stay in the world as ordinary random peds
     for (auto& [id, np] : m_byId)
         if (np.owner != Net().MyId() && IsAlive(np)) {
@@ -1635,7 +1705,9 @@ void Peds::OnPeerLeave(uint8_t id) {
     for(auto&[peerId,peer]:Net().Peers())if(peerId!=id)survivors.push_back(peerId);
     uint8_t successor=VehicleSuccessor(Net().HostId(),id,survivors);
     for(auto&[pid,np]:m_byId)if(np.owner==id){
-        np.owner=successor;np.hasState=false;np.handoverUntil=NowMs()+2000;
+        np.owner=successor;np.hasState=false;np.poses.Clear();np.handoverUntil=NowMs()+2000;
+        np.pendingAdoption=false;
+        if(successor==Net().MyId()&&!IsAlive(np)){QueueAdoption(np);continue;}
         if(successor==Net().MyId()&&IsAlive(np)&&!IsPedDead(np.ped)){
             Adopt(np);np.lastSendMs=0;Announce(np);
         }

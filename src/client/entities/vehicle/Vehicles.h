@@ -46,10 +46,15 @@ struct NetVehicle {
     bool playerUsed = false;
     bool script = false;       // a script's car in the game that announced it
     uint8_t origBy = 0;        // what this game had it created by before it became a mirror here (0: spawned as one)
-    bool heldHere = false;     // a script of this game held it when it became a mirror here
+    bool heldHere = false;     // a native script here holds this exact pool handle
     bool crashProofHere = false;  // made collision-proof here as a mirror (taken off when it is this game's again)
     bool physicsHeld=false,heldGravity=false;
     bool trainAttached=false,trainCollisionHeld=false,trainHadCollision=false;
+    bool parentAttached=false,parentCollisionHeld=false,parentHadCollision=false,parentWasVisible=false;
+    int parentHandle=-1;uint64_t parentGeneration=0;
+    uint32_t parentHeldPhysicsMask=0;bool parentHadGravity=false;
+    VehicleState scriptAttachment;
+    uint64_t attachmentSentMs=0;
     uint32_t heldPhysicsMask=0;
 
     bool hasState = false;
@@ -118,6 +123,8 @@ public:
     void ShareScriptLock(game::CVehicle* vehicle);
     void ReleaseScriptLocks();
     void ShareScriptDeletion(game::CVehicle* vehicle);
+    // Called after the native 0683/0684 opcode, retaining its actual result.
+    void ShareScriptAttachment(game::CVehicle* vehicle,bool attached);
     int RemoveSharedAmbient(const game::CVector& centre,int8_t area,int budget=2);
     // this game would drop the car, the other player is nearer: it goes to that player's game (false: not ours to give)
     bool QueueGiveAway(game::CVehicle* v, uint8_t to);
@@ -139,6 +146,11 @@ private:
     void SendLook(NetVehicle& nv);
     void ApplyLook(NetVehicle& nv);
     void ApplyMirror(NetVehicle& nv, float dt);
+    void ObserveScriptOwnership(NetVehicle& nv);
+    bool ApplyVehicleBinding(NetVehicle& nv,const VehicleState& state);
+    void UpdateVehicleBindings();
+    void HandleScriptAttachment(uint8_t from,Reader& r);
+    void SendScriptAttachment(NetVehicle& nv);
     void SendState(NetVehicle& nv,bool reliable=false);
     void ApplyTowLinks(NetVehicle& nv);
     void Forget(uint16_t netId, bool deleteVehicle);

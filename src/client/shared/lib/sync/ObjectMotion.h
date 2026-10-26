@@ -7,14 +7,15 @@ struct ObjectPhysics {
     // Exclude transient contact/attachment bits and the replica's local
     // DisableCollisionForce/DontApplySpeed freeze. These are configured
     // physical properties; the current simulator owns the local freeze.
-    static constexpr uint32_t PhysicalMask=0x00FC00FBu,InteractionMask=0x00042000u;
+    static constexpr uint32_t PhysicalMask=0x00FC00FBu,InteractionMask=0x00042000u,FreezeMask=0x00002004u;
     float mass=1,turnMass=1;
     uint32_t physicalFlags=0,interactionFlags=0;
-    void Write(Writer&w)const{w.F32(mass);w.F32(turnMass);w.U32(physicalFlags);w.U32(interactionFlags);}
-    bool Read(Reader&r){mass=r.F32();turnMass=r.F32();physicalFlags=r.U32();interactionFlags=r.U32();
+    uint16_t freezeFlags=0; // native configured freeze, separate from a replica's local freeze
+    void Write(Writer&w)const{w.F32(mass);w.F32(turnMass);w.U32(physicalFlags);w.U32(interactionFlags);w.U16(freezeFlags);}
+    bool Read(Reader&r){mass=r.F32();turnMass=r.F32();physicalFlags=r.U32();interactionFlags=r.U32();freezeFlags=r.U16();
         return r.Ok()&&std::isfinite(mass)&&mass>=0&&mass<=1e10f&&std::isfinite(turnMass)&&turnMass>=0&&turnMass<=1e10f&&
-            !(physicalFlags&~PhysicalMask)&&!(interactionFlags&~InteractionMask);}
-    bool SameAs(const ObjectPhysics&other)const{return mass==other.mass&&turnMass==other.turnMass&&physicalFlags==other.physicalFlags&&interactionFlags==other.interactionFlags;}
+            !(physicalFlags&~PhysicalMask)&&!(interactionFlags&~InteractionMask)&&!(freezeFlags&~FreezeMask);}
+    bool SameAs(const ObjectPhysics&other)const{return mass==other.mass&&turnMass==other.turnMass&&physicalFlags==other.physicalFlags&&interactionFlags==other.interactionFlags&&freezeFlags==other.freezeFlags;}
 };
 struct ObjectMotion {
     game::CVector velocity,turn,offset,euler;

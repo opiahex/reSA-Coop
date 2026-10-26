@@ -18,6 +18,7 @@
 #include "entities/profile/Profile.h"
 #include "entities/vehicle/Vehicles.h"
 #include "shared/api/net-session/Session.h"
+#include "shared/api/progress/SchoolProgress.h"
 #include "shared/config/Config.h"
 #include "shared/game/Game.h"
 #include "shared/game/Script.h"
@@ -351,7 +352,7 @@ void LoadHostWorld(const std::vector<uint8_t>& data);
 bool SafeToReload() {
     game::CPlayerPed* me = game::FindPlayerPed(0);
     return core::IsPlayerReady() && me && !me->InVehicle() && me->Health() > 0.0f && !game::Ref<uint8_t>(0xB5F851) &&
-           !core::IsOnMission() && !HostMissionRecent(5000);
+           !core::IsOnMission() && !PersonalActivityAttemptActive() && !HostMissionRecent(5000);
 }
 
 void SaveSpot() {

@@ -33,6 +33,7 @@
 #include "shared/game/Script.h"
 #include "shared/lib/core/Core.h"
 #include "shared/lib/memory/Memory.h"
+#include "shared/lib/sync/SchoolPolicy.h"
 #include "shared/ui/chat/Chat.h"
 
 namespace coop {
@@ -601,6 +602,19 @@ struct Reg {
 }  // namespace
 
 void SaveProfileNow(bool always) { Progress::Instance().SaveNow(always); }
+
+bool PersonalActivityAttemptActive(){
+    if(!core::IsPlayerReady()||core::IsRestarting())return false;
+    // DANCE raises this native flag without raising ONMISSION. Reading only
+    // ONMISSION allowed a queued world refresh to replace a live dance round.
+    if(game::Ref<uint8_t>(0xA444A8))return true; // CTheScripts::bMiniGameInProgress
+    if(!core::IsOnMission())return false;
+    for(auto*script=game::Ref<void*>(0xA8B42C);script;script=game::Field<void*>(script,0)){
+        if(game::Field<uint8_t>(script,0xC4)&&game::Field<uint8_t>(script,0xDC)&&
+           IsPersonalActivityScriptName(game::Field<char[8]>(script,8),game::Ref<int32_t>(game::addr::ScriptSpace+484)==1))return true;
+    }
+    return false;
+}
 
 bool BeginPersonalDrivingSchool(void*script){
     if(!script||!g_drivingReady||!Net().Online()||Net().IsHost()||!flow::InHostWorld())return false;

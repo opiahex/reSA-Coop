@@ -15,6 +15,7 @@
 #include "shared/api/story-scripts/StoryScripts.h"
 #include "shared/api/story-coop/StoryCoop.h"
 #include "shared/api/story-stage/StoryStage.h"
+#include "shared/api/world-objects/WorldObjects.h"
 #include "shared/game/Script.h"
 #include "shared/lib/core/Core.h"
 #include "shared/lib/memory/Memory.h"
@@ -24,8 +25,11 @@ namespace coop {namespace {
 using namespace game;using game::script::Cmd;
 enum:uint8_t{MAP=1,IPL=2,PROGRESS=3,SNAPSHOT_BEGIN=4,SNAPSHOT_END=5,REQUEST=6,DARKNESS=7};
 struct MapEdit{int op=0;CVector at;float radius=0;int model=0,value=0;};
-std::vector<MapEdit> edits;std::map<std::string,uint8_t> ipls;
+struct IplState{uint8_t op=0;uint32_t incarnation=0;};
+std::vector<MapEdit> edits;std::map<std::string,IplState> ipls;
 std::set<std::string> appliedFarIpls;
+std::map<std::string,uint32_t> appliedIplIncarnations;
+std::string IplName(std::string name){for(auto&c:name)if(c>='A'&&c<='Z')c=(char)(c-'A'+'a');return name;}
 uint32_t mapRevision=0,receivedMapRevision=0,snapshotRevision=0,snapshotExpected=0,snapshotCount=0;
 bool snapshotOpen=false,haveSnapshot=false;uint64_t requestedAt=0;
 uint32_t NextRevision(){if(++mapRevision==0)++mapRevision;return mapRevision;}
@@ -38,7 +42,7 @@ void Remember(const MapEdit&e){
     edits.push_back(e);
 }
 void Send(const MapEdit&e){Writer w(proto::G_STORY_WORLD);w.U8(MAP);w.U32(mapRevision);w.U16(e.op);w.Vec({e.at.x,e.at.y,e.at.z});w.F32(e.radius);w.I32(e.model);w.I32(e.value);Net().Send(proto::CH_RELIABLE,w);}
-void SendIpl(const std::string&name,uint8_t op){Writer w(proto::G_STORY_WORLD);w.U8(IPL);w.U32(mapRevision);w.U8(op);w.Str(name,32);Net().Send(proto::CH_RELIABLE,w);}
+void SendIpl(const std::string&name,const IplState&state){Writer w(proto::G_STORY_WORLD);w.U8(IPL);w.U32(mapRevision);w.U8(state.op);w.Str(name,32);w.U32(state.incarnation);Net().Send(proto::CH_RELIABLE,w);}
 void SendProgress(){
     std::array<uint32_t,5> values{};memcpy(values.data(),(void*)(0xB79000+(146-120)*4),12);memcpy(values.data()+3,(void*)0xB79380,8);
     if(progressSent&&values==sentProgress&&NowMs()-sentAt<3000)return;
@@ -138,7 +142,9 @@ template<int Op>void __cdecl ScriptIpl(int slot){
     originalIpl[Op](slot);auto*s=CurrentScript();
     if(!Net().Online()||!Net().IsHost()||!HostReplicating()||!IsSharedStoryScript(s)||LocalSchoolActivity())return;
     const char*name=Call<0x404A60,const char*>(slot);if(!name||!*name||strnlen(name,33)>32)return;
-    {ipls[name]=Op;NextRevision();SendIpl(name,Op);LOGI("Story map IPL sent name=%s op=%d",name,Op);}
+    auto key=IplName(name);auto state=ipls[key];state.op=Op;NextRevision();
+    if constexpr(Op==1){state.incarnation=mapRevision;ResetWorldObjectIpl(key.c_str(),state.incarnation,true);}
+    ipls[key]=state;SendIpl(key,state);LOGI("Story map IPL sent name=%s op=%d incarnation=%u",key.c_str(),Op,state.incarnation);
 }
 void Snapshot();
 void Receive(uint8_t from,Reader&r){
@@ -149,9 +155,11 @@ void Receive(uint8_t from,Reader&r){
     if(op==SNAPSHOT_BEGIN){auto rev=r.U32();auto count=r.U32();if(!r.Ok())return;edits.clear();ipls.clear();snapshotOpen=true;haveSnapshot=false;snapshotRevision=rev;snapshotExpected=count;snapshotCount=0;return;}
     if(op==SNAPSHOT_END){auto rev=r.U32();if(r.Ok()&&snapshotOpen&&rev==snapshotRevision&&snapshotCount==snapshotExpected){receivedMapRevision=rev;haveSnapshot=true;snapshotOpen=false;LOGI("Story map snapshot ready revision=%u records=%u",rev,snapshotCount);}return;}
     if(op==MAP){auto rev=r.U32();MapEdit e;e.op=r.U16();auto p=r.Vec();e.at={p.x,p.y,p.z};e.radius=r.F32();e.model=r.I32();e.value=r.I32();if(!r.Ok()||!Valid(e))return;Remember(e);receivedMapRevision=rev;if(snapshotOpen)++snapshotCount;appliedAt=0;LOGI("Story map edit received op=%04X model=%d",e.op,e.model);}
-    else if(op==IPL){auto rev=r.U32();auto action=r.U8();auto name=r.Str(32);if(!r.Ok()||action>2||name.empty()||!std::all_of(name.begin(),name.end(),[](unsigned char c){return(c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_';}))return;
+    else if(op==IPL){auto rev=r.U32();auto action=r.U8();auto name=r.Str(32);auto incarnation=r.U32();if(!r.Ok()||action>2||name.empty()||(incarnation&&(int32_t)(rev-incarnation)<0)||!std::all_of(name.begin(),name.end(),[](unsigned char c){return(c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_';}))return;
+        name=IplName(name);
+        if(auto i=ipls.find(name);i!=ipls.end()&&i->second.incarnation&&(!incarnation||(int32_t)(incarnation-i->second.incarnation)<0))return;
         if(action!=2||!snapshotOpen)appliedFarIpls.erase(name);
-        ipls[name]=action;receivedMapRevision=rev;if(snapshotOpen)++snapshotCount;appliedAt=0;}
+        ipls[name]={action,incarnation};ResetWorldObjectIpl(name.c_str(),incarnation);receivedMapRevision=rev;if(snapshotOpen)++snapshotCount;appliedAt=0;}
 
     else if(op==PROGRESS){auto rev=r.U32();std::array<uint32_t,5> values;for(auto&v:values)v=r.U32();float f[2];memcpy(f,values.data()+3,8);
         if(!r.Ok()||(receivedRevision&&(int32_t)(rev-receivedRevision)<=0)||values[0]>1000000||values[1]>1000000||values[2]>1000000||!std::isfinite(f[0])||!std::isfinite(f[1])||f[0]<0||f[1]<0||f[0]>1e6f||f[1]>1e6f)return;
@@ -159,15 +167,23 @@ void Receive(uint8_t from,Reader&r){
 }
 void Snapshot(){
     Writer begin(proto::G_STORY_WORLD);begin.U8(SNAPSHOT_BEGIN);begin.U32(mapRevision);begin.U32((uint32_t)(edits.size()+ipls.size()));Net().Send(proto::CH_RELIABLE,begin);
-    for(auto&e:edits)Send(e);for(auto&[name,op]:ipls)SendIpl(name,op);
+    for(auto&e:edits)Send(e);for(auto&[name,state]:ipls)SendIpl(name,state);
     Writer end(proto::G_STORY_WORLD);end.U8(SNAPSHOT_END);end.U32(mapRevision);Net().Send(proto::CH_RELIABLE,end);
     SendDarkness();
 }
 bool ApplyIpls(){
     bool ready=true;
-    for(auto&[name,op]:ipls){
+    for(auto&[name,state]:ipls){
         int slot=Call<0x404AC0,int>(name.c_str());if(slot<0){ready=false;continue;}
         auto*pool=Ref<CPoolHeader*>(0x8E3FB0);if(!pool||slot>=pool->size||pool->byteMap[slot]<0){ready=false;continue;}
+        // REMOVE followed by REQUEST in the same SCM frame still destroys the
+        // old native IPL. Preserve that transition in a late/current snapshot.
+        auto&applied=appliedIplIncarnations[name];
+        if(state.incarnation&&(!applied||(int32_t)(state.incarnation-applied)>0)){
+            Call<0x405890>(slot);applied=state.incarnation;appliedFarIpls.erase(name);ResetWorldObjectIpl(name.c_str(),state.incarnation,true);
+            LOGI("Story map IPL native reset name=%s incarnation=%u",name.c_str(),applied);
+        }
+        const auto op=state.op;
         auto*def=pool->objects+(size_t)slot*0x34;bool loaded=Field<uint8_t>(def,0x2D)!=0;
         if(op==1){if(loaded||!Field<uint8_t>(def,0x2F)||Field<uint8_t>(def,0x30))Call<0x405890>(slot);}
         // Remove-when-far is a one-shot native operation. Once streaming has
@@ -209,8 +225,8 @@ class StoryWorld:public Module{
     void OnPeerResync(uint8_t)override{if(Net().IsHost()){Snapshot();progressSent=false;}}
 
     void OnPeerJoin(uint8_t)override{progressSent=false;}
-    void OnGameShutdown()override{ClearDarkness();mapRevision=receivedMapRevision=0;snapshotOpen=haveSnapshot=false;requestedAt=0;edits.clear();ipls.clear();appliedFarIpls.clear();haveProgress=progressSent=false;receivedRevision=0;sentAt=appliedAt=0;}
-    void OnHostChanged(uint8_t)override{ClearDarkness();}
+    void OnGameShutdown()override{ClearDarkness();mapRevision=receivedMapRevision=0;snapshotOpen=haveSnapshot=false;requestedAt=0;edits.clear();ipls.clear();appliedFarIpls.clear();appliedIplIncarnations.clear();haveProgress=progressSent=false;receivedRevision=0;sentAt=appliedAt=0;}
+    void OnHostChanged(uint8_t)override{ClearDarkness();if(Net().IsHost()&&receivedMapRevision&&(!mapRevision||(int32_t)(receivedMapRevision-mapRevision)>0))mapRevision=receivedMapRevision;}
     void OnSessionEnd()override{OnGameShutdown();revision=0;}
 }feature;struct Reg{Reg(){core::RegisterModule(&feature);}}reg;
 }

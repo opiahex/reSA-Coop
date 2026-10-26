@@ -41,6 +41,7 @@ struct RemotePlayer {
 
     Mode mode = Mode::OnFoot;
     uint16_t vehNetId = 0;
+    uint64_t vehGeneration = 0; // accepted vehicle reference, invalidated on replacement/resync
     int8_t seat = -1;           // -1 driver, 0.. passenger seats
     uint64_t enterTaskMs = 0;   // when we started the enter-car animation for this player
     uint16_t enteringVeh = 0;
@@ -57,6 +58,11 @@ struct RemotePlayer {
     bool lookStale = false;
     uint64_t duckOffMs = 0;
     bool scriptAnimFull = false;  // a replicated full-body SCM action owns the pose
+    bool ClaimsDriver(uint16_t vehicle,uint64_t generation,int8_t area,uint64_t now)const {
+        return hasState&&mode==Mode::Driver&&generation&&vehNetId==vehicle&&vehGeneration==generation&&
+               state.health>0&&state.area==area&&now>=stateRecvMs&&now-stateRecvMs<1500&&
+               !seatTransition.HoldSeat(vehicle,now);
+    }
 };
 
 class Players : public Module {

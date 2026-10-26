@@ -828,7 +828,7 @@ void Players::OnSessionStart() {
 void Players::OnPeerJoin(uint8_t id) { Touch(id); }
 void Players::OnPeerResync(uint8_t id) {
     if(auto*rp=Get(id)){
-        rp->history.Clear();rp->hasState=false;rp->lastStateTime=0;
+        rp->history.Clear();rp->hasState=false;rp->lastStateTime=0;rp->vehGeneration=0;
         rp->seatTransition={};rp->enteringVeh=0;rp->enterTaskMs=rp->exitTaskMs=0;
         rp->padNew=rp->padOld={};rp->padFresh=false;
     }
@@ -863,7 +863,7 @@ void Players::OnGameStarted() {
         rp.ped = nullptr;
         rp.pedHandle = -1;
         rp.blip = 0;
-        rp.history.Clear();rp.hasState=false;rp.lastStateTime=0;
+        rp.history.Clear();rp.hasState=false;rp.lastStateTime=0;rp.vehGeneration=0;
         rp.seatTransition={};rp.enteringVeh=0;rp.enterTaskMs=rp.exitTaskMs=0;
         rp.deadShown=false;rp.scriptAnimFull=false;rp.padNew=rp.padOld={};
     }
@@ -1051,6 +1051,7 @@ void Players::HandleOnFoot(uint8_t from, Reader& r) {
     rp.stateRecvMs = NowMs();
     rp.padFresh = true;
     rp.mode = RemotePlayer::Mode::OnFoot;
+    rp.vehGeneration=0;
     rp.seatTransition.OnFoot(NowMs());
 }
 
@@ -1087,6 +1088,7 @@ void Players::HandleDriver(uint8_t from, Reader& r) {
     rp.mode = RemotePlayer::Mode::Driver;
     rp.history.Clear();
     rp.vehNetId = netId;
+    rp.vehGeneration=Net().ExpectedEntityGeneration(ENTITY_VEHICLE,netId);
     rp.seat = -1;
     Vehicles::Instance().ApplyDriverState(from, netId, vs);
 }
@@ -1099,7 +1101,7 @@ void Players::HandlePassenger(uint8_t from, Reader& r) {
     Vec3 p = r.Vec();
     OnFootState st;
     if(!ReadCommon(r, st))return;
-    if (!r.Ok()) return;
+    if (!r.Ok() || seat < 0 || seat > 7) return;
     RemotePlayer& rp = Touch(from);
     if(rp.hasState&&(int32_t)(st.motion.epoch-rp.state.motion.epoch)<0)return;
     if (rp.hasState && (int32_t)(time - rp.lastStateTime) < 0) return;
@@ -1118,6 +1120,7 @@ void Players::HandlePassenger(uint8_t from, Reader& r) {
     rp.mode = RemotePlayer::Mode::Passenger;
     rp.history.Clear();
     rp.vehNetId = netId;
+    rp.vehGeneration=Net().ExpectedEntityGeneration(ENTITY_VEHICLE,netId);
     rp.seat = seat;
 }
 
@@ -1427,6 +1430,14 @@ void Players::ApplyVehicleSeat(RemotePlayer& rp) {
     if (seated) return;
     // give the enter animation time; otherwise put the player in place directly
     if (NowMs() - rp.enterTaskMs < kEnterGraceMs && EnteringCar(ped)) return;
+    // Validate the destination before leaving the old seat. In particular a
+    // bike's driver/passenger snapshots can arrive in the opposite order, and
+    // a native mission passenger may still be completing its exit here.
+    if (rp.seat < -1 || rp.seat > 7) return;
+    if (rp.seat < 0) {
+        if (nv->veh->Driver() && nv->veh->Driver() != ped) return;
+    } else if (SeatOrAny(nv->veh, rp.seat) < 0 ||
+               (nv->veh->Passengers()[rp.seat] && nv->veh->Passengers()[rp.seat] != ped)) return;
     if (ped->InVehicle()) {
         CVector p = ped->GetPosition();
         Cmd(0x0362).I(rp.pedHandle).F(p.x).F(p.y).F(p.z).Run();  // WARP_CHAR_FROM_CAR_TO_COORD
@@ -1453,6 +1464,9 @@ void Players::ApplySeatAssignment(uint16_t vehicle,uint8_t mask,const std::array
         if(!p)continue;
         // A delayed resolution must not pull a player back after it left.
         if(id==Net().MyId()&&(!p->InVehicle()||p->Vehicle()!=nv->veh))continue;
+        if(rp&&(!rp->hasState||rp->vehNetId!=vehicle||rp->mode==RemotePlayer::Mode::OnFoot||
+           rp->seatTransition.HoldSeat(vehicle,NowMs())||
+           (rp->enterPending&&rp->enteringVeh!=vehicle)))continue;
         peds[id]=p;
         if(p->InVehicle()&&p->Vehicle()==nv->veh&&PassengerSeatOf(nv->veh,p)!=seats[id]){
             auto at=nv->veh->GetPosition();Cmd(0x0362).I(GetPedRef(p)).F(at.x+2.f+id*.5f).F(at.y).F(at.z).Run();
@@ -1478,7 +1492,13 @@ void Players::ResolvePassengerConflicts(){
         if(driver!=Net().MyId())continue;
         bool changingDriver=false;for(uint8_t id=0;id<3;++id)if(id!=driver&&wanted[id]==-1)changingDriver=true;
         if(changingDriver)continue;
-        auto resolved=ResolveSeatClaims(wanted,Net().HostId(),driver,nv.veh->MaxPassengers(),CooperativeReservedSeats(nv.veh));
+        // A native NPC already seated here owns its seat too. Reserving only
+        // pending story tasks could assign a player to an occupied NPC slot,
+        // causing repeated detach/warp attempts while the NPC waited to board.
+        auto reserved=CooperativeReservedSeats(nv.veh);
+        for(int seat=0;seat<std::clamp((int)nv.veh->MaxPassengers(),0,8);++seat)
+            if(auto*p=nv.veh->Passengers()[seat];p&&p!=me&&!FindByPed(p))reserved|=(uint8_t)(1u<<seat);
+        auto resolved=ResolveSeatClaims(wanted,Net().HostId(),driver,nv.veh->MaxPassengers(),reserved);
         if(resolved==wanted)continue;
         Writer w(proto::G_SEAT_ASSIGN);w.Entity(ENTITY_VEHICLE,vehicle);w.U32(++m_seatSerial);w.U8(mask);for(auto s:resolved)w.I8(s);
         Net().Send(proto::CH_RELIABLE,w);ApplySeatAssignment(vehicle,mask,resolved);
@@ -1656,9 +1676,12 @@ void Players::OnPreProcess() {
         }
         if (!rp.ped) SpawnRemote(rp);
         if (rp.ped) StartPendingEnter(rp);
-        if (rp.ped) ApplyState(rp);
-        if (rp.ped) KeepApart(rp.ped);
     }
+    // Free old seats first, then install drivers before their passengers. A
+    // host riding behind a guest on a bike otherwise ran before that bike's
+    // driver solely because the host has the lower player id.
+    for(auto mode:{RemotePlayer::Mode::OnFoot,RemotePlayer::Mode::Driver,RemotePlayer::Mode::Passenger})
+        for(auto&[id,rp]:m_remote)if(rp.ped&&rp.mode==mode){ApplyState(rp);KeepApart(rp.ped);}
 }
 
 // A script that puts this game's player on a spot (a changing room, a mission's) puts it inside the other player's
@@ -2023,7 +2046,7 @@ namespace coop {void Players::OnEntityReplaced(uint8_t kind,uint8_t scope,uint16
  if(kind==ENTITY_OBJECT){for(auto&[player,rp]:m_remote)if(rp.state.motion.objectSupport&&rp.state.motion.support==id){rp.state.motion={};rp.history.Clear();}return;}
  if(kind==ENTITY_TRAIN){for(auto&[player,rp]:m_remote){auto support=rp.state.motion.support;if((support&0x8000u)&&((support>>4)&255u)==id&&((support>>12)&7u)==scope+1u){ClearChangedSupport(rp.ped,support,0);rp.state.motion.support=0;rp.history.Clear();}}return;}
  if(kind!=ENTITY_VEHICLE)return;for(auto&[player,rp]:m_remote){
-  if(rp.vehNetId==id){rp.vehNetId=0;rp.mode=RemotePlayer::Mode::OnFoot;rp.seatTransition={};rp.history.Clear();}
+  if(rp.vehNetId==id){rp.vehNetId=0;rp.vehGeneration=0;rp.mode=RemotePlayer::Mode::OnFoot;rp.seatTransition={};rp.history.Clear();}
   if(!rp.state.motion.objectSupport&&rp.state.motion.support==id){ClearChangedSupport(rp.ped,id,0);rp.state.motion.support=0;rp.history.Clear();}
  }
 }}

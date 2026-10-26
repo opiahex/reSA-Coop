@@ -15,6 +15,7 @@
 #include "entities/player/PlayerExtrasState.h"
 #include "shared/api/story-coop/StoryCoop.h"
 #include "shared/api/story-stage/StoryStage.h"
+#include "shared/api/story-loadout/StoryLoadout.h"
 
 namespace coop {
 namespace {
@@ -94,6 +95,9 @@ void __fastcall Breath(CPlayerPed*p,void*edx,bool decrease,float multiplier){
     if(!decrease||(p->PlayerData()&&Field<float>(p->PlayerData(),0x44)>0))drowningRemainder=0;
     originalBreath(p,edx,decrease,multiplier);breathActor=previous;breathDose=previousDose;
 }
+using VisionFn=void(__cdecl*)(bool);VisionFn originalNightVision=nullptr,originalInfraredVision=nullptr;
+void __cdecl NightVision(bool enabled){originalNightVision(enabled);ObserveLocalStoryVision();}
+void __cdecl InfraredVision(bool enabled){originalInfraredVision(enabled);ObserveLocalStoryVision();}
 class PlayerExtras:public Module {
 public:
  const char*Name()const override{return "PlayerExtras";}
@@ -101,8 +105,11 @@ public:
     mem::RedirectCallFn(0x60A943,&Drown,&originalDrown);
     mem::HookFn(0x60A8D0,&Breath,&originalBreath,"CPlayerPed::HandlePlayerBreath owner state");
     mem::HookFn(0x688A90,&SwimInput,&originalSwim,"CTaskSimpleSwim::ProcessControlInput");
+    mem::HookFn(0x701120,&NightVision,&originalNightVision,"CPostEffects::ScriptNightVisionSwitch local equipment choice");
+    mem::HookFn(0x701140,&InfraredVision,&originalInfraredVision,"CPostEffects::ScriptInfraredVisionSwitch local equipment choice");
     Net().SetHandler(proto::G_PLAYER_EXTRAS,[](uint8_t from,Reader&r){
         uint8_t op=r.U8();uint32_t time=r.U32();
+        if(op==3){HandleStoryEquipmentEvent(from,r);return;}
         if(op==1){
             PlayerExtrasState state;if(!state.Read(r))return;
             auto&e=extras[from];if(e.received&&(int32_t)(time-e.time)<=0)return;

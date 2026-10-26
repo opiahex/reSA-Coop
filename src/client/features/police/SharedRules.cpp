@@ -1,4 +1,4 @@
-// Police rules apply to nearby participants of the host's story/war, not to
+// Police rules apply to nearby participants of the host's story, not to
 // distant players or their private school activities. Based on upstream 95d336a.
 #include <cmath>
 #include <vector>
@@ -82,7 +82,10 @@ class SharedRules:public Module{
     void OnPostProcess()override{
         if(!Net().Online()||!core::IsPlayerReady())return;
         if(Net().IsHost()){
-            if(NowMs()-sent<750)return;sent=NowMs();Rules r=Capture();r.war=Call<0x443AC0,bool>();r.active=r.war||HostReplicating();
+            // Gang-war immunity is the position-scoped native callback above.
+            // A distant battle must not lend this host's unrelated max-wanted
+            // or ignore-police settings to somebody standing beside the host.
+            if(NowMs()-sent<750)return;sent=NowMs();Rules r=Capture();r.war=Call<0x443AC0,bool>();r.active=HostReplicating();
             Writer w(proto::G_POLICE_RULES);w.U32(++sequence);w.Bool(r.active);w.Bool(r.war);w.U8(r.max);w.U8(r.ignore);w.F32(r.multiplier);Net().Send(proto::CH_RELIABLE,w);return;
         }
         if(remote.active&&Nearby()){if(!applied){own=Capture();applied=true;LOGD("Shared police rules applied war=%d",remote.war);}Apply(remote);}else Restore();

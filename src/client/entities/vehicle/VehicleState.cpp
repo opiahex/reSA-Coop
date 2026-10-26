@@ -82,6 +82,10 @@ void VehicleState::Write(Writer& w) const {
     if(extras & X_ROTOR)w.F32(rotorSpeed);
     if(extras & X_WHEELS)wheels.Write(w);
     w.Bool(train.Valid());if(train.Valid()){train.Write(w);w.Vec(V(trainOffset));trainRotation.Write(w);}
+    w.U32(attachmentRevision);if(attachmentRevision){w.U64(attachmentRun);w.U32(attachmentPhase);}
+    w.Entity(ENTITY_VEHICLE,parentVehicle,ENTITY_USE|ENTITY_OPTIONAL,255,parentGeneration);
+    if(parentVehicle){w.U64(parentGeneration);w.Vec(V(parentOffset));w.Bool(parentUsesEuler);
+        if(parentUsesEuler)w.Vec(V(parentEuler));else parentRotation.Write(w);}
 }
 
 bool VehicleState::Read(Reader& r) {
@@ -109,6 +113,12 @@ bool VehicleState::Read(Reader& r) {
     if(extras & X_ROTOR){r.Raw(&rotorSpeed,4);if(!std::isfinite(rotorSpeed)||rotorSpeed<0||rotorSpeed>5)return false;}
     if((extras & X_WHEELS)&&!wheels.Read(r))return false;
     if(r.Bool()){if(!train.Read(r)||!train.Valid())return false;trainOffset=G(r.Vec());trainRotation.Read(r);if(!(trainOffset.Length()<100))return false;}else train={};
+    attachmentRevision=r.U32();attachmentRun=attachmentRevision?r.U64():0;attachmentPhase=attachmentRevision?r.U32():0;
+    if(attachmentRevision&&!attachmentRun)return false;
+    parentVehicle=r.U16();parentGeneration=0;parentOffset={};parentRotation={};parentUsesEuler=false;parentEuler={};
+    if(parentVehicle){parentGeneration=r.U64();parentOffset=G(r.Vec());parentUsesEuler=r.Bool();
+        if(parentUsesEuler)parentEuler=G(r.Vec());else parentRotation.Read(r);
+        if(!parentGeneration||parentVehicle==0xFFFF||train.Valid()||!(parentOffset.Length()<128.f)||!(parentEuler.Length()<1000.f))return false;}
     return r.Ok();
 }
 

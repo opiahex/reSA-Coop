@@ -1,6 +1,15 @@
 #pragma once
 #include <cstdint>
+#include "common/lib/buffer/Buffer.h"
+#include "shared/game/Game.h"
 namespace coop {
+// Called after the real command by the owned shared SCM interpreter. Equipment
+// selection is an availability boundary, not a copy of the host's active role.
+void ObserveStoryEquipmentCommand(void*script,int opcode,const int32_t*parameters);
+// G_PLAYER_EXTRAS op 3; transport and this reader both validate its authority.
+void HandleStoryEquipmentEvent(uint8_t from,Reader&reader);
+// An explicit local goggles toggle supersedes a borrowed mission effect.
+void ObserveLocalStoryVision();
 // Host story inventory changes are provisional until native mission cleanup
 // confirms which weapons remain. Personal inventory is tracked separately.
 void ApplyStoryMissionWeapon(uint8_t operation,int weapon,int ammo,bool inHand);

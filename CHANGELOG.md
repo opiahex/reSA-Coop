@@ -2,7 +2,43 @@
 
 Первая публикация форка объединяет локальные версии **0.2.6-3p–0.2.24-3p** и перенесённые исправления SA:COOP.
 Это перечень итоговых изменений по подсистемам: промежуточные экспериментальные решения, которые были заменены, отдельными возможностями не считаются.
-Текущая база — **0.2.34-3p, протокол 43**. Все участники и сервер должны обновляться вместе.
+Текущая база — **0.2.35-3p, протокол 44**. Все участники и сервер должны обновляться вместе.
+
+## 0.2.35-3p
+
+### Русский
+
+**Протокол 44: обновите всех игроков и сервер вместе.** Формат личных профилей 7 сохранён. При обновлении сохраняйте настройки, сохранения и `coop/server-data`.
+
+- Исправлены конфликты мест с NPC. Запоздалое решение о посадке больше не возвращает игрока в прежнюю машину после выхода или пересадки.
+- Гость сохраняет управление своей машиной, когда сценарий принимает её в общий миссионный транспорт. Краткое отсутствие водителя на сетевой копии не передаёт машину хосту.
+- Синхронизируются сюжетное крепление машины к другой машине, смена опоры и отсоединение. Запоздалое состояние не возвращает прежнее крепление.
+- При смене владельца NPC короткое ожидание загрузки модели больше не удаляет ожидающего персонажа. Устаревшее ожидание не восстанавливает уже удалённого NPC.
+- Исправлена синхронизация подъёма, загрузки, перевозки и сброса ящиков погрузчиком. Миссионные предметы сохраняют заданную физику, скорости и заморозку и корректно возвращаются к обычной симуляции.
+- Уточнена привязка миссионных ворот и платформ к исходным объектам карты при перемещении, удалении и замене. Удалённый оригинал не подменяет созданную на его месте новую сущность.
+- Исправлен сброс повреждений при сюжетной перезагрузке части карты, включая плантацию. Запоздалое состояние прежней загрузки не повреждает новые объекты.
+- Личные задания медика, полицейского и пожарного защищены от сюжетного переноса, смены роли и перезагрузки мира хоста. Защита личного занятия также учитывает активную танцевальную мини-игру.
+- Сюжетные гонки отделены от личных турниров при определении владельца сценария.
+- Гость получает необходимый сюжетный парашют и тогда, когда у хоста он уже есть. Такая выдача сохраняет выбранное гостем оружие.
+- Сюжетные приборы ночного и теплового видения учитывают личный выбор гостя; его собственный эффект не перезаписывается чужой командой.
+- При обороне территории около гостя вдали от хоста загружаются нужные местность, пути и модели противников. Освобождение от розыска ограничено зоной боя.
+
+### English
+
+**Protocol 44: update every player and the server together.** Personal profile format 7 is unchanged. Preserve settings, saves and `coop/server-data` when updating.
+
+- Fixed seat conflicts with NPCs. A delayed seat decision no longer puts a player back in their previous vehicle after they leave or switch vehicles.
+- Guests retain control of their vehicle when a script adopts it as a mission vehicle. A temporary missing driver on a replica does not transfer the vehicle to the host.
+- Scripted vehicle-to-vehicle attachment, reparenting and detachment are synchronized. Delayed state cannot restore an obsolete attachment.
+- When NPC ownership changes, a short model-loading wait no longer deletes the pending character. An obsolete wait cannot recreate an NPC that has already been removed.
+- Fixed synchronization of forklift crate lifting, loading, transport and dropping. Mission objects retain their assigned physics, velocities and frozen state, and return correctly to normal simulation.
+- Improved matching of mission gates and platforms to their original map objects when moved, deleted or replaced. A deleted original is kept distinct from a new entity created in its place.
+- Fixed damage resets when a script reloads part of the map, including the plantation. Delayed state from the previous load cannot damage newly created objects.
+- Personal Paramedic, Vigilante and Firefighter attempts are protected from the host's story relocations, role changes and world reloads. Personal-activity protection also recognizes an active dance minigame.
+- Story races are distinguished from personal tournaments when determining script ownership.
+- Guests receive a required mission parachute even when the host already has one. This availability grant preserves the guest's selected weapon.
+- Scripted night and thermal vision respect each guest's personal choice instead of overwriting their own effect with another player's command.
+- Territory defense near a guest loads the required terrain, paths and enemy models even when the host is far away. The wanted-level exemption is limited to the battle area.
 
 ## 0.2.34-3p
 

@@ -1,24 +1,40 @@
-# reSA-Coop 0.2.34-3p
+# reSA-Coop 0.2.35-3p
 
-**Готовая сборка / Compiled build: `reSA-Coop-v0.2.34-3p-win32.zip` в Assets / in Assets.**
+**Готовая сборка / Compiled build: `reSA-Coop-v0.2.35-3p-win32.zip` в Assets / in Assets.**
 
 ## Русский
 
-- Исправлена проверка сохранений mission packs, включая используемый DYOM режим: проверяется соответствующий `MPACK…/SCR.SCM`, а не скрипт обычного сюжета. [#2](https://github.com/opiahex/reSA-Coop/issues/2)
-- При загрузке выбирается номер набора из сохранения. Отсутствующий набор, несовместимая структура скриптов и ошибка чтения сообщаются отдельно. Проверка обычного сюжета сохранена.
+**Протокол 44: обновите всех игроков и сервер вместе.** Формат личных профилей 7 сохранён. При обновлении сохраняйте настройки, сохранения и `coop/server-data`.
 
-Исправление касается подключения и загрузки мира. Полное совместное прохождение DYOM-миссий пока не проверено.
-
-Протокол 43, личные профили 7. При обновлении сохраняйте настройки, сохранения и `coop/server-data`.
+- Исправлены конфликты мест с NPC. Запоздалое решение о посадке больше не возвращает игрока в прежнюю машину после выхода или пересадки.
+- Гость сохраняет управление своей машиной, когда сценарий принимает её в общий миссионный транспорт. Краткое отсутствие водителя на сетевой копии не передаёт машину хосту.
+- Синхронизируются сюжетное крепление машины к другой машине, смена опоры и отсоединение. Запоздалое состояние не возвращает прежнее крепление.
+- При смене владельца NPC короткое ожидание загрузки модели больше не удаляет ожидающего персонажа. Устаревшее ожидание не восстанавливает уже удалённого NPC.
+- Исправлена синхронизация подъёма, загрузки, перевозки и сброса ящиков погрузчиком. Миссионные предметы сохраняют заданную физику, скорости и заморозку и корректно возвращаются к обычной симуляции.
+- Уточнена привязка миссионных ворот и платформ к исходным объектам карты при перемещении, удалении и замене. Удалённый оригинал не подменяет созданную на его месте новую сущность.
+- Исправлен сброс повреждений при сюжетной перезагрузке части карты, включая плантацию. Запоздалое состояние прежней загрузки не повреждает новые объекты.
+- Личные задания медика, полицейского и пожарного защищены от сюжетного переноса, смены роли и перезагрузки мира хоста. Защита личного занятия также учитывает активную танцевальную мини-игру.
+- Сюжетные гонки отделены от личных турниров при определении владельца сценария.
+- Гость получает необходимый сюжетный парашют и тогда, когда у хоста он уже есть. Такая выдача сохраняет выбранное гостем оружие.
+- Сюжетные приборы ночного и теплового видения учитывают личный выбор гостя; его собственный эффект не перезаписывается чужой командой.
+- При обороне территории около гостя вдали от хоста загружаются нужные местность, пути и модели противников. Освобождение от розыска ограничено зоной боя.
 
 ## English
 
-- Fixed compatibility checks for native mission-pack saves, including the mode used by DYOM: the matching `MPACK…/SCR.SCM` is checked instead of the base story script. [#2](https://github.com/opiahex/reSA-Coop/issues/2)
-- Loading selects the pack number stored in the save. Missing packs, incompatible script layouts and read failures have separate messages. The base-story check is retained.
+**Protocol 44: update every player and the server together.** Personal profile format 7 is unchanged. Preserve settings, saves and `coop/server-data` when updating.
 
-This change covers joining and loading the world. Complete co-op DYOM mission playthroughs have not been verified.
-
-Protocol 43, personal profiles 7. Preserve settings, saves and `coop/server-data` when updating.
+- Fixed seat conflicts with NPCs. A delayed seat decision no longer puts a player back in their previous vehicle after they leave or switch vehicles.
+- Guests retain control of their vehicle when a script adopts it as a mission vehicle. A temporary missing driver on a replica does not transfer the vehicle to the host.
+- Scripted vehicle-to-vehicle attachment, reparenting and detachment are synchronized. Delayed state cannot restore an obsolete attachment.
+- When NPC ownership changes, a short model-loading wait no longer deletes the pending character. An obsolete wait cannot recreate an NPC that has already been removed.
+- Fixed synchronization of forklift crate lifting, loading, transport and dropping. Mission objects retain their assigned physics, velocities and frozen state, and return correctly to normal simulation.
+- Improved matching of mission gates and platforms to their original map objects when moved, deleted or replaced. A deleted original is kept distinct from a new entity created in its place.
+- Fixed damage resets when a script reloads part of the map, including the plantation. Delayed state from the previous load cannot damage newly created objects.
+- Personal Paramedic, Vigilante and Firefighter attempts are protected from the host's story relocations, role changes and world reloads. Personal-activity protection also recognizes an active dance minigame.
+- Story races are distinguished from personal tournaments when determining script ownership.
+- Guests receive a required mission parachute even when the host already has one. This availability grant preserves the guest's selected weapon.
+- Scripted night and thermal vision respect each guest's personal choice instead of overwriting their own effect with another player's command.
+- Territory defense near a guest loads the required terrain, paths and enemy models even when the host is far away. The wanted-level exemption is limited to the battle area.
 
 ## Установка / Installation
 
@@ -30,4 +46,4 @@ Extract the ZIP beside `gta_sa.exe`. Run `install.bat` if an ASI loader is neede
 
 SA:COOP — [Karimov-Akbar](https://github.com/Karimov-Akbar/sa-coop). Разработка reSA-Coop / reSA-Coop development — [opiahex](https://github.com/opiahex). MIT.
 
-SHA-256 — `SHA256SUMS.txt`. Игровые файлы и личные материалы не включены. / Game files and personal materials are not included.
+SHA-256 — `SHA256SUMS.txt`.

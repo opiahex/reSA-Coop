@@ -23,6 +23,7 @@
 
 #include "features/story/missions/Missions.h"
 #include "shared/api/story-actions/StoryActions.h"
+#include "shared/api/mission-objects/SharedObject.h"
 #include "shared/api/story-scripts/StoryScripts.h"
 #include "shared/api/story-loadout/StoryLoadout.h"
 #include "shared/api/story-coop/StoryCoop.h"
@@ -106,14 +107,9 @@ bool PersonalActivity(void* script) {
         const auto* ip = Field<const uint8_t*>(script, 0x14);
         if (ip && Field<uint16_t>(ip, 0) == 0x03A4 && ip[2] == 9) name = (const char*)ip + 3;
     }
-    static const char* const own[] = {"none", "dual", "shtr", "grav", "otb", "pool2", "lowr", "zero5", "truck", "boat", "blood", "tria", "bcour", "stunt", "oddveh", "taxiodd", "ambulan", "firetru", "copcar", "pimp", "freight", "trainsl",
-        "trace", "hotr", "kicks", "kicksta", "bloodr", "dskool", "bskool", "bschoo", "psch", "desert5", "bikes",
-        "gym", "gymls", "gymsf", "gymlv", "shoot", "shrange", "trucks", "quarry", "quarrys", "burgjb", "valet_l", "mtbiker", "cprace", "bbchal", "barb", "tatto", "blackj", "roulete", "bandit", "vidpok", "wheelo"};
-    static const char*const prefixes[]={"gym","shop","food","pizza","chick","burger","barber","tattoo","wardrob","warrobe","psave","buypro","intman","entext","barguy","barstaf","amunat","browse","car_mod","carmod","vending","fodvend","hotdog","gfdate","gfmeet"};
-    for(auto prefix:prefixes)if(!_strnicmp(name,prefix,strlen(prefix)))return true;
-    for (const char* activity : own) if (!_strnicmp(name, activity, 8)) return true;
-    return false;
+    return IsPersonalActivityScriptName(name,Ref<int32_t>(addr::ScriptSpace+484)==1);
 }
+bool GuestPersonalAttempt(){return Net().Online()&&!Net().IsHost()&&PersonalActivityAttemptActive();}
 
 // Main SCM helpers do not have m_bIsMission set. Ownership comes from the
 // native thread that spawned them, and lasts only for that cooperative run.
@@ -958,9 +954,26 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
                 if (peer.incarnation && CooperativeInventoryParticipant(id)) stripParticipants.push_back({id, peer.incarnation});
         }
     }
+    int attachmentCount=story?(chainOp==0x0550?2:(chainOp==0x0683||chainOp==0x0684)?1:0):0;
+    int32_t attachmentParameters[2]{};
+    if(attachmentCount){
+        alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);uint32_t saved[32];memcpy(saved,(void*)0xA43C78,sizeof saved);
+        CallMethod<0x464080>(copy,attachmentCount);memcpy(attachmentParameters,(void*)0xA43C78,attachmentCount*4);memcpy((void*)0xA43C78,saved,sizeof saved);
+    }
+    int equipmentCount=story?((chainOp==0x08B1||chainOp==0x08B2)?1:chainOp==0x01B9?2:0):0;
+    int32_t equipmentParameters[2]{};
+    if(equipmentCount){
+        alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);uint32_t saved[32];memcpy(saved,(void*)0xA43C78,sizeof saved);
+        CallMethod<0x464080>(copy,equipmentCount);memcpy(equipmentParameters,(void*)0xA43C78,equipmentCount*4);memcpy((void*)0xA43C78,saved,sizeof saved);
+    }
     auto savedSubtitleSetting=Ref<uint8_t>(0xBA678C);int previousPreference=g_storySubtitlePreference;
     if(story){g_storySubtitlePreference=savedSubtitleSetting;Ref<uint8_t>(0xBA678C)=1;}
     auto result=g_objectCommands[Group](script,edx,opcode);
+    if(attachmentCount){
+        if(chainOp==0x0550)RecordStoryObjectFreeze(attachmentParameters[0],attachmentParameters[1]!=0);
+        else if(auto*car=GetVehicle(attachmentParameters[0]))Vehicles::Instance().ShareScriptAttachment(car,chainOp==0x0683);
+    }
+    if(equipmentCount)ObserveStoryEquipmentCommand(script,chainOp,equipmentParameters);
     if(story){Ref<uint8_t>(0xBA678C)=savedSubtitleSetting;g_storySubtitlePreference=previousPreference;}
     if (stripRun && stripRun == StoryRunId() && stripWorld == Net().WorldEpoch() && stripPhase == CooperativeStoryPhase()) {
         // Native loss is permanent. Retire role snapshots before issuing the
@@ -1203,7 +1216,7 @@ using TextGetFn=const char*(__fastcall*)(void*,void*,const char*);TextGetFn g_or
 const char*__fastcall SharedTextGet(void*self,void*edx,const char*key){
     // Script code keeps its own table. Only the remote on-screen counters use
     // the host table, looked up by the native game at display time.
-    if((uintptr_t)self==kTheText&&Net().Online()&&!Net().IsHost()&&!CurrentScript()&&((g_onscreenSet&&NowMs()>=g_localActivityUntil)||CutsceneRunning())&&key){
+    if((uintptr_t)self==kTheText&&Net().Online()&&!Net().IsHost()&&!CurrentScript()&&((g_onscreenSet&&NowMs()>=g_localActivityUntil)||CutsceneRunning())&&key&&!GuestPersonalAttempt()){
         const auto&keys=TranslatedTable(CutsceneRunning()&&!g_cutsceneTextTable.empty()?g_cutsceneTextTable:g_sharedMissionTable);
         // CKeyGen::GetUppercaseKey uses GTA's CRC32, not std::hash.
         auto hash=Call<0x53CF30,uint32_t>(key);auto i=keys.find(hash);if(i!=keys.end())return i->second.c_str();
@@ -1359,6 +1372,7 @@ void HandleText(uint8_t from, Reader& r) {
     bool subtitle=r.Bool();int slot=r.I8();auto token=r.U32();auto insert=r.Str(399);auto insertHash=r.U32();auto insertTable=r.Str(8);
     auto to=r.U8();if(to!=proto::kServerId&&to!=Net().MyId())return;
     if (!r.Ok() || from != Net().HostId() || Net().IsHost() || !core::IsPlayerReady() || !flow::InHostWorld()) return;
+    if(GuestPersonalAttempt())return;
     if(subtitle&&!SubtitlesEnabled())return;
     if(subtitle&&SubtitleWaiting(slot,token,time)){
         auto deadline=g_replayingSubtitleDeadline?g_replayingSubtitleDeadline:NowMs()+15000;
@@ -1933,9 +1947,9 @@ void HandleCutscene(uint8_t from, Reader& r) {
         if (g_csState != 0) PartnerClearCutscene();
         auto* me = FindPlayerPed(0);
         int type = me->VehicleIfIn() ? me->VehicleIfIn()->VehicleSubClass() : -1;
-        g_sceneBypassed = type == VEHICLE_TYPE_HELI || type == VEHICLE_TYPE_PLANE || type == VEHICLE_TYPE_BOAT ||
+        g_sceneBypassed = GuestPersonalAttempt() || type == VEHICLE_TYPE_HELI || type == VEHICLE_TYPE_PLANE || type == VEHICLE_TYPE_BOAT ||
                           type == VEHICLE_TYPE_FHELI || type == VEHICLE_TYPE_FPLANE;
-        if (type < 0 && !me->AttachedTo()) {
+        if (!g_sceneBypassed && type < 0 && !me->AttachedTo()) {
             // Standing is unset after a scene or a fresh spawn, even on a
             // loaded floor. Preserve actual flight/swimming, not that bit.
             bool found = false;
@@ -1948,7 +1962,7 @@ void HandleCutscene(uint8_t from, Reader& r) {
                           (me->Intelligence() && CallMethod<0x601110, void*>(me->Intelligence())));
             g_sceneBypassed = airborne || flying || anim::FindTask(me, 1304);
         }
-        if(g_sceneBypassed){SendCutscene(CS_READY,"",0,Net().HostId());LOGI("Host cutscene bypassed: player in air/on water");return;}
+        if(g_sceneBypassed){SendCutscene(CS_READY,"",0,Net().HostId());LOGI("Host cutscene bypassed: personal attempt=%d player in air/on water",GuestPersonalAttempt());return;}
         LOGI("Host cutscene %s: loading here", name.c_str());
         // the loading sets us out of a vehicle (CCutsceneMgr::LoadCutsceneData_preload): we get back in afterwards
         if (CPlayerPed* me = FindPlayerPed(0); me->InVehicle() && me->Vehicle() && g_csCar < 0) {
@@ -2057,7 +2071,7 @@ AudioTarget g_hostAudioTarget[4];
 std::map<uint32_t, AudioTarget> g_audioTargets[4];
 bool g_applyingAudio=false;
 bool SharedAudioSlot(uint8_t slot) {
-    return !g_applyingAudio && Net().Online() && !Net().IsHost() && slot<4 && !g_audioSlots[slot].clips.empty() &&
+    return !g_applyingAudio && Net().Online() && !Net().IsHost() && !GuestPersonalAttempt() && slot<4 && !g_audioSlots[slot].clips.empty() &&
         (g_csState!=0||(!PersonalActivity(g_currentScript)&&NowMs()>=g_localActivityUntil));
 }
 uint32_t g_hostAudioToken[4] = {};
@@ -2185,6 +2199,7 @@ void HandleMissionAudio(uint8_t from, Reader& r) {
         return;
     }
     if(!flow::InHostWorld())return;
+    if(GuestPersonalAttempt()){if(event>=0&&event<100000)AudioReceipt(slot,token,event,6);return;}
     if (event >= 0 && event < 100000) {
         g_audioSlots[slot].Receive(op, event, token, NowMs());
         if(op==2)AudioReceipt(slot,token,event,0);
@@ -2193,7 +2208,7 @@ void HandleMissionAudio(uint8_t from, Reader& r) {
     }
 }
 void UpdateMissionAudio() {
-    if(g_csState==0&&NowMs()<g_localActivityUntil)return;
+    if(GuestPersonalAttempt()||(g_csState==0&&NowMs()<g_localActivityUntil))return;
     g_applyingAudio=true;
     auto pending = std::move(g_pendingAudio);
     g_pendingAudio.clear();
@@ -2335,6 +2350,7 @@ void HandleStoryWarp(uint8_t from,Reader&r){
     if(!r.Ok()||(target!=255&&target!=Net().MyId())||from!=Net().HostId()||Net().IsHost()||!next.run||next.run!=StoryRunId()||!next.phase||next.phase<CooperativeStoryPhase()||next.flags>3||!next.sequence||(int32_t)(next.sequence-g_storyWarpLatest)<=0||
        !std::isfinite(p.x)||!std::isfinite(p.y)||!std::isfinite(p.z)||std::fabs(p.x)>20000||std::fabs(p.y)>20000||std::fabs(p.z)>5000||!std::isfinite(next.heading))return;
     AdoptCooperativeStoryPhase(next.run,next.phase);
+    if(GuestPersonalAttempt()){g_storyWarpLatest=next.sequence;g_storyWarp={};ReleaseStoryWarpHold();return;}
     g_storyWarpLatest=next.sequence;next.position={p.x,p.y,p.z};next.pending=true;next.world=Net().WorldEpoch();next.received=NowMs();next.refs=Net().EntityContext();g_storyWarp=std::move(next);SetLocalStoryTransitionPending(true);
 }
 void SendMissionEnd(uint64_t run, uint32_t phase) {
@@ -2374,6 +2390,7 @@ bool StoryWarpFootSpot(const StoryWarp&next,CPlayerPed*me,CVector&out,bool&water
 }
 void ApplyStoryWarp(){
     if(!g_storyWarp.pending)return;
+    if(GuestPersonalAttempt()){g_storyWarp={};ReleaseStoryWarpHold();return;}
     const auto activeRun = StoryRunId();
     bool current = g_storyWarp.run == activeRun && g_storyWarp.phase >= CooperativeStoryPhase();
     // The inactive role snapshot and the mission-end packet can arrive in the
@@ -2469,15 +2486,16 @@ void HandleGameEvent(uint8_t from, Reader& input) {
     if (!r.Ok() || !core::IsPlayerReady() || g_csState != 0) return;
     if (g_cameraLatest && (int32_t)(c.time - g_cameraLatest) < 0) return;
     g_cameraLatest = c.time;
+    if(GuestPersonalAttempt())return;
     c.recv = NowMs(); g_scriptCamera = c;
     if (!c.active) StopScriptCamera();
-    if(!c.active&&g_sharedControlsPending&&NowMs()>=g_localActivityUntil&&!g_warpHolding&&g_csState==0){
+    if(!c.active&&g_sharedControlsPending&&!GuestPersonalAttempt()&&NowMs()>=g_localActivityUntil&&!g_warpHolding&&g_csState==0){
         GetPad(0)->DisablePlayerControls=(GetPad(0)->DisablePlayerControls&~0xA1u)|(c.controls&0xA1u);
         if(!(c.controls&0xA1u))g_sharedControlsPending=false;
     }
 }
 void UpdateScriptCamera() {
-    if(NowMs()<g_localActivityUntil)return;
+    if(GuestPersonalAttempt()||NowMs()<g_localActivityUntil)return;
     auto& c = g_scriptCamera;
     if (StoryRoleOwnsCamera() || !c.active || NowMs() - c.recv > 2000 || g_csState != 0) return StopScriptCamera();
     if (!g_cameraApplied) {
@@ -2717,7 +2735,7 @@ void HandleScreen(uint8_t from, Reader& r) {
     uint8_t flags = r.U8();
     float duration = r.F32();uint32_t generation=r.U32();
     if (!flow::InHostWorld() || !r.Ok() || from != Net().HostId() || Net().IsHost() || !core::IsPlayerReady()) return;
-    if(g_sceneBypassed||NowMs()<g_localActivityUntil)return;
+    if(g_sceneBypassed||GuestPersonalAttempt()||NowMs()<g_localActivityUntil)return;
     if((int32_t)(generation-g_receivedScreenGeneration)<0)return;
     if(generation!=g_receivedScreenGeneration){g_receivedScreenGeneration=generation;g_blackSince=0;g_blackExpired=false;}
     g_screenReceived = NowMs();
@@ -2756,7 +2774,7 @@ std::array<int32_t,5>g_partnerTimerValues{};
 using TimerFn=void(__fastcall*)(void*,void*);
 TimerFn g_originalTimerProcess=nullptr,g_originalTimerDisplay=nullptr;
 void TimerWithHostValues(TimerFn original,void*self,void*edx,bool tick){
-    if(!g_onscreenSet||Net().IsHost()||!flow::InHostWorld()||NowMs()<g_localActivityUntil){original(self,edx);return;}
+    if(!g_onscreenSet||Net().IsHost()||!flow::InHostWorld()||GuestPersonalAttempt()||NowMs()<g_localActivityUntil){original(self,edx);return;}
     std::array<uint32_t,5>offsets{};offsets[0]=Ref<uint32_t>(kOnscreenTimer);
     for(size_t i=0;i<4;++i)offsets[i+1]=Ref<uint32_t>(kOnscreenTimer+0x40+i*0x44);
     auto values = g_partnerTimerValues;
@@ -2769,7 +2787,7 @@ void TimerWithHostValues(TimerFn original,void*self,void*edx,bool tick){
         for (size_t i = 0; i < values.size(); ++i) if (personal[i]) g_partnerTimerValues[i] = old[i];
     }
 }
-void __fastcall SharedTimerProcess(void*self,void*edx){if(CooperativeStageWaiting())return;TimerWithHostValues(g_originalTimerProcess,self,edx,true);}
+void __fastcall SharedTimerProcess(void*self,void*edx){if(!GuestPersonalAttempt()&&CooperativeStageWaiting())return;TimerWithHostValues(g_originalTimerProcess,self,edx,true);}
 void __fastcall SharedTimerDisplay(void*self,void*edx){TimerWithHostValues(g_originalTimerDisplay,self,edx,false);}
 
 void HostSendOnscreen() {
@@ -2799,7 +2817,7 @@ void HandleOnscreen(uint8_t from, Reader& r) {
     for (int32_t& v : values) v = r.I32();
     std::string table = r.Str(8);
     if (!flow::InHostWorld() || !r.Ok() || block.size() != kOnscreenSize || from != Net().HostId() || Net().IsHost() || !core::IsPlayerReady()) return;
-    if(NowMs()<g_localActivityUntil)return;
+    if(GuestPersonalAttempt()||NowMs()<g_localActivityUntil)return;
     UseMissionTable(table);
     uint8_t* b = block.data();
     g_partnerTimerValues[0]=values[0];
@@ -2815,6 +2833,7 @@ void HandleOnscreen(uint8_t from, Reader& r) {
 
 void ClearPartnerOnscreen() {
     if (!g_onscreenSet) return;
+    if(GuestPersonalAttempt()){g_onscreenSet=false;return;}
     // the display flags come back every frame while a variable is set (COnscreenTimer::ProcessForDisplay), and the
     // host's mission clears its counters in its last frame, which never reached us
     CallMethod<0x44CBC0>((void*)kOnscreenTimer);  // COnscreenTimer::Init
@@ -2849,9 +2868,11 @@ void PartnerMissionCleanup() {
     ClearPartnerOnscreen();
     if (g_csState == 2) PartnerEndCutscene();
     if (g_csState != 0) PartnerClearCutscene();
-    RestoreSceneHud();
-    if (g_weFaded && Darkening()) Fade(0.5f, 1);
-    if (g_weWide) SetWideScreen(false);
+    if(!GuestPersonalAttempt()){
+        RestoreSceneHud();
+        if (g_weFaded && Darkening()) Fade(0.5f, 1);
+        if (g_weWide) SetWideScreen(false);
+    }else g_savedHud=false;
     g_weFaded = g_weWide = false;
 }
 
@@ -3338,6 +3359,7 @@ private:
         else if(!withoutScene)withoutScene=NowMs();
         else if(NowMs()-withoutScene>3000)SkipVote(Net().MyId(),true);
         ApplyStoryWarp();
+        if(GuestPersonalAttempt())return;
         UpdateScriptCamera();
         UpdateMissionAudio();
         if (g_csState == 0 && ((g_blackSince && NowMs() - g_blackSince > 8000) ||
@@ -3439,7 +3461,7 @@ bool LocalSchoolActivity() {
 }
 
 bool LocalStoryPresentationBlocked() {
-    return g_personalFlag||LocalSchoolActivity()||NowMs()<g_localActivityUntil||PersonalActivity(g_currentScript);
+    return GuestPersonalAttempt()||g_personalFlag||LocalSchoolActivity()||NowMs()<g_localActivityUntil||PersonalActivity(g_currentScript);
 }
 
 void* CurrentScript() { return g_currentScript; }
