@@ -20,6 +20,10 @@ bool applying=false;
 int nativeTrack=-1;
 uint32_t trackToken=0, receivedToken=0;
 bool trackPlaying=false;
+constexpr uintptr_t kCutsceneTrackManager=0x8AE554;
+// CAECutsceneTrackManager keeps the playing track id at +0x24, followed by
+// the playback clock at +0x28. A track id (e.g. INTRO1A's 703) is not a time.
+int32_t TrackPlaybackTime(){return Ref<int32_t>(kCutsceneTrackManager+0x28);}
 struct Sound{int event=0;AudioTarget target;float volume=0,speed=1;uint64_t received=0;};
 std::deque<Sound> pending;
 std::vector<uint8_t> pendingTrack;
@@ -34,7 +38,7 @@ void __fastcall ScriptSound(void* audio,void* edx,int event,CVector* pos,CPhysic
     originalSound(audio,edx,event,pos,entity,volume,speed);
 }
 void SendTrack(uint8_t op,uint8_t to=proto::kServerId) {
-    Writer w(proto::G_SCRIPT_SOUND);w.U8(op);w.U32(++controlSequence);w.U32(trackToken);w.I16((int16_t)nativeTrack);w.U8(to);w.U32(trackPlaying?(uint32_t)std::max(0,Ref<int32_t>(0x8AE554+0x24)):0);
+    Writer w(proto::G_SCRIPT_SOUND);w.U8(op);w.U32(++controlSequence);w.U32(trackToken);w.I16((int16_t)nativeTrack);w.U8(to);w.U32(trackPlaying?(uint32_t)std::max(0,TrackPlaybackTime()):0);
     Net().Send(proto::CH_RELIABLE,w);
 }
 void __fastcall LoadTrack(void* audio,void* edx,int16_t track,bool wait) {
@@ -120,8 +124,13 @@ struct Register{Register(){core::RegisterModule(&sounds);}} registration;
 }
 void AlignSharedSoundtrack(uint32_t milliseconds,bool hard){
     if(Net().IsHost()||nativeTrack<0||!trackPlaying||NowMs()-lastAlignment<3000)return;
-    int actual=Ref<int32_t>(0x8AE554+0x24);
-    if(!hard&&(actual<0||std::abs((int64_t)actual-(int64_t)milliseconds)<600))return;
+    int actual=TrackPlaybackTime();
+    // Loading/stopping clocks are negative native status values. Do not start
+    // another preload while that operation is still in progress: even the
+    // native non-waiting preload waits synchronously for the old stream to stop.
+    if(actual<0||Ref<int32_t>(kCutsceneTrackManager+8)!=3||
+       Ref<int32_t>(kCutsceneTrackManager+0x24)!=nativeTrack)return;
+    if(!hard&&std::abs((int64_t)actual-(int64_t)milliseconds)<600)return;
     lastAlignment=NowMs();applying=true;LoadTrack((void*)0xB6BC90,nullptr,(int16_t)nativeTrack,false);
     Ref<uint32_t>(0x8AE554+0x14)=milliseconds;originalPlay((void*)0xB6BC90,nullptr);trackPlaying=true;applying=false;
     LOGI("Shared soundtrack aligned offset=%u previous=%d",milliseconds,actual);

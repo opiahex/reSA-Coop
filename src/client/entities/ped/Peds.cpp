@@ -1527,7 +1527,12 @@ void Peds::OnPreProcess() {
             (n.state.flags&PedSyncState::F_IN_VEHICLE)&&n.state.seat<0?1:0;
         if(n.owner!=Net().MyId()&&!IsAlive(n)){
             n.spawnWait.Block("ped",id,"queued",priority);
-            if(IsPedModel(n.model)&&!IsModelLoaded(n.model))RequestSharedModel(n.model,priority>0);
+            // Special actor numbers are slots local to their owner. A slot
+            // such as 299 has no archive location here until the received name
+            // is resolved; prefetching the foreign number bypasses SpawnMirror
+            // and can send the native streamer into an invalid file retry.
+            if(n.model>=kSpecialFirst&&n.model<=kSpecialLast)SpecialModelFor(n.special);
+            else if(IsPedModel(n.model)&&!IsModelLoaded(n.model))RequestSharedModel(n.model,priority>0);
         }
         float age=n.spawnWait.since?std::min(10000.f,(NowMs()-n.spawnWait.since)*.05f):0;
         order.push_back({(n.state.pos-focus).Length()-priority*10000.f-age,id});

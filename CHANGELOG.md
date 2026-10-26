@@ -2,7 +2,27 @@
 
 Первая публикация форка объединяет локальные версии **0.2.6-3p–0.2.24-3p** и перенесённые исправления SA:COOP.
 Это перечень итоговых изменений по подсистемам: промежуточные экспериментальные решения, которые были заменены, отдельными возможностями не считаются.
-Текущая база — **0.2.32-3p, протокол 43**. Все участники и сервер должны обновляться вместе.
+Текущая база — **0.2.33-3p, протокол 43**. Все участники и сервер должны обновляться вместе.
+
+## 0.2.33-3p
+
+### Русский
+
+Протокол 43 и формат личных профилей 7 сохранены.
+
+- Исправлено зависание гостей после пропуска или завершения катсцены. Специальные модели сюжетных NPC загружаются по имени; пустой локальный слот больше не вызывает бесконечный повтор чтения в GTA. Это также применяется при подключении к уже начатой миссии.
+- Исправлен конфликт перехватов сюжетных команд с модами, которые используют один общий обработчик SCM. Каждый диапазон команд сохраняет свою цепочку обработки.
+- Исправлена сверка времени сюжетной музыки: номер трека больше не принимается за время воспроизведения. Убраны вызванные этим повторные перезагрузки звука.
+- Сверка игровых файлов использует путь запущенного EXE, включая переименованный файл. Невозможность чтения отмечается отдельно от настоящего различия сборок; проверка CRC и отсутствующих файлов сохраняется.
+
+### English
+
+Protocol 43 and personal profile format 7 are unchanged.
+
+- Fixed guests hanging after cutscenes are skipped or end. Special story NPC models are resolved by name before loading, preventing an unbound local slot from entering GTA's endless file-read retry. This also applies when joining an ongoing mission.
+- Fixed story-command hook conflicts with mods that share one SCM dispatcher. Each command range retains its own dispatch chain.
+- Fixed story soundtrack time comparison: the track ID is no longer treated as playback time, preventing unnecessary audio reloads.
+- Simulation-file comparison uses the running executable's actual path, including renamed files. Read failures are reported separately from confirmed differences; CRC and missing-file checks remain active.
 
 ## 0.2.32-3p
 

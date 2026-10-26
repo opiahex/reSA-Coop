@@ -19,17 +19,59 @@ namespace coop {namespace {
 struct Digest{std::string name;uint8_t status=0;uint32_t crc=0;uint64_t size=0;};
 using List=std::vector<Digest>;
 std::atomic<bool> cancel=false;
-Digest Hash(const std::filesystem::path&root,const std::string&name){
- Digest d;d.name=name;std::error_code ec;auto p=root/std::filesystem::path(Utf8ToWide(name));
- if(!std::filesystem::exists(p,ec))return d;
- auto stamp=std::filesystem::last_write_time(p,ec);std::ifstream f(p,std::ios::binary);if(!f){d.status=2;return d;}
- std::array<char,65536>b;d.status=1;
- while(f&&!cancel){f.read(b.data(),b.size());auto n=f.gcount();if(n>0){d.size+=n;d.crc=Crc32(b.data(),(size_t)n,d.crc);}Sleep(1);}
- if(cancel||(!f.eof()&&f.fail())||std::filesystem::last_write_time(p,ec)!=stamp)d.status=2;
+std::filesystem::path ExecutablePath(){
+ std::vector<wchar_t> path(MAX_PATH);
+ for(;;){
+  DWORD n=GetModuleFileNameW(nullptr,path.data(),(DWORD)path.size());
+  if(!n){LOGW("Simulation executable path unavailable: error=%lu",GetLastError());return {};}
+  if(n<path.size())return std::filesystem::path(std::wstring(path.data(),n));
+  if(path.size()>=32768){LOGW("Simulation executable path exceeds Windows path limit");return {};}
+  path.resize(std::min<size_t>(path.size()*2,32768));
+ }
+}
+Digest HashFile(const std::filesystem::path&p,const std::string&name){
+ Digest d;d.name=name;
+ if(p.empty()){d.status=2;return d;}
+ HANDLE file=CreateFileW(p.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_SEQUENTIAL_SCAN,nullptr);
+ if(file==INVALID_HANDLE_VALUE){
+  DWORD error=GetLastError();
+  // A running image may have a different filename, or may have been moved after
+  // launch. Failure to read it is not evidence of different executable bytes.
+  d.status=name=="gta_sa.exe"||(error!=ERROR_FILE_NOT_FOUND&&error!=ERROR_PATH_NOT_FOUND)?2:0;
+  LOGW("Simulation file scan unavailable: file=%s status=%u error=%lu",name.c_str(),d.status,error);return d;
+ }
+ BY_HANDLE_FILE_INFORMATION before{},after{};
+ bool ok=GetFileInformationByHandle(file,&before)!=FALSE;
+ DWORD error=ok?ERROR_SUCCESS:GetLastError();std::array<char,65536>b;
+ while(ok&&!cancel){
+  DWORD n=0;if(!ReadFile(file,b.data(),(DWORD)b.size(),&n,nullptr)){error=GetLastError();ok=false;break;}
+  if(!n)break;
+  d.size+=n;d.crc=Crc32(b.data(),n,d.crc);Sleep(1);
+ }
+ if(ok&&!GetFileInformationByHandle(file,&after)){error=GetLastError();ok=false;}
+ if(ok&&(before.nFileSizeHigh!=after.nFileSizeHigh||before.nFileSizeLow!=after.nFileSizeLow||
+    CompareFileTime(&before.ftLastWriteTime,&after.ftLastWriteTime)!=0||
+    d.size!=(((uint64_t)before.nFileSizeHigh<<32)|before.nFileSizeLow))){error=ERROR_FILE_INVALID;ok=false;}
+ if(cancel){error=ERROR_OPERATION_ABORTED;ok=false;}
+ CloseHandle(file);d.status=ok?1:2;
+ if(!ok)LOGW("Simulation file scan incomplete: file=%s bytes=%llu error=%lu",name.c_str(),(unsigned long long)d.size,error);
  return d;
 }
+Digest Hash(const std::filesystem::path&root,const std::string&name){
+ return HashFile(root/std::filesystem::path(Utf8ToWide(name)),name);
+}
+enum class Match{Equal,Different,Unknown};
+Match CompareDigest(const Digest*a,const Digest*b){
+ if(!a||!b||a->status==2||b->status==2)return Match::Unknown;
+ if((a->name=="gta_sa.exe"||b->name=="gta_sa.exe")&&(a->status!=1||b->status!=1))return Match::Unknown;
+ if(a->status!=b->status)return Match::Different;
+ return a->status==1&&(a->crc!=b->crc||a->size!=b->size)?Match::Different:Match::Equal;
+}
 Digest ImageCollision(const std::filesystem::path&root,const std::string&name){
- Digest d;d.name=name+" (*.col)";std::ifstream f(root/std::filesystem::path(Utf8ToWide(name)),std::ios::binary);if(!f)return d;
+ Digest d;d.name=name+" (*.col)";auto p=root/std::filesystem::path(Utf8ToWide(name));std::ifstream f(p,std::ios::binary);
+ if(!f){DWORD attributes=GetFileAttributesW(p.c_str());DWORD error=attributes==INVALID_FILE_ATTRIBUTES?GetLastError():ERROR_SUCCESS;
+  d.status=attributes==INVALID_FILE_ATTRIBUTES&&(error==ERROR_FILE_NOT_FOUND||error==ERROR_PATH_NOT_FOUND)?0:2;
+  LOGW("Simulation collision archive unavailable: file=%s status=%u",name.c_str(),d.status);return d;}
  uint32_t magic=0,count=0;f.read((char*)&magic,4);f.read((char*)&count,4);
  if(magic!=0x32524556||count>100000){d.status=2;return d;}
  struct Entry{uint32_t sector;uint16_t streaming,archive;char name[24];};std::vector<Entry> entries(count);
@@ -43,16 +85,20 @@ Digest ImageCollision(const std::filesystem::path&root,const std::string&name){
  return d;
 }
 class SimulationFiles:public Module{
- std::future<List> worker;List files;std::map<uint8_t,List> remote;std::map<uint8_t,uint32_t> warned;bool started=false,send=true;uint64_t last=0;
+ std::future<List> worker;List files;std::map<uint8_t,List> remote;std::map<uint8_t,uint32_t> warned,uncheckedWarned;bool started=false,send=true;uint64_t last=0;
  const char*Name()const override{return "SimulationFiles";}
  void Compare(uint8_t from){
-  if(files.empty()||!remote.count(from))return;int bad=0;uint32_t fingerprint=0;
+  if(files.empty()||!remote.count(from))return;int bad=0,unknown=0;uint32_t fingerprint=0,unchecked=0;
   for(auto&a:files){auto&list=remote[from];auto i=std::find_if(list.begin(),list.end(),[&](auto&b){return a.name==b.name;});
-   if(i==list.end()||a.status!=i->status||(a.status==1&&(a.crc!=i->crc||a.size!=i->size))){++bad;fingerprint=Crc32(a.name.data(),a.name.size(),fingerprint);if(i!=list.end())fingerprint=Crc32(&i->crc,sizeof(i->crc),fingerprint);LOGW("Simulation file differs: peer=%u file=%s local=%u/%llu/%08X remote=%u/%llu/%08X",from,a.name.c_str(),a.status,(unsigned long long)a.size,a.crc,i==list.end()?255:i->status,i==list.end()?0:(unsigned long long)i->size,i==list.end()?0:i->crc);}}
-  for(auto&b:remote[from])if(std::none_of(files.begin(),files.end(),[&](auto&a){return a.name==b.name;})){++bad;fingerprint=Crc32(b.name.data(),b.name.size(),fingerprint);LOGW("Simulation file only on peer %u: %s",from,b.name.c_str());}
-  LOGI("Simulation file comparison: peer=%u entries=%u differences=%d",from,(unsigned)files.size(),bad);
+   Match match=CompareDigest(&a,i==list.end()?nullptr:&*i);
+   if(match==Match::Unknown){++unknown;unchecked=Crc32(a.name.data(),a.name.size(),unchecked);LOGW("Simulation file comparison unavailable: peer=%u file=%s local_status=%u remote_status=%u",from,a.name.c_str(),a.status,i==list.end()?255:i->status);}
+   else if(match==Match::Different){++bad;fingerprint=Crc32(a.name.data(),a.name.size(),fingerprint);if(i!=list.end())fingerprint=Crc32(&i->crc,sizeof(i->crc),fingerprint);LOGW("Simulation file differs: peer=%u file=%s local=%u/%llu/%08X remote=%u/%llu/%08X",from,a.name.c_str(),a.status,(unsigned long long)a.size,a.crc,i==list.end()?255:i->status,i==list.end()?0:(unsigned long long)i->size,i==list.end()?0:i->crc);}}
+  for(auto&b:remote[from])if(std::none_of(files.begin(),files.end(),[&](auto&a){return a.name==b.name;})){++unknown;unchecked=Crc32(b.name.data(),b.name.size(),unchecked);LOGW("Simulation file not included in local comparison: peer=%u file=%s",from,b.name.c_str());}
+  LOGI("Simulation file comparison: peer=%u entries=%u differences=%d unchecked=%d",from,(unsigned)files.size(),bad,unknown);
   if(bad&&(!warned.count(from)||warned[from]!=fingerprint)){warned[from]=fingerprint;ui::TheChat().AddSystem(Format(TR("Игровые файлы отличаются у %s (%d). Подробности: coop.log.","Simulation files differ with %s (%d). See coop.log."),Net().PeerName(from).c_str(),bad));}
   if(!bad)warned.erase(from);
+  if(unknown&&(!uncheckedWarned.count(from)||uncheckedWarned[from]!=unchecked)){uncheckedWarned[from]=unchecked;ui::TheChat().AddSystem(Format(TR("Не удалось полностью сверить игровые файлы с %s (%d). Подробности: coop.log.","Could not fully compare simulation files with %s (%d). See coop.log."),Net().PeerName(from).c_str(),unknown));}
+  if(!unknown)uncheckedWarned.erase(from);
  }
  void OnInstallHooks()override{
   Net().SetHandler(proto::G_SIM_FILES,[](uint8_t from,Reader&r){auto&self=Instance();List list;int count=r.U8();if(count>40)return;
@@ -62,9 +108,9 @@ class SimulationFiles:public Module{
  }
  void OnPostProcess()override{
   if(!Net().Online())return;
-  if(!started){started=true;cancel=false;auto root=std::filesystem::path(ModuleDir(nullptr));
-   worker=std::async(std::launch::async,[root]{SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);List out;
-    for(const char*n:{"gta_sa.exe","data/script/main.scm","data/script/script.img","data/handling.cfg","data/weapon.dat","data/vehicles.ide","data/peds.ide","data/pedstats.dat","data/surface.dat","data/surfinfo.dat","data/default.dat","data/gta.dat"}){if(cancel)break;out.push_back(Hash(root,n));}
+  if(!started){started=true;cancel=false;auto root=std::filesystem::path(ModuleDir(nullptr));auto executable=ExecutablePath();
+   worker=std::async(std::launch::async,[root,executable]{SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);List out;
+    for(const char*n:{"gta_sa.exe","data/script/main.scm","data/script/script.img","data/handling.cfg","data/weapon.dat","data/vehicles.ide","data/peds.ide","data/pedstats.dat","data/surface.dat","data/surfinfo.dat","data/default.dat","data/gta.dat"}){if(cancel)break;out.push_back(std::string_view(n)=="gta_sa.exe"?HashFile(executable,n):Hash(root,n));}
     std::error_code ec;std::vector<std::string> cols;for(std::filesystem::recursive_directory_iterator i(root/"models/coll",ec),end;!ec&&i!=end;i.increment(ec))if(i->is_regular_file(ec)&&ToLower(i->path().extension().string())==".col")cols.push_back(i->path().lexically_relative(root).generic_string());
     std::sort(cols.begin(),cols.end());for(auto&n:cols)if(!cancel&&out.size()<37)out.push_back(Hash(root,n));
     if(!cancel)out.push_back(ImageCollision(root,"models/gta3.img"));if(!cancel)out.push_back(ImageCollision(root,"models/gta_int.img"));return out;
@@ -79,8 +125,8 @@ class SimulationFiles:public Module{
   }
  }
  void OnPeerJoin(uint8_t)override{send=true;}
- void OnPeerLeave(uint8_t id)override{remote.erase(id);warned.erase(id);}
- void OnSessionEnd()override{remote.clear();warned.clear();send=true;}
+ void OnPeerLeave(uint8_t id)override{remote.erase(id);warned.erase(id);uncheckedWarned.erase(id);}
+ void OnSessionEnd()override{remote.clear();warned.clear();uncheckedWarned.clear();send=true;}
 public:static SimulationFiles&Instance(){static auto*s=new SimulationFiles;return *s;}
 };
 struct Reg{Reg(){core::RegisterModule(&SimulationFiles::Instance());}}reg;

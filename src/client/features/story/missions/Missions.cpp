@@ -2974,11 +2974,12 @@ public:
         mem::HookFn(0x469F00, &HookScriptProcess, &g_origScriptProcess, "CRunningScript::Process");
         mem::HookFn(0x582300,&GymCreateMenu,&g_origCreateMenu,"CMenuSystem::CreateNewMenu (gym opening key)");
         mem::HookFn(0x580750,&GymDeleteMenu,&g_origDeleteMenu,"CMenuSystem::SwitchOffMenu (gym ownership)");
-        // Process() inlines ProcessOneCommand in the original exe. Both paths
-        // dispatch through the same opcode-range handler, so hook that handler.
-        mem::HookFn(Ref<uintptr_t>(0x8A6168+1*4),&HookCommands100,&g_origCommands100,"CRunningScript::ProcessCommands100To199");
-        mem::HookFn(Ref<uintptr_t>(0x8A6168+5*4),&HookCommands500,&g_origCommands500,"CRunningScript::ProcessCommands500To599");
-        mem::HookFn(Ref<uintptr_t>(0x8A6168 + 2 * 4), &HookCommands200, &g_origCommands200, "CRunningScript::ProcessCommands200To299");
+        // Both native execution paths dispatch through this table. CLEO can
+        // point several ranges at one dispatcher: wrap the slots separately
+        // instead of installing conflicting inline hooks on that shared code.
+        g_origCommands100=Ref<CommandsFn>(0x8A6168+1*4);mem::Put(0x8A6168+1*4,&HookCommands100);
+        g_origCommands500=Ref<CommandsFn>(0x8A6168+5*4);mem::Put(0x8A6168+5*4,&HookCommands500);
+        g_origCommands200=Ref<CommandsFn>(0x8A6168+2*4);mem::Put(0x8A6168+2*4,&HookCommands200);
         InstallStoryObjectCommands();
         mem::RedirectCallFn(0x484361, &HookScriptClearArea, &g_origClearArea);  // CLEAR_AREA (opcode 0395)
         mem::HookFn(0x609590, &HookCanPlayerStartMission, &g_origCanStart, "CPlayerPed::CanPlayerStartMission");
