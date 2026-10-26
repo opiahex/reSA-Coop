@@ -23,6 +23,29 @@ namespace coop::patches {
 
 namespace {
 
+// The protected 1.0 US executable uses instruction bytes as a key for AddGlass's
+// camera-pointer decoder. PositionAttachedEntity's entry is one such key: our
+// attachment hook changes it, and glass from a damaged vehicle then decodes an
+// invalid pointer (reported 004015F3, EAX=8696171E). Keep the
+// decoder's exact operation, using its original key as an immediate instead.
+// This runs before module hooks; other executables/modded thunks are untouched.
+void PreserveGlassDecoderKey() {
+    static const uint8_t thunk[] = {
+        0x9C, 0xA1, 0x5C, 0x06, 0x56, 0x01, 0xF7, 0xD0,
+        0x33, 0x05, 0xF1, 0x6F, 0x54, 0x00, 0x8B, 0x00,
+        0x9D, 0xE9, 0x7A, 0xE3, 0x09, 0x00};
+    static const uint8_t entry[] = {0xE9, 0x70, 0x1C, 0xF6, 0xFF};
+    static const uint8_t keyEntry[] = {0x90, 0xE9, 0xE2, 0xF7, 0xEB, 0xFF};
+    if (!mem::Check(0x49F970, entry, sizeof entry) ||
+        !mem::Check(0x4015E5, thunk, sizeof thunk) ||
+        !mem::Check(0x546FF0, keyEntry, sizeof keyEntry)) return;
+    // xor eax,[00546FF1] -> xor eax,0xEBF7E2E9; nop. Both are six bytes and
+    // leave EAX/EFLAGS identical before the original dereference and popfd.
+    static const uint8_t immutableKey[] = {0x35, 0xE9, 0xE2, 0xF7, 0xEB, 0x90};
+    mem::Write(0x4015ED, immutableKey, sizeof immutableKey);
+    LOGI("Preserved CFx::AddGlass decoder key before the attachment hook");
+}
+
 // RpAnimBlendClumpUpdateAnimations can fade/remove its last association in
 // UpdateBlend. Vanilla still enters frame callbacks with a null first node
 // (004D1750). Keep native blend/time cleanup, skipping only the empty pose pass.
@@ -593,6 +616,7 @@ void ApplyWindowPlacement() {
 
 void Apply() {
     auto& cfg = Cfg();
+    PreserveGlassDecoderKey();
 
     // Native 2-player (split screen) mode must never activate: our remote player is a CPlayerPed
     // registered in CWorld::Players[1] only while it is processed. CGameLogic::IsCoopGameGoingOn -> false

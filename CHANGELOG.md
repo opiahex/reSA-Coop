@@ -4,6 +4,16 @@
 Это перечень итоговых изменений по подсистемам: промежуточные экспериментальные решения, которые были заменены, отдельными возможностями не считаются.
 Текущая база — **0.2.31-3p, протокол 42**. Все участники и сервер должны обновляться вместе.
 
+## Следующий выпуск / Unreleased
+
+### Русский
+
+- Исправлен вылет при появлении осколков стекла с VehDeform. Перехват крепления объектов больше не нарушает вычисление адреса камеры в GTA San Andreas 1.0 US. [#1](https://github.com/opiahex/reSA-Coop/issues/1)
+
+### English
+
+- Fixed a crash when VehDeform creates glass particles. The attachment hook no longer corrupts the camera-pointer calculation in GTA San Andreas 1.0 US. [#1](https://github.com/opiahex/reSA-Coop/issues/1)
+
 ## 0.2.31-3p
 
 ### Русский
