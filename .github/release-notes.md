@@ -6,6 +6,7 @@
 
 **Протокол 44: обновите всех игроков и сервер вместе.** Формат личных профилей 7 сохранён. При обновлении сохраняйте настройки, сохранения и `coop/server-data`.
 
+- Исправлен вылет при возрождении напарника после удаления его прежнего персонажа.
 - Исправлены конфликты мест с NPC. Запоздалое решение о посадке больше не возвращает игрока в прежнюю машину после выхода или пересадки.
 - Гость сохраняет управление своей машиной, когда сценарий принимает её в общий миссионный транспорт. Краткое отсутствие водителя на сетевой копии не передаёт машину хосту.
 - Синхронизируются сюжетное крепление машины к другой машине, смена опоры и отсоединение. Запоздалое состояние не возвращает прежнее крепление.
@@ -23,6 +24,7 @@
 
 **Protocol 44: update every player and the server together.** Personal profile format 7 is unchanged. Preserve settings, saves and `coop/server-data` when updating.
 
+- Fixed a crash when a remote player respawns after their previous ped is removed.
 - Fixed seat conflicts with NPCs. A delayed seat decision no longer puts a player back in their previous vehicle after they leave or switch vehicles.
 - Guests retain control of their vehicle when a script adopts it as a mission vehicle. A temporary missing driver on a replica does not transfer the vehicle to the host.
 - Scripted vehicle-to-vehicle attachment, reparenting and detachment are synchronized. Delayed state cannot restore an obsolete attachment.

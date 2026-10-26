@@ -1681,7 +1681,7 @@ void Players::OnPreProcess() {
     // host riding behind a guest on a bike otherwise ran before that bike's
     // driver solely because the host has the lower player id.
     for(auto mode:{RemotePlayer::Mode::OnFoot,RemotePlayer::Mode::Driver,RemotePlayer::Mode::Passenger})
-        for(auto&[id,rp]:m_remote)if(rp.ped&&rp.mode==mode){ApplyState(rp);KeepApart(rp.ped);}
+        for(auto&[id,rp]:m_remote)if(rp.ped&&rp.mode==mode){ApplyState(rp);if(rp.ped)KeepApart(rp.ped);}
 }
 
 // A script that puts this game's player on a spot (a changing room, a mission's) puts it inside the other player's
@@ -1690,7 +1690,7 @@ void Players::OnPreProcess() {
 // until they part (CPhysical::m_pEntityIgnoredCollision, the game clears it once they stop touching).
 void Players::KeepApart(CPed* other) {
     CPlayerPed* me = FindPlayerPed(0);
-    if (!me || me->InVehicle() || other->InVehicle()) return;
+    if (!me || !other || me->InVehicle() || other->InVehicle()) return;
     CVector d = other->GetPosition() - me->GetPosition();
     if (d.x * d.x + d.y * d.y > 0.4f * 0.4f || std::fabs(d.z) > 1.5f) return;
     Field<CEntity*>(me, 0x128) = other;
