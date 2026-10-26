@@ -2,7 +2,27 @@
 
 Первая публикация форка объединяет локальные версии **0.2.6-3p–0.2.24-3p** и перенесённые исправления SA:COOP.
 Это перечень итоговых изменений по подсистемам: промежуточные экспериментальные решения, которые были заменены, отдельными возможностями не считаются.
-Текущая база — **0.2.33-3p, протокол 43**. Все участники и сервер должны обновляться вместе.
+Текущая база — **0.2.34-3p, протокол 43**. Все участники и сервер должны обновляться вместе.
+
+## 0.2.34-3p
+
+### Русский
+
+Протокол 43 и формат личных профилей 7 сохранены.
+
+- Исправлена проверка сохранений mission packs, включая используемый DYOM режим: проверяется соответствующий `MPACK…/SCR.SCM`, а не скрипт обычного сюжета. [#2](https://github.com/opiahex/reSA-Coop/issues/2)
+- При загрузке выбирается номер набора из сохранения. Отсутствующий набор, несовместимая структура скриптов и ошибка чтения сообщаются отдельно. Проверка обычного сюжета сохранена.
+
+Исправление касается подключения и загрузки мира. Полное совместное прохождение DYOM-миссий пока не проверено.
+
+### English
+
+Protocol 43 and personal profile format 7 are unchanged.
+
+- Fixed compatibility checks for native mission-pack saves, including the mode used by DYOM: the matching `MPACK…/SCR.SCM` is checked instead of the base story script. [#2](https://github.com/opiahex/reSA-Coop/issues/2)
+- Loading selects the pack number stored in the save. Missing packs, incompatible script layouts and read failures have separate messages. The base-story check is retained.
+
+This change covers joining and loading the world. Complete co-op DYOM mission playthroughs have not been verified.
 
 ## 0.2.33-3p
 

@@ -1,24 +1,24 @@
-# reSA-Coop 0.2.33-3p
+# reSA-Coop 0.2.34-3p
 
-**Готовая сборка / Compiled build: `reSA-Coop-v0.2.33-3p-win32.zip` в Assets / in Assets.**
+**Готовая сборка / Compiled build: `reSA-Coop-v0.2.34-3p-win32.zip` в Assets / in Assets.**
 
 ## Русский
 
-- Исправлено зависание гостей после пропуска или завершения катсцены. Специальные модели сюжетных NPC загружаются по имени; пустой локальный слот больше не вызывает бесконечный повтор чтения в GTA. Это также применяется при подключении к уже начатой миссии.
-- Исправлен конфликт перехватов сюжетных команд с модами, которые используют один общий обработчик SCM. Каждый диапазон команд сохраняет свою цепочку обработки.
-- Исправлена сверка времени сюжетной музыки: номер трека больше не принимается за время воспроизведения. Убраны вызванные этим повторные перезагрузки звука.
-- Сверка игровых файлов использует путь запущенного EXE, включая переименованный файл. Невозможность чтения отмечается отдельно от настоящего различия сборок; проверка CRC и отсутствующих файлов сохраняется.
+- Исправлена проверка сохранений mission packs, включая используемый DYOM режим: проверяется соответствующий `MPACK…/SCR.SCM`, а не скрипт обычного сюжета. [#2](https://github.com/opiahex/reSA-Coop/issues/2)
+- При загрузке выбирается номер набора из сохранения. Отсутствующий набор, несовместимая структура скриптов и ошибка чтения сообщаются отдельно. Проверка обычного сюжета сохранена.
 
-Протокол 43, личные профили 7. Обновите мод у всех игроков. Настройки, сохранения и `coop/server-data` сохраняйте при обновлении.
+Исправление касается подключения и загрузки мира. Полное совместное прохождение DYOM-миссий пока не проверено.
+
+Протокол 43, личные профили 7. При обновлении сохраняйте настройки, сохранения и `coop/server-data`.
 
 ## English
 
-- Fixed guests hanging after cutscenes are skipped or end. Special story NPC models are resolved by name before loading, preventing an unbound local slot from entering GTA's endless file-read retry. This also applies when joining an ongoing mission.
-- Fixed story-command hook conflicts with mods that share one SCM dispatcher. Each command range retains its own dispatch chain.
-- Fixed story soundtrack time comparison: the track ID is no longer treated as playback time, preventing unnecessary audio reloads.
-- Simulation-file comparison uses the running executable's actual path, including renamed files. Read failures are reported separately from confirmed differences; CRC and missing-file checks remain active.
+- Fixed compatibility checks for native mission-pack saves, including the mode used by DYOM: the matching `MPACK…/SCR.SCM` is checked instead of the base story script. [#2](https://github.com/opiahex/reSA-Coop/issues/2)
+- Loading selects the pack number stored in the save. Missing packs, incompatible script layouts and read failures have separate messages. The base-story check is retained.
 
-Protocol 43, personal profiles 7. Update all players. Preserve settings, saves and `coop/server-data` when updating.
+This change covers joining and loading the world. Complete co-op DYOM mission playthroughs have not been verified.
+
+Protocol 43, personal profiles 7. Preserve settings, saves and `coop/server-data` when updating.
 
 ## Установка / Installation
 

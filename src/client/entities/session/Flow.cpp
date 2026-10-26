@@ -21,6 +21,7 @@
 #include "shared/config/Config.h"
 #include "shared/game/Game.h"
 #include "shared/game/Script.h"
+#include "shared/lib/sync/WorldScript.h"
 #include "shared/lib/core/Core.h"
 #include "shared/ui/chat/Chat.h"
 
@@ -552,12 +553,12 @@ struct ScmSizes {  // the story's sizes in main.scm's header and in a save (CThe
 // The game puts a save's running scripts at their places in main.scm and never checks that the save comes from the same
 // main.scm (CTheScripts::Load reads the sizes and drops them): a save of another main.scm crashes it in the first
 // scripts it runs. The save must have this game's sizes: those of its loaded main.scm, or of one it may load.
-bool SameMainScm(const std::vector<uint8_t>& save) {
+bool SameBaseScm(const std::vector<uint8_t>& save) {
     auto inSave = [&](const ScmSizes& s) {
         auto b = (const uint8_t*)&s;
         return std::search(save.begin(), save.end(), b, b + sizeof s) != save.end();
     };
-    if (game::Ref<uint32_t>(0xA444C4))  // CTheScripts::MainScriptSize: the game has loaded its main.scm
+    if (!game::Ref<uint8_t>(0xB72910) && game::Ref<uint32_t>(0xA444C4))  // CTheScripts::MainScriptSize: the game has loaded its main.scm
         return inSave({game::Ref<uint32_t>(0xA444C4), game::Ref<uint32_t>(0xA444C0), game::Ref<uint16_t>(0xA444BC),
                        game::Ref<uint16_t>(0xA444B8), game::Ref<uint32_t>(0xA444B4)});
     std::vector<std::wstring> files = {Cfg().gameDir + L"data\\script\\main.scm"};
@@ -582,12 +583,51 @@ bool SameMainScm(const std::vector<uint8_t>& save) {
     return !known;
 }
 
+enum class ScriptCheck { Match, Different, Unavailable, MissingPack, InvalidSave };
+
+// Keep the base-story compatibility path unchanged. A mission pack instead
+// uses its numbered local SCR.SCM, even while another story is loaded here.
+ScriptCheck CheckWorldScript(const std::vector<uint8_t>& save, uint8_t& pack) {
+    if (!worldscript::ReadMissionPack(save, pack)) return ScriptCheck::InvalidSave;
+    if (!pack) return SameBaseScm(save) ? ScriptCheck::Match : ScriptCheck::Different;
+    worldscript::SaveHeader header;
+    if (!worldscript::ReadSaveHeader(save, header)) return ScriptCheck::InvalidSave;
+    const auto& expected = header.layout;
+    LOGI("World script layout: pack=%u main=%u mission=%u count=%u exclusive=%u locals=%u", pack,
+         expected.main, expected.largestMission, expected.missions, expected.exclusiveMissions, expected.largestMissionLocals);
+    const auto file = core::UserFilesDir() + L"MPACK\\MPACK" + std::to_wstring(pack) + L"\\SCR.SCM";
+    std::vector<uint8_t> scm;
+    if (!ReadFileBytes(file, scm)) {
+        LOGW("World mission pack unavailable: pack=%u script=%s", pack, WideToUtf8(file).c_str());
+        return FileExists(file) ? ScriptCheck::Unavailable : ScriptCheck::MissingPack;
+    }
+    worldscript::ScriptLayout local;
+    if (!worldscript::ReadScmLayout(scm, local)) return ScriptCheck::Unavailable;
+    LOGI("Local mission-pack layout: pack=%u main=%u mission=%u count=%u exclusive=%u locals=%u", pack,
+         local.main, local.largestMission, local.missions, local.exclusiveMissions, local.largestMissionLocals);
+    return local == expected ? ScriptCheck::Match : ScriptCheck::Different;
+}
+
 void LoadHostWorld(const std::vector<uint8_t>& data) {
-    if (!SameMainScm(data)) {
-        Fail(TR("Мир хоста не загрузится, потому что ваш файл data\\script\\main.scm не такой, как у хоста. Нужны "
-                "одинаковые версия игры и моды, которые меняют сюжет.",
-                "The host's world cannot load because your data\\script\\main.scm differs from the host's. You both "
-                "need the same game version and the same mods that change the story."));
+    uint8_t pack = 0;
+    const auto script = CheckWorldScript(data, pack);
+    if (script != ScriptCheck::Match) {
+        if (script == ScriptCheck::InvalidSave)
+            Fail(TR("В сохранении мира хоста повреждён заголовок скриптов.", "The host's world save has an invalid script header."));
+        else if (script == ScriptCheck::MissingPack)
+            Fail(Format(TR("У хоста запущен набор миссий MPACK%u. Установите такой же набор в GTA San Andreas User Files\\MPACK.",
+                           "The host is running mission pack MPACK%u. Install the same pack under GTA San Andreas User Files\\MPACK."), (unsigned)pack));
+        else if (script == ScriptCheck::Unavailable)
+            Fail(TR("Не удалось проверить скрипты для загрузки мира хоста. Подробности: coop.log.",
+                    "Could not verify the scripts required by the host's world. See coop.log."));
+        else if (pack)
+            Fail(Format(TR("Скрипт набора миссий MPACK%u отличается от сохранения хоста. Нужна та же версия набора.",
+                           "Mission pack MPACK%u does not match the host's save. The same pack version is required."), (unsigned)pack));
+        else
+            Fail(TR("Мир хоста не загрузится, потому что ваш файл data\\script\\main.scm не такой, как у хоста. Нужны "
+                    "одинаковые версия игры и моды, которые меняют сюжет.",
+                    "The host's world cannot load because your data\\script\\main.scm differs from the host's. You both "
+                    "need the same game version and the same mods that change the story."));
         return;
     }
     EnsureDirectory(Cfg().coopDir + L"world");

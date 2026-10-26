@@ -19,6 +19,7 @@
 #include "shared/config/Config.h"
 #include "shared/game/Game.h"
 #include "shared/lib/memory/Memory.h"
+#include "shared/lib/sync/WorldScript.h"
 #include "shared/ui/chat/Chat.h"
 #include "shared/ui/input/Input.h"
 #include "shared/ui/renderer/Renderer.h"
@@ -459,14 +460,26 @@ bool LoadSaveFile(const std::wstring& path) {
         g_redirectPath.clear();
         return false;
     }
+    std::vector<uint8_t> save;
+    uint8_t missionPack = 0;
+    if (!ReadFileBytes(path, save) || !worldscript::ReadMissionPack(save, missionPack)) {
+        LOGE("Save has no valid native script-mode header: %s", g_redirectPath.c_str());
+        g_redirectPath.clear();
+        return false;
+    }
+    if (missionPack && !FileExists(UserFilesDir() + L"MPACK\\MPACK" + std::to_wstring(missionPack) + L"\\SCR.SCM")) {
+        LOGE("Save requires missing mission pack %u", missionPack);
+        g_redirectPath.clear();
+        return false;
+    }
     game::Ref<uint8_t>(mm + 0x15F) = (uint8_t)flow::kRedirectSlot;  // m_SelectedSlot
     if (!game::Ref<uint8_t>(mm + 0xE9)) {                            // !m_bMainMenuSwitch -> in game
         game::CallMethod<0x573330>((void*)mm);                        // DoSettingsBeforeStartingAGame
     }
     game::Ref<uint8_t>(mm + 0x32) = 1;        // m_bDontDrawFrontEnd
-    game::Ref<uint8_t>(0xB72910) = 0;         // CGame::bMissionPackGame
+    game::Ref<uint8_t>(0xB72910) = missionPack;  // select the save's script mode before restarting
     game::Ref<uint8_t>(mm + 0x60) = 1;        // m_bLoadingData
-    LOGI("Loading save %s", g_redirectPath.c_str());
+    LOGI("Loading save %s (mission pack %u)", g_redirectPath.c_str(), missionPack);
     return true;
 }
 
