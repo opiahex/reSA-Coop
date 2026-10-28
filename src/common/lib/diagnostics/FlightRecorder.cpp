@@ -13,6 +13,8 @@
 #include <cstdio>
 #include <cwchar>
 #include <locale.h>
+#include <memory>
+#include <new>
 #include <type_traits>
 
 namespace coop::flight {
@@ -24,6 +26,7 @@ constexpr uint64_t kControlReserve=2048;
 static_assert(kFileLimit>kControlReserve+512,"segment must leave room for counters");
 static_assert(std::atomic<uint32_t>::is_always_lock_free,"recorder counters must not hide locks");
 static_assert(std::atomic<bool>::is_always_lock_free,"recorder switch must not hide locks");
+static_assert(std::atomic<SnapshotExportResult>::is_always_lock_free,"snapshot status must not hide locks");
 struct Recorder {
     struct Segment {unsigned number=0;DWORD volume=0,indexHigh=0,indexLow=0;uint32_t events=0;uint64_t first=0,last=0;HANDLE handle=INVALID_HANDLE_VALUE;};
     std::atomic_flag guard=ATOMIC_FLAG_INIT;
@@ -40,6 +43,8 @@ struct Recorder {
     unsigned segment=0;
     std::array<Segment,kFiles> segments{};
     unsigned segmentCount=0;
+    std::atomic<uint32_t> snapshotRequested{0},snapshotCompleted{0};
+    std::atomic<SnapshotExportResult> snapshotResult{SnapshotExportResult::None};
 };
 static_assert(std::is_trivially_destructible_v<Recorder>,"recorder must outlive a timed-out writer during CRT exit");
 Recorder g_recorder;
@@ -119,16 +124,20 @@ bool Rotate(Recorder&r){
     if(!OpenSegment(r,r.segment+1,false)){RotationFailed(r);return false;}
     return true;
 }
-bool Output(Recorder&r,const Event&e){
-    if(r.file==INVALID_HANDLE_VALUE)return false;
+int FormatEvent(Recorder&r,const Event&e,char(&b)[2048]){
     // Fixed stack storage on the drain thread, large enough even for decimal
     // UINT64_MAX in every field and scientific notation for every finite float.
-    char b[2048],f[5][32];
+    char f[5][32];
     const float values[]={e.health,e.maxHealth,e.armour,e.beforeHealth,e.afterHealth};
     for(size_t i=0;i<5;++i)if(std::isfinite(values[i]))_snprintf_l(f[i],sizeof f[i],"%.9g",r.locale,values[i]);else snprintf(f[i],sizeof f[i],"null");
     const auto&c=e.context;
-    int n=snprintf(b,sizeof b,"{\"event\":\"flight\",\"ticks\":%llu,\"local_seq\":%llu,\"pid\":%u,\"tid\":%u,\"stage\":%u,\"reason\":%u,\"msg\":%u,\"channel\":%u,\"source\":%u,\"recipient\":%u,\"local_peer\":%u,\"wire_time\":%u,\"incarnation\":%u,\"world\":%u,\"id\":%u,\"generation\":%llu,\"fingerprint\":%llu,\"motion_epoch\":%u,\"native_handle\":%u,\"health\":%s,\"max_health\":%s,\"armour\":%s,\"before_health\":%s,\"after_health\":%s}\n",
-        (unsigned long long)e.ticks,(unsigned long long)e.localSeq,e.pid,e.tid,e.stage,e.reason,c.msg,c.channel,c.source,c.recipient,e.localPeer,c.wireTime,c.incarnation,c.world,c.entity,(unsigned long long)c.generation,(unsigned long long)c.fingerprint,e.motionEpoch,e.nativeHandle,f[0],f[1],f[2],f[3],f[4]);
+    int n=snprintf(b,sizeof b,"{\"event\":\"flight\",\"ticks\":%llu,\"local_seq\":%llu,\"pid\":%u,\"tid\":%u,\"stage\":%u,\"reason\":%u,\"msg\":%u,\"channel\":%u,\"source\":%u,\"recipient\":%u,\"local_peer\":%u,\"wire_time\":%u,\"incarnation\":%u,\"world\":%u,\"id\":%u,\"generation\":%llu,\"fingerprint\":%llu,\"motion_epoch\":%u,\"native_handle\":%u,\"health\":%s,\"max_health\":%s,\"armour\":%s,\"before_health\":%s,\"after_health\":%s,\"detail_known\":%u,\"span\":%llu,\"mission_run\":%llu,\"mission_phase\":%u,\"script_birth\":%llu,\"script_offset\":%u,\"opcode\":%u,\"owner\":%u,\"owner_epoch\":%u}\n",
+        (unsigned long long)e.ticks,(unsigned long long)e.localSeq,e.pid,e.tid,e.stage,e.reason,c.msg,c.channel,c.source,c.recipient,e.localPeer,c.wireTime,c.incarnation,c.world,c.entity,(unsigned long long)c.generation,(unsigned long long)c.fingerprint,e.motionEpoch,e.nativeHandle,f[0],f[1],f[2],f[3],f[4],e.detailKnown,(unsigned long long)e.span,(unsigned long long)e.missionRun,e.missionPhase,(unsigned long long)e.scriptBirth,e.scriptOffset,e.opcode,e.owner,e.ownerEpoch);
+    return n;
+}
+bool Output(Recorder&r,const Event&e){
+    if(r.file==INVALID_HANDLE_VALUE)return false;
+    char b[2048];int n=FormatEvent(r,e,b);
     if(n<=0||(size_t)n>=sizeof b){r.ioErrors.fetch_add(1,std::memory_order_relaxed);return false;}
     if(r.written+(unsigned)n>kFileLimit-kControlReserve&&!Rotate(r))return false;
     if(!WriteBytes(r,b,(DWORD)n))return false;
@@ -154,17 +163,59 @@ void OutputCounters(Recorder&r){
     if(n<=0||(size_t)n>=sizeof b){r.ioErrors.fetch_add(1);return;}
     WriteBytes(r,b,(DWORD)n);
 }
+void ExportSnapshot(Recorder&r){
+    const auto request=r.snapshotRequested.load(std::memory_order_acquire);
+    if(request==r.snapshotCompleted.load(std::memory_order_acquire))return;
+    auto finish=[&](SnapshotExportResult result){
+        r.snapshotResult.store(result,std::memory_order_relaxed);
+        r.snapshotCompleted.store(request,std::memory_order_release);
+    };
+    if(!r.running.load(std::memory_order_acquire)){finish(SnapshotExportResult::Stopped);return;}
+    r.snapshotResult.store(SnapshotExportResult::Writing,std::memory_order_release);
+    std::unique_ptr<Event[]> events(new(std::nothrow) Event[kCapacity]);
+    if(!events){finish(SnapshotExportResult::IoError);return;}
+    const auto snapshot=Snapshot(events.get(),kCapacity);
+    if(snapshot.busy){finish(SnapshotExportResult::Busy);return;}
+    wchar_t path[2112]{};
+    int chars=swprintf(path,std::size(path),L"%ls.snapshot-%u.jsonl",r.path,request);
+    if(chars<0||(size_t)chars>=std::size(path)){finish(SnapshotExportResult::IoError);return;}
+    HANDLE file=CreateFileW(path,GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(file==INVALID_HANDLE_VALUE){finish(SnapshotExportResult::IoError);return;}
+    uint64_t written=0;
+    auto write=[&](const char*data,int size){
+        if(!r.running.load(std::memory_order_acquire)||size<=0||written+(unsigned)size>8u*1024u*1024u)return false;
+        DWORD done=0;
+        if(!WriteFile(file,data,(DWORD)size,&done,nullptr)||done!=(DWORD)size)return false;
+        written+=(unsigned)size;return true;
+    };
+    char b[2048];
+    int n=snprintf(b,sizeof b,"{\"event\":\"flight_snapshot\",\"version\":1,\"request_seq\":%u,\"snapshot_only\":true,\"capacity\":4096,\"captured\":%u,\"qpc_frequency\":%llu,\"pid\":%u}\n",
+        request,(unsigned)snapshot.count,(unsigned long long)r.frequency,(unsigned)GetCurrentProcessId());
+    bool ok=n>0&&(size_t)n<sizeof b&&write(b,n);
+    for(size_t i=0;ok&&i<snapshot.count;++i){n=FormatEvent(r,events[i],b);ok=n>0&&(size_t)n<sizeof b&&write(b,n);}
+    if(ok){
+        const auto&c=snapshot.counters;
+        n=snprintf(b,sizeof b,"{\"event\":\"flight_snapshot_end\",\"request_seq\":%u,\"complete\":true,\"trace_complete\":false,\"counters_concurrent\":true,\"captured\":%u,\"retained_from_seq\":%llu,\"retained_through_seq\":%llu,\"accepted_sample\":%u,\"busy_drops\":%u,\"lifecycle_drops\":%u,\"history_overwrites\":%u,\"drain_drops\":%u,\"io_errors\":%u,\"segments_evicted\":%u,\"events_evicted\":%u,\"rotation_failures\":%u,\"export_failed\":%u}\n",
+            request,(unsigned)snapshot.count,(unsigned long long)(snapshot.count?events[0].localSeq:0),(unsigned long long)(snapshot.count?events[snapshot.count-1].localSeq:0),
+            c.accepted,c.busyDrops,c.lifecycleDrops,c.historyOverwrites,c.drainDrops,c.ioErrors,c.segmentsEvicted,c.eventsEvicted,c.rotationFailures,c.exportFailed);
+        ok=n>0&&(size_t)n<sizeof b&&write(b,n);
+    }
+    if(!CloseHandle(file))ok=false;
+    finish(ok?SnapshotExportResult::Saved:r.running.load(std::memory_order_acquire)?SnapshotExportResult::IoError:SnapshotExportResult::Stopped);
+}
 DWORD WINAPI Worker(void*param){
     auto*r=static_cast<Recorder*>(param);
     uint64_t cursor=0,lastCounters=0;
     while(r->running.load(std::memory_order_acquire)){
         Drain(*r,cursor);auto now=GetTickCount64();
         if(now-lastCounters>=1000){OutputCounters(*r);lastCounters=now;}
+        ExportSnapshot(*r);
         Sleep(20);
     }
     // Avoid issuing new I/O during shutdown. Keep history for Snapshot and
     // expose any records not yet copied to the writer as drain drops.
     if(TryLock(*r)) {if(cursor<r->total)Add(r->drainDrops,r->total-cursor);Unlock(*r);}
+    ExportSnapshot(*r); // settle any request not processed before Stop
     OutputCounters(*r); // best effort: Stop has a bounded wait and reports timeout
     for(unsigned i=0;i<r->segmentCount;++i)if(r->segments[i].handle!=INVALID_HANDLE_VALUE){CloseHandle(r->segments[i].handle);r->segments[i].handle=INVALID_HANDLE_VALUE;}
     r->file=INVALID_HANDLE_VALUE;
@@ -180,6 +231,7 @@ bool Start(const std::wstring&path){
     r.total=0;r.frequency=(uint64_t)f.QuadPart;std::wmemcpy(r.path,path.c_str(),path.size()+1);r.locale=locale;r.segment=0;r.segmentCount=0;
     r.accepted=0;r.busyDrops=0;r.lifecycleDrops=0;r.historyOverwrites=0;r.drainDrops=0;r.ioErrors=0;
     r.segmentsEvicted=0;r.eventsEvicted=0;r.rotationFailures=0;r.exportFailed=0;
+    r.snapshotRequested=0;r.snapshotCompleted=0;r.snapshotResult=SnapshotExportResult::None;
     Unlock(r);
     if(!OpenSegment(r,0,true)){_free_locale(r.locale);r.locale=nullptr;return false;}
     HMODULE pinned=nullptr;
@@ -228,4 +280,28 @@ SnapshotResult Snapshot(Event*out,size_t cap)noexcept{
     Unlock(r);return result;
 }
 uint64_t TickFrequency()noexcept{LARGE_INTEGER f{};return QueryPerformanceFrequency(&f)&&f.QuadPart>0?(uint64_t)f.QuadPart:0;}
+SnapshotExportResult RequestSnapshotExport()noexcept{
+    auto&r=Get();auto epoch=r.epoch.load(std::memory_order_acquire);
+    if(!r.enabled.load(std::memory_order_acquire))return SnapshotExportResult::Disabled;
+    if(!TryLock(r))return SnapshotExportResult::Busy;
+    SnapshotExportResult result=SnapshotExportResult::Queued;
+    auto request=r.snapshotRequested.load(std::memory_order_acquire);
+    if(!r.enabled.load(std::memory_order_acquire)||r.epoch.load(std::memory_order_acquire)!=epoch)result=SnapshotExportResult::Disabled;
+    else if(request!=r.snapshotCompleted.load(std::memory_order_acquire))result=SnapshotExportResult::Busy;
+    else if(request>=4)result=SnapshotExportResult::Limit;
+    else {r.snapshotResult.store(SnapshotExportResult::Queued,std::memory_order_relaxed);r.snapshotRequested.store(request+1,std::memory_order_release);}
+    Unlock(r);return result;
+}
+SnapshotExportStatus GetSnapshotExportStatus()noexcept{
+    auto&r=Get();SnapshotExportStatus status;
+    if(!TryLock(r)){status.busy=true;status.result=SnapshotExportResult::Busy;return status;}
+    status.requested=r.snapshotRequested.load(std::memory_order_acquire);
+    status.completed=r.snapshotCompleted.load(std::memory_order_acquire);
+    status.result=r.snapshotResult.load(std::memory_order_acquire);
+    if(status.requested>status.completed&&status.result!=SnapshotExportResult::Writing)status.result=SnapshotExportResult::Queued;
+    Unlock(r);
+    return status;
+}
+uint64_t NextDiagnosticSpan() noexcept {static thread_local uint64_t next=0;if(!++next)++next;return next;}
+
 }

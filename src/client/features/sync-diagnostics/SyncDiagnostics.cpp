@@ -2,7 +2,6 @@
 #include <psapi.h>
 #include <algorithm>
 #include <cstdio>
-#include <filesystem>
 #include <map>
 #include <string>
 #include <vector>
@@ -40,7 +39,7 @@ uint32_t Look(CVehicle*v){
 }
 std::string Escape(const std::string&s){std::string r;for(unsigned char c:s){if(c=='"'||c=='\\')r+='\\';if(c>=32)r+=c;}return r;}
 class Diagnostics:public Module {
-    FILE*file=nullptr;std::wstring path;uint64_t last=0,seq=0,written=0;
+    std::wstring path;std::string sessionHeader;uint32_t sessionToken=0,sessionSerial=0;bool headerQueued=false;uint64_t last=0,seq=0;
     std::map<uint32_t,uint64_t> requests,warnings;
     std::map<uint32_t,std::pair<uint64_t,uint64_t>> observations;
     std::map<uint8_t,std::map<uint32_t,Entry>> remote;
@@ -64,10 +63,12 @@ class Diagnostics:public Module {
         return out;
     }
     void Write(const std::string&s){
-        if(!file)return;
-        profile::Scope timing(profile::LOG_IO);
-        if(written+s.size()>8*1024*1024){fclose(file);std::wstring old=path+L".previous";MoveFileExW(path.c_str(),old.c_str(),MOVEFILE_REPLACE_EXISTING);file=_wfopen(path.c_str(),L"wb");written=0;}
-        if(file){fwrite(s.data(),1,s.size(),file);written+=s.size();}
+        log::WriteLegacySync(headerQueued?sessionToken:0,s.data(),s.size());
+    }
+    void BeginSink(){
+        if(path.empty()||headerQueued)return;
+        if(!sessionToken)sessionToken=log::BeginLegacySync(path.data(),path.size());
+        if(sessionToken)headerQueued=log::WriteLegacySync(sessionToken,sessionHeader.data(),sessionHeader.size());
     }
     void Warn(const char*reason,const Entry&e,uint8_t source){
         uint32_t key=((uint32_t)source<<24)|((uint32_t)e.kind<<16)|e.id;auto now=last;
@@ -98,22 +99,20 @@ public:
         });
     }
     void OnSessionStart()override{
-        OnSessionEnd();SyncTrace()={};auto dir=Cfg().coopDir+L"diagnostics\\";CreateDirectoryW(dir.c_str(),nullptr);
-        SYSTEMTIME t;GetLocalTime(&t);wchar_t name[128];swprintf(name,128,L"sync-%04u%02u%02u-%02u%02u%02u-p%u-%lu.jsonl",t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond,Net().MyId(),GetCurrentProcessId());path=dir+name;
-        // Bounded sessions and file rotation; never include configs, invite codes or voice audio.
-        std::vector<std::filesystem::path> files;std::error_code ec;
-        for(std::filesystem::directory_iterator it(dir,ec),end;!ec&&it!=end;it.increment(ec))if(it->is_regular_file(ec)&&it->path().filename().wstring().rfind(L"sync-",0)==0)files.push_back(it->path());
-        std::sort(files.begin(),files.end());while(files.size()>10){std::filesystem::remove(files.front(),ec);files.erase(files.begin());}
-        file=_wfopen(path.c_str(),L"wb");written=0;
-        Write("{\"event\":\"session\",\"version\":\"" COOP_VERSION_STR "\",\"protocol\":"+std::to_string(kProtocolVersion)+",\"pid\":"+std::to_string(GetCurrentProcessId())+",\"peer\":"+std::to_string(Net().MyId())+",\"host\":"+std::to_string(Net().HostId())+",\"nickname\":\""+Escape(Cfg().nickname)+"\"}\n");
-        if(file)fflush(file);last=0;seq=0;
+        OnSessionEnd();SyncTrace()={};auto dir=Cfg().coopDir+L"diagnostics\\";
+        SYSTEMTIME t;GetLocalTime(&t);wchar_t name[128];if(++sessionSerial==0)++sessionSerial;
+        swprintf(name,128,L"sync-%04u%02u%02u-%02u%02u%02u-p%u-%lu-s%u.jsonl",t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond,Net().MyId(),GetCurrentProcessId(),sessionSerial);path=dir+name;
+        // The worker alone creates/rotates files. Per-process session suffix avoids same-second truncation.
+        sessionHeader="{\"event\":\"session\",\"version\":\"" COOP_VERSION_STR "\",\"protocol\":"+std::to_string(kProtocolVersion)+",\"pid\":"+std::to_string(GetCurrentProcessId())+",\"peer\":"+std::to_string(Net().MyId())+",\"host\":"+std::to_string(Net().HostId())+",\"nickname\":\""+Escape(Cfg().nickname)+"\"}\n";
+        BeginSink();last=0;seq=0;
     }
-    void OnSessionEnd()override{if(file){fclose(file);file=nullptr;}OnGameShutdown();}
+    void OnSessionEnd()override{log::EndLegacySync(sessionToken);sessionToken=0;headerQueued=false;sessionHeader.clear();path.clear();OnGameShutdown();}
     void OnGameShutdown()override{remote.clear();warnings.clear();requests.clear();observations.clear();ownedAudit.clear();auditCursor=0;auditAt=0;last=0;}
     void OnPeerLeave(uint8_t id)override{remote.erase(id);}
     bool OnCommand(const std::string&cmd,const std::vector<std::string>&)override{if(cmd!="syncdiag")return false;last=0;core::Notify("Sync diagnostics: coop/diagnostics; /syncdiag records the current state");return true;}
     void OnPostProcess()override{
         if(!Net().Online()||!core::IsPlayerReady())return;
+        if(!headerQueued)BeginSink();
         // Spread the manifests across frames; rotate through every identity,
         // including entries past 320, rather than repeatedly sending a prefix.
         if(!ownedAudit.empty()&&NowMs()>=auditAt){
@@ -202,7 +201,6 @@ public:
         for(auto it=observations.begin();it!=observations.end();)it=it->second.second==last?std::next(it):observations.erase(it);
         for(auto&[source,records]:remote)for(auto it=records.begin();it!=records.end();)it=last-it->second.received>10000?records.erase(it):std::next(it);
         for(auto*map:{&requests,&warnings})for(auto i=map->begin();i!=map->end();)i=last-i->second>60000?map->erase(i):std::next(i);
-        if(file)fflush(file);
     }
     void Request(const Entry&e,uint8_t source,int&asked){
         uint32_t key=((uint32_t)source<<24)|((uint32_t)e.kind<<16)|e.id;

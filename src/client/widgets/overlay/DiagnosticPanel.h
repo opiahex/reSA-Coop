@@ -12,4 +12,11 @@ namespace coop::ui {
 // only while its existing keyboard + mouse UI capture owns input.
 void UpdateDiagnosticSnapshot(uint64_t nowMs);
 void RenderDiagnosticPanel(bool interactive=false);
+struct DiagnosticTimings {
+    uint64_t draws=0,samples=0;
+    double drawTotalUs=0,drawMaxUs=0,snapshotTotalUs=0,snapshotMaxUs=0;
+    bool available=false;
+};
+// Copied CPU-side timings on the existing owner thread; not GPU time/FPS proof.
+DiagnosticTimings GetDiagnosticTimings();
 }

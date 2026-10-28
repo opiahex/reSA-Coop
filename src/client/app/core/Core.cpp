@@ -45,6 +45,7 @@ VoidFn g_origDebugTextMenu = nullptr;
 VoidFn g_origShutDownForRestart = nullptr;
 VoidFn g_origInitWhenRestarting = nullptr;
 std::atomic<bool> g_initialised{false};
+std::atomic<uint32_t> g_diagnosticGameThread{0};
 bool g_restarting = false;  // between CGame::ShutDownForRestart and InitialiseWhenRestarting
 int g_initDepth = 0;        // inside CGame::InitialiseWhenRestarting
 int g_loadDepth=0;         // scripts are not executable while save pointers are being relocated
@@ -228,6 +229,9 @@ void HandleChatSubmit(const std::string& text) {
 }
 
 void CommonFrame() {
+    if(!g_diagnosticGameThread.load(std::memory_order_acquire)){
+        uint32_t empty=0;g_diagnosticGameThread.compare_exchange_strong(empty,GetCurrentThreadId(),std::memory_order_release,std::memory_order_relaxed);
+    }
     log::StartDiagnostics(); // first ordinary frame, after DLL loader lock
     Heartbeat();
     if (g_lastCommonFrame == g_frameNo) return;
@@ -356,6 +360,7 @@ void WriteDefaultConfig(const std::wstring& path) {
 
 }  // namespace
 
+uint32_t DiagnosticGameThreadId() noexcept {return g_diagnosticGameThread.load(std::memory_order_acquire);}
 void RegisterModule(Module* m) { Modules().push_back(m); }
 
 bool IsInCoopSession() { return Net().Online(); }
@@ -605,10 +610,14 @@ void Init(void* hModule) {
     if(mem::PatchFailureSerial()!=patchFailures||mem::HasUnsafePatchFailure()){LOGE("Co-op initialisation blocked after patch failure; dependent hooks were not installed");return;}
 
     // frame hooks (call-site redirections; chain to whatever was there before)
-    if(!mem::RedirectCallFn(0x53E981, &HookGameProcess, &g_origGameProcess)||
-       !mem::RedirectCallFn(0x53E7A5, &HookMenuProcess, &g_origMenuProcess)||
-       !mem::RedirectCallFn(0x53EBE4, &HookDebugTextIngame, &g_origDebugTextIngame)||
-       !mem::RedirectCallFn(0x53E86C, &HookDebugTextMenu, &g_origDebugTextMenu)||
+    constexpr uint8_t nativeCalls[4][5]={{0xe8,0x5a,0xd5,0xff,0xff},{0xe8,0x96,0xcc,0x03,0x00},{0xe8,0x77,0x36,0xff,0xff},{0xe8,0xef,0x39,0xff,0xff}};
+    constexpr uintptr_t callSites[4]={0x53E981,0x53E7A5,0x53EBE4,0x53E86C};
+    mem::CriticalCallPreimage calls[4];
+    for(int i=0;i<4;++i){calls[i]=mem::InspectCriticalCall(callSites[i]);if(!calls[i].ok){LOGE("Critical frame call %08X has invalid target or instruction",(unsigned)callSites[i]);return;}}
+    if(mem::TryRedirectCriticalCall(callSites[0],(void*)&HookGameProcess,(void**)&g_origGameProcess,nativeCalls[0],calls[0]).state!=mem::PatchState::Installed||
+       mem::TryRedirectCriticalCall(callSites[1],(void*)&HookMenuProcess,(void**)&g_origMenuProcess,nativeCalls[1],calls[1]).state!=mem::PatchState::Installed||
+       mem::TryRedirectCriticalCall(callSites[2],(void*)&HookDebugTextIngame,(void**)&g_origDebugTextIngame,nativeCalls[2],calls[2]).state!=mem::PatchState::Installed||
+       mem::TryRedirectCriticalCall(callSites[3],(void*)&HookDebugTextMenu,(void**)&g_origDebugTextMenu,nativeCalls[3],calls[3]).state!=mem::PatchState::Installed||
        !mem::HookFn(0x6190A0, &HookGenerateGameFilename, &g_origGenerateGameFilename, "C_PcSave::GenerateGameFilename")||
        !mem::HookFn(0x53C550, &HookShutDownForRestart, &g_origShutDownForRestart, "CGame::ShutDownForRestart")||
        !mem::HookFn(0x5D17B0,&HookGenericLoad,&g_originalLoad,"CGenericGameStorage::GenericLoad script relocation guard")||

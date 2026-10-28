@@ -57,7 +57,8 @@ struct Observation {
     hookreg::Ticket ticket{};
     bool active = false;
     Observation(hookreg::Kind kind, const char* label, uintptr_t addr, size_t size,
-                const void* desired = nullptr, const char* purpose = nullptr, const void* expected = nullptr) noexcept {
+                const void* desired = nullptr, const char* purpose = nullptr, const void* expected = nullptr,
+                hookreg::Chain chain = hookreg::Chain::NotChecked) noexcept {
         if (!addr || !size || size > std::numeric_limits<uint32_t>::max()) return;
         hookreg::Spec spec{};
         uint32_t rva = 0, timestamp = 0;
@@ -73,7 +74,7 @@ struct Observation {
             (void)ReadProcessMemory(GetCurrentProcess(), purpose, spec.purpose, sizeof(spec.purpose) - 1, &got);
             if (!got || !memchr(spec.purpose, 0, got)) spec.purpose[0] = 0;
         }
-        spec.site = addr; spec.span = static_cast<uint32_t>(size); spec.kind = kind;
+        spec.site = addr; spec.span = static_cast<uint32_t>(size); spec.kind = kind; spec.chain=chain;
         // Input can be an invalid pointer; never dereference it for diagnostics.
         if (desired && size <= hookreg::kBytes) {
             uint8_t bytes[hookreg::kBytes]{}; SIZE_T got = 0;
@@ -279,7 +280,7 @@ uintptr_t CallTarget(uintptr_t addr) {
 }
 
 namespace {
-RedirectResult RedirectImpl(uintptr_t addr, const void* newTarget, void** chain) {
+RedirectResult RedirectImpl(uintptr_t addr, const void* newTarget, void** chain, const uint8_t* expectedCurrent = nullptr) {
     RedirectResult result;
     uint8_t instruction[5]{};
     SIZE_T read = 0;
@@ -298,6 +299,7 @@ RedirectResult RedirectImpl(uintptr_t addr, const void* newTarget, void** chain)
         result.write.failure = WriteFailure::UnsupportedRegion;
         return result;
     }
+    if(expectedCurrent && memcmp(instruction,expectedCurrent,sizeof(instruction))!=0){result.write.failure=WriteFailure::Conflict;return result;}
     memcpy(result.originalBytes, instruction, sizeof(instruction));
     int32_t oldRel = 0;
     memcpy(&oldRel, instruction + 1, sizeof(oldRel));
@@ -330,6 +332,31 @@ RedirectResult TryRedirectCall(uintptr_t addr, const void* newTarget, void** cha
     if (!result.write.Ok()) InterlockedIncrement(&patchFailureSerial);
     obs.Finish(WriteOutcome(result.write), WriteError(result.write), reinterpret_cast<uintptr_t>(result.previous));
     return result;
+}
+
+bool ExecutableAddress(const void* address) noexcept {
+    MEMORY_BASIC_INFORMATION m{};
+    if(!address||!VirtualQuery(address,&m,sizeof(m))||m.State!=MEM_COMMIT||(m.Protect&(PAGE_GUARD|PAGE_NOACCESS)))return false;
+    const DWORD p=m.Protect&0xff;
+    return p==PAGE_EXECUTE||p==PAGE_EXECUTE_READ||p==PAGE_EXECUTE_READWRITE||p==PAGE_EXECUTE_WRITECOPY;
+}
+CriticalCallPreimage InspectCriticalCall(uintptr_t addr) noexcept {
+    CriticalCallPreimage result{};SIZE_T n=0;
+    if(!addr||addr>UINTPTR_MAX-5||!ExecutableAddress((void*)addr)||!ExecutableAddress((void*)(addr+4))||
+       !ReadProcessMemory(GetCurrentProcess(),(void*)addr,result.bytes,5,&n)||n!=5||result.bytes[0]!=0xE8)return result;
+    int32_t rel=0;memcpy(&rel,result.bytes+1,sizeof(rel));result.previous=(void*)(addr+5+rel);
+    result.ok=ExecutableAddress(result.previous);return result;
+}
+RedirectResult TryRedirectCriticalCall(uintptr_t addr,const void* target,void** chain,const uint8_t (&native)[5],const CriticalCallPreimage& inspected){
+    uint8_t desired[5]={0xE8};const int32_t rel=static_cast<int32_t>(reinterpret_cast<uintptr_t>(target)-(addr+5));memcpy(desired+1,&rel,sizeof(rel));
+    auto kind=memcmp(inspected.bytes,native,5)==0?hookreg::Chain::NotChecked:hookreg::Chain::ExternalUnverified;
+    Observation obs(hookreg::Kind::Call,"call",addr,5,desired,"critical frame call",native,kind);
+    RedirectResult result{};
+    if(!inspected.ok||!addr||addr>UINTPTR_MAX-5||!ExecutableAddress((void*)addr)||!ExecutableAddress((void*)(addr+4))||
+       !ExecutableAddress(inspected.previous)||!ExecutableAddress(target)){result.write.failure=WriteFailure::UnsupportedRegion;}
+    else result=RedirectImpl(addr,target,chain,inspected.bytes);
+    if(!result.write.Ok())InterlockedIncrement(&patchFailureSerial);
+    obs.Finish(WriteOutcome(result.write),WriteError(result.write),reinterpret_cast<uintptr_t>(result.previous));return result;
 }
 
 bool RedirectCall(uintptr_t addr, const void* newTarget, void** previous) {
@@ -426,6 +453,16 @@ SwapResult TrySwapVTable(void** vtable, int index, void* fn, void* expected, boo
     if (!result.write.Ok()) InterlockedIncrement(&patchFailureSerial);
     obs.Finish(WriteOutcome(result.write), WriteError(result.write), reinterpret_cast<uintptr_t>(result.previous));
     return result;
+}
+
+SwapResult TrySwapScmSlot(uintptr_t slot,void* fn,void* native,void* expected,void** chain,bool ownChain){
+    auto kind=(expected==native||ownChain)?hookreg::Chain::NotChecked:hookreg::Chain::ExternalUnverified;
+    Observation obs(hookreg::Kind::Scm,"scm",slot,sizeof(fn),&fn,"critical SCM dispatch",&native,kind);
+    SwapResult result{};
+    if(!slot||!expected||expected==fn||!ExecutableAddress(expected)||!ExecutableAddress(fn))result.write.failure=WriteFailure::UnsupportedRegion;
+    else result=SwapImpl((void**)slot,0,fn,expected,true,chain);
+    if(!result.write.Ok())InterlockedIncrement(&patchFailureSerial);
+    obs.Finish(WriteOutcome(result.write),WriteError(result.write),reinterpret_cast<uintptr_t>(result.previous));return result;
 }
 
 void* SwapVTable(void** vtable, int index, void* fn) {

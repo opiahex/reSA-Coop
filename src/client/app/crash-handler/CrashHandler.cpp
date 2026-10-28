@@ -17,6 +17,13 @@ namespace coop {
 
 namespace {
 std::wstring g_crashPath;
+wchar_t g_tailDirectory[2048]{};
+bool PrepareDiagnosticTail(bool start) {
+    if(!start){DisarmFlightTail();return true;}
+    if(!g_tailDirectory[0]){SetLastError(ERROR_BAD_PATHNAME);return false;}
+    try{return ArmFlightTail(std::wstring(g_tailDirectory));}
+    catch(...){SetLastError(ERROR_NOT_ENOUGH_MEMORY);return false;}
+}
 LPTOP_LEVEL_EXCEPTION_FILTER g_prevFilter = nullptr;
 volatile LONG g_firstChanceReports = 0, g_unhandledReports = 0;  // apart: first-chance ones used up the real crash's
 volatile LONG g_inFilter = 0;
@@ -203,6 +210,11 @@ void StartHangDetector(unsigned seconds) {
 
 void InstallCrashHandler(const std::wstring& coopDir) {
     InitFlightTail(coopDir); // pre-open outside exception handling; optional
+    // Immutable path published before the ordinary-frame diagnostic worker starts.
+    // The worker never reads widgets, Config or native game objects.
+    if(coopDir.size()<sizeof(g_tailDirectory)/sizeof(g_tailDirectory[0]))
+        std::copy(coopDir.begin(),coopDir.end(),g_tailDirectory);
+    log::SetDiagnosticsPrepare(&PrepareDiagnosticTail);
     g_crashPath = coopDir + L"crash.log";
     ModuleRange(GetModuleHandleW(nullptr), g_exeBase, g_exeEnd);
     HMODULE self = nullptr;

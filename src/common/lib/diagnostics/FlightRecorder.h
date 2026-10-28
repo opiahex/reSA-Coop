@@ -18,6 +18,8 @@ struct Context {
     uint16_t entity=0;
     uint8_t msg=0,channel=0,source=255,recipient=255;
 };
+enum DetailKnown:uint16_t { SpanKnown=1, MissionKnown=2, ScriptBirthKnown=4, InstructionKnown=8, OwnerKnown=16, OwnerEpochKnown=32, OpcodeKnown=64, ScriptOffsetKnown=128 };
+enum DiagnosticStage:uint16_t { ScmProcessEnter=256,ScmProcessLeave,ScmCommandEnter,ScmCommandLeave };
 struct Event {
     Context context{};
     uint16_t stage=0,reason=0;
@@ -26,6 +28,12 @@ struct Event {
     uint8_t localPeer=255;
     uint64_t ticks=0,localSeq=0; // QPC before lock; localSeq is commit order
     uint32_t pid=0,tid=0;       // assigned by Record
+    // Local diagnostic metadata, never serialized into a network packet.
+    // A span is scoped by pid+tid, not a global packet/event identity.
+    uint64_t span=0,missionRun=0,scriptBirth=0;
+    uint32_t missionPhase=0,scriptOffset=0,ownerEpoch=0;
+    uint16_t opcode=0,detailKnown=0;
+    uint8_t owner=255;
 };
 struct Counters {
     // 32-bit cumulative counters wrap after UINT32_MAX; samples are concurrent.
@@ -49,4 +57,19 @@ bool Record(Event event) noexcept;
 SnapshotResult Snapshot(Event* out,size_t cap) noexcept;
 Counters GetCounters() noexcept;
 uint64_t TickFrequency() noexcept;
+uint64_t NextDiagnosticSpan() noexcept;
+
+enum class SnapshotExportResult : uint8_t { None, Queued, Writing, Saved, Busy, Disabled, Limit, IoError, Stopped };
+struct SnapshotExportStatus {
+    uint32_t requested=0,completed=0;
+    SnapshotExportResult result=SnapshotExportResult::None;
+    bool busy=false; // no coherent status sample; numeric fields are unavailable
+};
+// A single try-lock only: no allocation, file IO, thread creation or waiting.
+// The existing writer saves up to 4096 recent entries, not the complete trace.
+// At most four requests per Start; each file is capped at 8 MiB and CREATE_NEW.
+// Busy/Disabled/Limit reject this request; an accepted request returns Queued.
+SnapshotExportResult RequestSnapshotExport() noexcept;
+// Concurrent progress sample; request numbers are local to this recording.
+SnapshotExportStatus GetSnapshotExportStatus() noexcept;
 }

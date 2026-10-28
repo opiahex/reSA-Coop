@@ -12,6 +12,12 @@
 //      cutscenes   - the partner loads and plays the same cutscene (G_CUTSCENE);
 //      screen      - fades and widescreen borders (G_FADE), onscreen timers/counters (G_ONSCREEN).
 // Mission peds and vehicles are ordinary host entities (Peds/Vehicles).
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+// WinGDI's GetObject macro must not rename the game's GetObject function.
+#undef GetObject
 #include <algorithm>
 #include "shared/api/story-world/StoryWorld.h"
 #include <cmath>
@@ -36,6 +42,7 @@
 #include "shared/api/native-interaction/NativeInteraction.h"
 #include "common/api/protocol/Protocol.h"
 #include "common/lib/log/Log.h"
+#include "common/lib/diagnostics/FlightRecorder.h"
 #include "common/lib/profile/Profile.h"
 #include "shared/lib/sync/SyncTrace.h"
 #include "shared/lib/sync/ScriptValues.h"
@@ -152,6 +159,59 @@ bool SharedStoryScript(void* script) {
     if (i->second.bound && i->second.base != base) return false;
     return true;
 }
+
+// Recorder metadata is sampled before calling the native handler. Never keep
+// a script pointer for the leave event: the handler may destroy its thread.
+bool TraceReadable(const void* address,size_t size) noexcept {
+    uintptr_t p=(uintptr_t)address;MEMORY_BASIC_INFORMATION m{};
+    if(!p||!size||size-1>UINTPTR_MAX-p||!VirtualQuery(address,&m,sizeof(m))||m.State!=MEM_COMMIT||
+       (m.Protect&(PAGE_GUARD|PAGE_NOACCESS)))return false;
+    DWORD protect=m.Protect&0xff;
+    if(protect!=PAGE_READONLY&&protect!=PAGE_READWRITE&&protect!=PAGE_WRITECOPY&&
+       protect!=PAGE_EXECUTE_READ&&protect!=PAGE_EXECUTE_READWRITE&&protect!=PAGE_EXECUTE_WRITECOPY)return false;
+    uintptr_t start=(uintptr_t)m.BaseAddress;
+    return p>=start&&p-start<m.RegionSize&&size<=m.RegionSize-(p-start);
+}
+struct ScopedScmTrace {
+    flight::Event event{};bool active=false;bool process=false;
+    ScopedScmTrace(void* script,bool isProcess,bool shared,int opcode) noexcept:process(isProcess){
+        if(!flight::Enabled())return;
+        const uint32_t gameThread=core::DiagnosticGameThreadId();
+        if(!gameThread||gameThread!=GetCurrentThreadId()){
+            active=true;event.span=flight::NextDiagnosticSpan();event.detailKnown|=flight::SpanKnown;
+            event.stage=isProcess?flight::ScmProcessEnter:flight::ScmCommandEnter;
+            event.reason=gameThread?1:2; // 1: different thread, 2: not yet bound
+            if(!isProcess){event.opcode=(uint16_t)(opcode&0x7fff);event.detailKnown|=flight::OpcodeKnown;}
+            (void)flight::Record(event);return;
+        }
+        const auto run=StoryRunId();auto it=g_storyThreads.find(script);
+        if(!isProcess)shared=g_currentScript&&script==g_currentScript&&run&&it!=g_storyThreads.end()&&it->second.run==run;
+        if(!shared&&(isProcess||g_currentScript))return;
+        active=true;event.span=flight::NextDiagnosticSpan();event.detailKnown|=flight::SpanKnown;
+        event.stage=isProcess?flight::ScmProcessEnter:flight::ScmCommandEnter;
+        if(shared&&run){event.missionRun=run;event.missionPhase=CooperativeStoryPhase();event.detailKnown|=flight::MissionKnown;}
+        if(Net().Online()){event.context.world=Net().WorldEpoch();event.context.incarnation=Net().MyIncarnation();event.context.source=Net().MyId();event.localPeer=Net().MyId();
+            if(shared){event.owner=Net().MyId();event.detailKnown|=flight::OwnerKnown;}}
+        if(shared&&it!=g_storyThreads.end()&&run&&it->second.run==run&&it->second.birth){event.scriptBirth=it->second.birth;event.detailKnown|=flight::ScriptBirthKnown;}
+        if(!isProcess){event.opcode=(uint16_t)(opcode&0x7fff);event.detailKnown|=flight::OpcodeKnown;}
+        if(script){
+            uintptr_t p=(uintptr_t)script;void* base=nullptr;void* ip=nullptr;SIZE_T got=0;
+            if(p<=UINTPTR_MAX-0x14-sizeof(void*)&&TraceReadable((void*)(p+0x10),sizeof(void*)*2)&&
+               ReadProcessMemory(GetCurrentProcess(),(void*)(p+0x10),&base,sizeof(base),&got)&&got==sizeof(base)&&
+               ReadProcessMemory(GetCurrentProcess(),(void*)(p+0x14),&ip,sizeof(ip),&got)&&got==sizeof(ip)){
+                uintptr_t b=(uintptr_t)base,i=(uintptr_t)ip;
+                MEMORY_BASIC_INFORMATION bm{},im{};
+                if(b&&i>=b&&i-b<=16u*1024u*1024u&&TraceReadable(base,1)&&TraceReadable(ip,1)&&VirtualQuery(base,&bm,sizeof(bm))&&VirtualQuery(ip,&im,sizeof(im))&&
+                   bm.State==MEM_COMMIT&&im.State==MEM_COMMIT&&bm.AllocationBase==im.AllocationBase){
+                    event.scriptOffset=(uint32_t)(i-b);event.detailKnown|=flight::ScriptOffsetKnown;
+                    if(!isProcess)event.detailKnown|=flight::InstructionKnown;
+                }
+            }
+        }
+        (void)flight::Record(event);
+    }
+    ~ScopedScmTrace() noexcept {if(active){event.stage=process?flight::ScmProcessLeave:flight::ScmCommandLeave;(void)flight::Record(event);}}
+};
 void BindStoryThread(void* script) {
     auto i = g_storyThreads.find(script);
     if (i != g_storyThreads.end() && !i->second.bound) {
@@ -476,7 +536,7 @@ void __fastcall HookScriptProcess(void* script, void* edx) {
     auto timersBefore=Field<std::array<int32_t,2>>(script,0xBC);
     bool personalDriving=BeginPersonalDrivingSchool(script);
     BeginAirportGateScript(script);
-    g_origScriptProcess(script, edx);
+    {ScopedScmTrace trace(script,true,shared,0);g_origScriptProcess(script, edx);}
     EndAirportGateScript(script);
     if(personalDriving)EndPersonalDrivingSchool();
     if(!Field<uint8_t>(script,0xC4))CancelCooperativeStage(script);
@@ -744,6 +804,7 @@ ObjectCommand ReadStoryObject(void*script,int opcode){
 }
 CommandsFn g_objectCommands[27]{};
 template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int opcode){
+    ScopedScmTrace trace(script,false,false,opcode);
     const int chainOp=opcode&0x7FFF;
     // These are native main.scm helpers, not children of a story mission.
     // Only their qualified airport commands may replace native movement.
@@ -1001,10 +1062,18 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
     if(object.create){int h=Ref<int32_t>(0xA43C78);auto*o=GetObject(h);if(o&&(object.model<0||o->ModelIndex()==object.model)){ShareMissionObject(h);if(story)ArmCooperativeStage(script);}}
     return result;
 }
-void InstallStoryObjectCommands(){
+int8_t __fastcall HookCommands100(void*,void*,int);
+int8_t __fastcall HookCommands200(void*,void*,int);
+bool InstallStoryObjectCommands(){
+    // Slots 1 and 2 already contain our lower-level special wrappers. Compare
+    // those exact pointers before installing the outer story wrapper.
+    auto a=mem::ReadVTableSlot((void**)0x8A6168,1),b=mem::ReadVTableSlot((void**)0x8A6168,2);
+    if(!a.ok||!b.ok||a.value!=(void*)&HookCommands100||b.value!=(void*)&HookCommands200){
+        (void)mem::TrySwapScmSlot(0x8A616C,(void*)&HookStoryObjects<1>,(void*)0x466DE0,nullptr,nullptr);return false;
+    }
+    if(mem::TrySwapScmSlot(0x8A616C,(void*)&HookStoryObjects<1>,(void*)0x466DE0,a.value,(void**)&g_objectCommands[1],true).state!=mem::PatchState::Installed||
+       mem::TrySwapScmSlot(0x8A6170,(void*)&HookStoryObjects<2>,(void*)0x469390,b.value,(void**)&g_objectCommands[2],true).state!=mem::PatchState::Installed)return false;
     g_objectCommands[0]=Ref<CommandsFn>(0x8A6168+0*4);mem::Put(0x8A6168+0*4,&HookStoryObjects<0>);
-    g_objectCommands[1]=Ref<CommandsFn>(0x8A6168+1*4);mem::Put(0x8A6168+1*4,&HookStoryObjects<1>);
-    g_objectCommands[2]=Ref<CommandsFn>(0x8A6168+2*4);mem::Put(0x8A6168+2*4,&HookStoryObjects<2>);
     g_objectCommands[3]=Ref<CommandsFn>(0x8A6168+3*4);mem::Put(0x8A6168+3*4,&HookStoryObjects<3>);
     g_objectCommands[4]=Ref<CommandsFn>(0x8A6168+4*4);mem::Put(0x8A6168+4*4,&HookStoryObjects<4>);
     g_objectCommands[6]=Ref<CommandsFn>(0x8A6168+6*4);mem::Put(0x8A6168+6*4,&HookStoryObjects<6>);
@@ -1027,6 +1096,7 @@ void InstallStoryObjectCommands(){
     g_objectCommands[23]=Ref<CommandsFn>(0x8A6168+23*4);mem::Put(0x8A6168+23*4,&HookStoryObjects<23>);
     g_objectCommands[24]=Ref<CommandsFn>(0x8A6168+24*4);mem::Put(0x8A6168+24*4,&HookStoryObjects<24>);
     g_objectCommands[25]=Ref<CommandsFn>(0x8A6168+25*4);mem::Put(0x8A6168+25*4,&HookStoryObjects<25>);
+    return true;
 }
 
 CommandsFn g_origCommands100=nullptr;
@@ -1041,6 +1111,7 @@ int8_t __fastcall HookCommands100(void*script,void*edx,int opcode){
 }
 CommandsFn g_origCommands500=nullptr;
 int8_t __fastcall HookCommands500(void*script,void*edx,int opcode){
+    ScopedScmTrace trace(script,false,false,opcode);
     int handle=-1;
     if(opcode==0x020A&&script==g_currentScript&&Replicating()&&SharedStoryScript(script)){
         alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);
@@ -3056,10 +3127,14 @@ public:
         // Both native execution paths dispatch through this table. CLEO can
         // point several ranges at one dispatcher: wrap the slots separately
         // instead of installing conflicting inline hooks on that shared code.
-        g_origCommands100=Ref<CommandsFn>(0x8A6168+1*4);mem::Put(0x8A6168+1*4,&HookCommands100);
-        g_origCommands500=Ref<CommandsFn>(0x8A6168+5*4);mem::Put(0x8A6168+5*4,&HookCommands500);
-        g_origCommands200=Ref<CommandsFn>(0x8A6168+2*4);mem::Put(0x8A6168+2*4,&HookCommands200);
-        InstallStoryObjectCommands();
+        auto scm100=mem::ReadVTableSlot((void**)0x8A6168,1),scm500=mem::ReadVTableSlot((void**)0x8A6168,5),scm200=mem::ReadVTableSlot((void**)0x8A6168,2);
+        if(!scm100.ok||!scm500.ok||!scm200.ok||!mem::ExecutableAddress(scm100.value)||!mem::ExecutableAddress(scm500.value)||!mem::ExecutableAddress(scm200.value)){
+            (void)mem::TrySwapScmSlot(0x8A616C,(void*)&HookCommands100,(void*)0x466DE0,nullptr,nullptr);return;
+        }
+        if(mem::TrySwapScmSlot(0x8A616C,(void*)&HookCommands100,(void*)0x466DE0,scm100.value,(void**)&g_origCommands100).state!=mem::PatchState::Installed||
+           mem::TrySwapScmSlot(0x8A617C,(void*)&HookCommands500,(void*)0x47E090,scm500.value,(void**)&g_origCommands500).state!=mem::PatchState::Installed||
+           mem::TrySwapScmSlot(0x8A6170,(void*)&HookCommands200,(void*)0x469390,scm200.value,(void**)&g_origCommands200).state!=mem::PatchState::Installed||
+           !InstallStoryObjectCommands())return;
         mem::RedirectCallFn(0x484361, &HookScriptClearArea, &g_origClearArea);  // CLEAR_AREA (opcode 0395)
         mem::HookFn(0x609590, &HookCanPlayerStartMission, &g_origCanStart, "CPlayerPed::CanPlayerStartMission");
         mem::HookFn(0x464C20, &HookStartNewScript, &g_origStartScript, "CTheScripts::StartNewScript");

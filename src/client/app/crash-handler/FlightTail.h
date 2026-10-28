@@ -21,6 +21,8 @@ namespace coop::crash_tail {
 // v1 is little-endian (supported GTA build is x86). Every field has a fixed
 // width; no native pointers, addresses of buffers, or structure padding are
 // persisted. A reader must validate magic/schema/header/event/frame lengths.
+// V1 remains declared for decoding historical files. V2 appends numeric SCM
+// details and a checksum, retaining a fixed preallocated exception-path frame.
 #pragma pack(push,1)
 struct CountersV1 {
     uint32_t accepted,busyDrops,lifecycleDrops,historyOverwrites,drainDrops,ioErrors;
@@ -41,52 +43,84 @@ struct EventV1 {
     float health,maxHealth,armour,beforeHealth,afterHealth;
 };
 struct FrameV1 {HeaderV1 header;EventV1 events[64];};
+struct HeaderV2 {HeaderV1 base;uint32_t crc32;};
+struct EventV2 {
+    EventV1 base;
+    uint64_t span,missionRun,scriptBirth;
+    uint32_t missionPhase,scriptOffset,ownerEpoch;
+    uint16_t opcode,detailKnown;
+    uint8_t owner;
+};
+struct FrameV2 {HeaderV2 header;EventV2 events[64];};
 #pragma pack(pop)
 static_assert(std::is_trivially_copyable_v<HeaderV1> && std::is_trivially_copyable_v<EventV1>);
 static_assert(sizeof(HeaderV1)<256 && sizeof(EventV1)<256);
+static_assert(std::is_trivially_copyable_v<FrameV2> && sizeof(EventV2)<256);
 
-// Initialized only during normal startup. This state intentionally remains
-// alive until the OS closes the process handle; never close it from a handler.
+// Startup/lifecycle worker only. The handler never closes or initializes a file.
+// A stopped recording keeps its file until a later, serialized Arm or exit.
 inline HANDLE file=INVALID_HANDLE_VALUE;
 inline volatile LONG busy=0, firstAttempts=0,unhandledAttempts=0,broken=0;
+inline volatile LONG active=0;
 inline uint32_t processId=0;
 inline uint64_t qpcFrequency=0;
-inline FrameV1 frame{};
+inline FrameV2 frame{};
 inline flight::Event snapshot[64]{};
 
-inline bool Init(const std::wstring& coopDir) {
-    char enabled[8]{};
-    if(GetEnvironmentVariableA("COOP_FLIGHT_RECORDER",enabled,sizeof enabled)!=1 || enabled[0]!='1')return false;
-    if(file!=INVALID_HANDLE_VALUE)return true;
-    LARGE_INTEGER counter{};QueryPerformanceCounter(&counter);
+inline bool Arm(const std::wstring& coopDir) {
+    if(InterlockedCompareExchange(&busy,1,0)!=0){SetLastError(ERROR_BUSY);return false;}
+    struct Release {~Release(){DWORD error=GetLastError();InterlockedExchange(&busy,0);SetLastError(error);}} release;
+    auto finish=[](bool ok){return ok;};
+    if(file!=INVALID_HANDLE_VALUE&&InterlockedCompareExchange(&active,0,0)&&!InterlockedCompareExchange(&broken,0,0))return finish(true);
+    InterlockedExchange(&active,0);
+    if(file!=INVALID_HANDLE_VALUE){CloseHandle(file);file=INVALID_HANDLE_VALUE;}
+    LARGE_INTEGER counter{};
+    if(!QueryPerformanceCounter(&counter)){SetLastError(ERROR_INVALID_DATA);return finish(false);}
     processId=GetCurrentProcessId();qpcFrequency=flight::TickFrequency();
+    if(!qpcFrequency){SetLastError(ERROR_INVALID_DATA);return finish(false);}
     for(unsigned i=0;i<16;++i){
         wchar_t suffix[128]{};
         int n=swprintf(suffix,128,L"flight-tail-%lu-%llu-%u.bin",(unsigned long)processId,(unsigned long long)counter.QuadPart,i);
-        if(n<=0||(size_t)n>=128)return false;
+        if(n<=0||(size_t)n>=128){SetLastError(ERROR_BUFFER_OVERFLOW);return finish(false);}
         std::wstring path=coopDir;if(!path.empty()&&path.back()!=L'\\'&&path.back()!=L'/')path+=L'\\';path+=suffix;
         HANDLE h=CreateFileW(path.c_str(),FILE_APPEND_DATA,FILE_SHARE_READ,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
-        if(h!=INVALID_HANDLE_VALUE){file=h;return true;}
-        if(GetLastError()!=ERROR_FILE_EXISTS && GetLastError()!=ERROR_ALREADY_EXISTS)return false;
+        if(h!=INVALID_HANDLE_VALUE){
+            file=h;InterlockedExchange(&firstAttempts,0);InterlockedExchange(&unhandledAttempts,0);InterlockedExchange(&broken,0);
+            InterlockedExchange(&active,1);return finish(true);
+        }
+        if(GetLastError()!=ERROR_FILE_EXISTS && GetLastError()!=ERROR_ALREADY_EXISTS)return finish(false);
     }
-    return false;
+    SetLastError(ERROR_FILE_EXISTS);return finish(false);
+}
+inline void Disarm() noexcept {InterlockedExchange(&active,0);}
+inline bool Ready() noexcept {return InterlockedCompareExchange(&active,0,0)!=0&&InterlockedCompareExchange(&broken,0,0)==0;}
+inline bool Init(const std::wstring& coopDir) {
+    char enabled[8]{};
+    if(GetEnvironmentVariableA("COOP_FLIGHT_RECORDER",enabled,sizeof enabled)!=1 || enabled[0]!='1')return false;
+    return Arm(coopDir);
+}
+inline uint32_t FrameCrc(const void*bytes,size_t size) noexcept {
+    auto*p=static_cast<const uint8_t*>(bytes);uint32_t crc=0xFFFFFFFFu;
+    for(size_t i=0;i<size;++i){crc^=p[i];for(unsigned bit=0;bit<8;++bit)crc=(crc>>1)^(0xEDB88320u&uint32_t(-int32_t(crc&1)));}
+    return ~crc;
 }
 
 // Best effort and non-reentrant; it never dereferences exception context and
 // never allocates, takes a mutex, formats text or scans native objects. A normal
 // synchronous WriteFile can still block/fail in a damaged or stalled process.
 inline bool Persist(bool firstChance) noexcept {
-    if(file==INVALID_HANDLE_VALUE || InterlockedCompareExchange(&broken,0,0)!=0)return false;
+    if(InterlockedCompareExchange(&active,0,0)==0)return false;
     if(InterlockedCompareExchange(&busy,1,0)!=0)return false;
+    if(InterlockedCompareExchange(&active,0,0)==0||file==INVALID_HANDLE_VALUE||InterlockedCompareExchange(&broken,0,0)!=0){InterlockedExchange(&busy,0);return false;}
     volatile LONG* lane=firstChance?&firstAttempts:&unhandledAttempts;
     if(InterlockedCompareExchange(lane,0,0)>=(firstChance?6:2)){InterlockedExchange(&busy,0);return false;}
     InterlockedIncrement(lane);
     auto result=flight::Snapshot(snapshot,64);
     size_t n=std::min<size_t>(result.count,64);
-    auto& h=frame.header;
-    h.magic[0]='R';h.magic[1]='S';h.magic[2]='F';h.magic[3]='T';h.schema=1;
-    h.headerBytes=(uint16_t)sizeof(HeaderV1);h.eventBytes=(uint16_t)sizeof(EventV1);h.reserved=0;
-    h.frameBytes=(uint32_t)(sizeof(HeaderV1)+n*sizeof(EventV1));h.count=(uint32_t)n;
+    auto& h=frame.header.base;
+    h.magic[0]='R';h.magic[1]='S';h.magic[2]='F';h.magic[3]='T';h.schema=2;
+    h.headerBytes=(uint16_t)sizeof(HeaderV2);h.eventBytes=(uint16_t)sizeof(EventV2);h.reserved=0;
+    h.frameBytes=(uint32_t)(sizeof(HeaderV2)+n*sizeof(EventV2));h.count=(uint32_t)n;
     h.busy=result.busy?1u:0u;h.pid=processId;h.protocol=kProtocolVersion;h.kind=firstChance?1u:2u;h.qpcFrequency=qpcFrequency;
     const auto& c=result.counters;
     h.counters={c.accepted,c.busyDrops,c.lifecycleDrops,c.historyOverwrites,c.drainDrops,c.ioErrors,
@@ -94,12 +128,16 @@ inline bool Persist(bool firstChance) noexcept {
     constexpr char version[]=COOP_VERSION_STR;
     for(size_t i=0;i<sizeof h.version;++i)h.version[i]=i<sizeof(version)?version[i]:0;
     for(size_t i=0;i<n;++i){
-        const auto& e=snapshot[i];const auto& x=e.context;auto& d=frame.events[i];
+        const auto& e=snapshot[i];const auto& x=e.context;auto& full=frame.events[i];auto& d=full.base;
         d={x.fingerprint,x.generation,e.ticks,e.localSeq,x.wireTime,x.incarnation,x.world,
            e.motionEpoch,e.nativeHandle,e.pid,e.tid,x.entity,e.stage,e.reason,
            x.msg,x.channel,x.source,x.recipient,e.localPeer,
            e.health,e.maxHealth,e.armour,e.beforeHealth,e.afterHealth};
+        full.span=e.span;full.missionRun=e.missionRun;full.scriptBirth=e.scriptBirth;
+        full.missionPhase=e.missionPhase;full.scriptOffset=e.scriptOffset;full.ownerEpoch=e.ownerEpoch;
+        full.opcode=e.opcode;full.detailKnown=e.detailKnown;full.owner=e.owner;
     }
+    frame.header.crc32=0;frame.header.crc32=FrameCrc(&frame,h.frameBytes);
     DWORD written=0;BOOL ok=WriteFile(file,&frame,h.frameBytes,&written,nullptr);
     if(!ok||written!=h.frameBytes)InterlockedExchange(&broken,1);
     InterlockedExchange(&busy,0);
@@ -109,5 +147,8 @@ inline bool Persist(bool firstChance) noexcept {
 
 namespace coop {
 inline bool InitFlightTail(const std::wstring& coopDir){return crash_tail::Init(coopDir);}
+inline bool ArmFlightTail(const std::wstring& coopDir){return crash_tail::Arm(coopDir);}
+inline void DisarmFlightTail() noexcept {crash_tail::Disarm();}
+inline bool FlightTailReady() noexcept {return crash_tail::Ready();}
 inline bool PersistFlightTail(bool firstChance) noexcept{return crash_tail::Persist(firstChance);}
 }

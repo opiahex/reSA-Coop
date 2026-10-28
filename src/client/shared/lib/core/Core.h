@@ -38,6 +38,8 @@ public:
 namespace core {
 
 void Init(void* hModule);
+// First ordinary frame's thread ID, or 0 until it has been observed.
+uint32_t DiagnosticGameThreadId() noexcept;
 void RegisterModule(Module* m);
 void PeerResynced(uint8_t id);  // dispatches Module::OnPeerResync
 void CollectSyncAudit(std::vector<SyncAuditEntry>& out);

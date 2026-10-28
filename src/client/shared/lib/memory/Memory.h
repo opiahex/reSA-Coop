@@ -73,6 +73,12 @@ uintptr_t CallTarget(uintptr_t addr);
 // chain, when provided, is populated before writing so an immediately executed detour
 // can call the original target even if a later protection or cache operation fails.
 RedirectResult TryRedirectCall(uintptr_t addr, const void* newTarget, void** chain = nullptr);
+struct CriticalCallPreimage { uint8_t bytes[5]{}; void* previous = nullptr; bool ok = false; };
+// The manifest is a native reference, not proof of third-party ABI compatibility.
+CriticalCallPreimage InspectCriticalCall(uintptr_t addr) noexcept;
+RedirectResult TryRedirectCriticalCall(uintptr_t addr, const void* target, void** chain,
+                                       const uint8_t (&native)[5], const CriticalCallPreimage& inspected);
+bool ExecutableAddress(const void* address) noexcept;
 // Publishes *previous before mutation. False does not guarantee unchanged bytes.
 bool RedirectCall(uintptr_t addr, const void* newTarget, void** previous);
 
@@ -90,6 +96,8 @@ inline bool RedirectCallFn(uintptr_t addr, F detour, F* previous) {
 
 SlotReadResult ReadVTableSlot(void** vtable, int index);
 SwapResult TrySwapVTable(void** vtable, int index, void* fn, void* expected, bool checkExpected, void** chain = nullptr);
+// Checked SCM dispatch replacement; native is manifest evidence, expected is the inspected current chain.
+SwapResult TrySwapScmSlot(uintptr_t slot, void* fn, void* native, void* expected, void** chain, bool ownChain = false);
 // Returns nullptr unless the write and readback were confirmed.
 void* SwapVTable(void** vtable, int index, void* fn);
 

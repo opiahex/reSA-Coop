@@ -12,7 +12,12 @@
 #include <string>
 #include <type_traits>
 #include "entities/player/Players.h"
+#include "entities/vehicle/Vehicles.h"
+#include "entities/ped/Peds.h"
 #include "entities/session/Flow.h"
+#include "shared/api/story-coop/StoryCoop.h"
+#include "shared/api/story-stage/StoryStage.h"
+#include "common/lib/util/Util.h"
 #include "shared/api/net-session/Session.h"
 #include "shared/game/Game.h"
 
@@ -105,10 +110,23 @@ void RemoteRows(NativeSnapshot&out,uint8_t peer,const RemotePlayer&rp,game::CPed
 }
 }
 
-bool CaptureNativeSnapshot(NativeSnapshot&out,uint32_t owningThread){
-    if(!owningThread||owningThread!=GetCurrentThreadId())return false;
-    out={};auto&net=Net();auto&transport=net.Net();
+bool CaptureNativeSnapshot(NativeSnapshot&out,uint32_t owningThread,uint16_t selectedEntity){
+    if(!owningThread||owningThread!=GetCurrentThreadId()||owningThread!=core::DiagnosticGameThreadId())return false;
+    out={};const auto sampledNow=NowMs();auto&net=Net();auto&transport=net.Net();
+    out.missionKnown=net.Online();if(out.missionKnown)out.mission=StoryRunId();
     out.Add(NativeKind::Network,255,false,0,"net in %llu KB / out %llu KB, state %d, phase %d",(unsigned long long)(transport.BytesIn()/1024),(unsigned long long)(transport.BytesOut()/1024),(int)net.GetState(),(int)flow::GetPhase());
+    if(net.Online()){
+        out.Add(NativeKind::Network,net.MyId(),false,0,"session: peer %u host %u connection %u world %u | current mission run %llu phase %u",net.MyId(),net.HostId(),net.MyIncarnation(),net.WorldEpoch(),(unsigned long long)out.mission,CooperativeStoryPhase());
+        for(auto&[id,peer]:net.Peers())out.Add(NativeKind::Network,id,false,0,"peer %u: connection %u world %u RTT %u ms",id,peer.incarnation,net.PeerWorldEpoch(id),peer.ping);
+    }
+    out.Add(NativeKind::Network,255,false,0,"queues in %llu B / out %llu B | stale %llu expired %llu entity rejects %llu waiting %u",(unsigned long long)transport.QueuedInBytes(),(unsigned long long)transport.QueuedOutBytes(),(unsigned long long)net.StalePacketsDiscarded(),(unsigned long long)net.QueuedPacketsDiscarded(),(unsigned long long)net.EntityPacketsDiscarded(),(unsigned)net.EntityPacketsWaiting());
+    auto&vehicles=Vehicles::Instance();auto&peds=Peds::Instance();
+    out.Add(NativeKind::Remote,255,false,0,"network records: vehicles %u pending vehicles %u NPC %u | entity search selects exact record",(unsigned)vehicles.All().size(),(unsigned)vehicles.Pending().size(),(unsigned)peds.All().size());
+    if(selectedEntity){
+        if(auto i=vehicles.All().find(selectedEntity);i!=vehicles.All().end()){auto*n=&i->second;out.Add(NativeKind::LocalCar,n->owner,true,selectedEntity,"vehicle %u: owner %u generation %llu cachedHandle %d poolValid %d state %d age %s ms physicsHeld %d | ownerEpoch UNKNOWN",selectedEntity,n->owner,(unsigned long long)net.EntityGeneration(ENTITY_VEHICLE,selectedEntity),n->handle,native_detail::VehicleValid(n->veh),n->hasState,DiagnosticAge(sampledNow,n->recvMs,n->hasState).c_str(),n->physicsHeld);}
+        if(auto i=vehicles.Pending().find(selectedEntity);i!=vehicles.Pending().end()){auto*w=vehicles.PendingWait(selectedEntity);out.Add(NativeKind::LocalCar,i->second.owner,true,selectedEntity,"pending vehicle %u: owner %u model %u reason %s priority %d age %s ms",selectedEntity,i->second.owner,i->second.model,w?w->reason:"unobserved",w?w->priority:0,DiagnosticAge(sampledNow,w?w->since:0,w!=nullptr).c_str());}
+        if(auto i=peds.All().find(selectedEntity);i!=peds.All().end()){auto*n=&i->second;out.Add(NativeKind::Remote,n->owner,true,selectedEntity,"NPC %u: owner %u generation %llu cachedHandle %d poolValid %d state %d age %s ms wait %s | ownerEpoch UNKNOWN",selectedEntity,n->owner,(unsigned long long)net.EntityGeneration(ENTITY_PED,selectedEntity),n->handle,native_detail::PedValid(n->ped),n->hasState,DiagnosticAge(sampledNow,n->recvMs,n->hasState).c_str(),n->spawnWait.reason);}
+    }
     int32_t state=0;game::CPlayerPed*me=nullptr;
     if(!native_detail::Read((void*)game::addr::GameState,0,state)||state!=game::GAME_STATE_IDLE||!native_detail::Read((void*)game::addr::Players,0,me)||!me){out.Add(NativeKind::LocalCar,255,false,0,"Native car/remote state UNKNOWN (player not ready)");return true;}
     native_detail::CarRows(out,me,net.MyId());

@@ -52,14 +52,13 @@ struct Filter {
     bool Valid()const{return peer.valid&&entity.valid&&mission.valid&&fingerprint.valid;}
     bool Match(const flight::Event&e)const {
         bool peerMatch=!peer.active||(peer.valid&&((e.localPeer!=255&&peer.value==e.localPeer)||(e.context.source!=255&&peer.value==e.context.source)||(e.context.recipient!=255&&peer.value==e.context.recipient)));
-        // Recorder v1 has no mission field. Never turn an unavailable value into mission 0.
-        return Valid()&&peerMatch&&entity.Match(e.context.entity)&&mission.Match(0,false)&&fingerprint.Match(e.context.fingerprint)&&hookId.empty();
+        return Valid()&&peerMatch&&entity.Match(e.context.entity)&&mission.Match(e.missionRun,(e.detailKnown&flight::MissionKnown)!=0)&&fingerprint.Match(e.context.fingerprint)&&hookId.empty();
     }
     bool Match(const hookreg::Record&r)const {
         return Valid()&&!peer.active&&!entity.active&&!mission.active&&!fingerprint.active&&Contains(Bounded(r.spec.id),hookId);
     }
     bool Match(const NativeRow&r)const {
-        return Valid()&&peer.Match(r.peer,r.peerKnown)&&entity.Match(r.entity,r.entityKnown)&&!mission.active&&!fingerprint.active&&hookId.empty()&&Contains(Bounded(r.text),search);
+        return Valid()&&peer.Match(r.peer,r.peerKnown)&&entity.Match(r.entity,r.entityKnown)&&mission.Match(r.mission,r.missionKnown)&&!fingerprint.active&&hookId.empty()&&Contains(Bounded(r.text),search);
     }
 };
 inline const char* Comparison(hookreg::Comparison c){switch(c){case hookreg::Comparison::Match:return "MATCH";case hookreg::Comparison::Mismatch:return "MISMATCH";default:return "UNKNOWN";}}
@@ -73,7 +72,15 @@ inline std::string EventText(const flight::Event&e){
     char text[384];
     std::snprintf(text,sizeof(text),"seq %llu stage %u reason %u peer %u src %u dst %u entity %u gen %llu world %u msg %u ch %u fp %016llX hp %.2f/%.2f arm %.2f",
         (unsigned long long)e.localSeq,e.stage,e.reason,e.localPeer,e.context.source,e.context.recipient,e.context.entity,(unsigned long long)e.context.generation,e.context.world,e.context.msg,e.context.channel,(unsigned long long)e.context.fingerprint,e.health,e.maxHealth,e.armour);
-    return text;
+    std::string out=text;
+    if(e.detailKnown){
+        auto value=[](uint64_t n,bool known){return known?std::to_string(n):std::string("UNKNOWN");};
+        out+=" span "+value(e.span,(e.detailKnown&flight::SpanKnown)!=0)+" mission "+value(e.missionRun,(e.detailKnown&flight::MissionKnown)!=0);
+        out+=" phase "+value(e.missionPhase,(e.detailKnown&flight::MissionKnown)!=0)+" scriptBirth "+value(e.scriptBirth,(e.detailKnown&flight::ScriptBirthKnown)!=0);
+        out+=" opcode "+value(e.opcode,(e.detailKnown&(flight::InstructionKnown|flight::OpcodeKnown))!=0)+" IPoffset "+value(e.scriptOffset,(e.detailKnown&(flight::InstructionKnown|flight::ScriptOffsetKnown))!=0);
+        out+=" owner "+value(e.owner,(e.detailKnown&flight::OwnerKnown)!=0)+" ownerEpoch "+value(e.ownerEpoch,(e.detailKnown&flight::OwnerEpochKnown)!=0);
+    }
+    return out;
 }
 inline std::string HookText(const hookreg::Record&r){
     char text[256],rva[32];

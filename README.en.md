@@ -48,6 +48,8 @@ Use matching story scripts, vehicle handling data and model collisions across pl
 
 ## Reporting a problem
 
+Open **F9 → Diagnostics** for network and entity state, events, hooks and timing measurements. **Start recording / Stop recording** control recording; **Save recent** exports recent events. This is a bounded history of instrumented paths; loss counters show when it is incomplete.
+
 Include the version, mission name and steps leading to the problem in an [issue](https://github.com/opiahex/reSA-Coop/issues). For synchronization problems, attach logs from the affected players for the same session:
 
 - `coop/coop.log`;

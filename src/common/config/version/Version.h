@@ -2,7 +2,7 @@
 #include <cstdint>
 
 #define COOP_NAME "SA:COOP"
-#define COOP_VERSION_STR "0.2.36-3p"
+#define COOP_VERSION_STR "0.2.37-3p"
 
 namespace coop {
 // Bumped on any incompatible change of the network protocol.
