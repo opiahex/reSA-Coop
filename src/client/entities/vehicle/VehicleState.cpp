@@ -36,13 +36,16 @@ VehicleState VehicleState::Capture(game::CVehicle* v) {
         s.misc = game::Field<uint16_t>(v, 0x86C);
     }
     if (type == game::VEHICLE_TYPE_PLANE) {
-        s.extras |= X_GEAR;
+        s.extras |= X_GEAR | X_ROTOR;
         s.gear = game::Field<float>(v, 0x9CC);
+        const float prop = game::Field<float>(v, 0x9C4); // CPlane::m_fPropSpeed
+        s.rotorSpeed = std::isfinite(prop) ? std::clamp(prop,0.0f,5.0f) : 0.0f;
     }
     int model = v->ModelIndex();
     if (type == game::VEHICLE_TYPE_HELI) {
         s.extras |= X_SEARCHLIGHT | X_ROTOR;
-        s.rotorSpeed=std::clamp(game::Field<float>(v,0x84C),0.0f,5.0f);
+        const float rotor=game::Field<float>(v,0x84C);
+        s.rotorSpeed=std::isfinite(rotor)?std::clamp(rotor,0.0f,5.0f):0.0f;
         s.searchTarget = game::Field<CVector>(v, 0x9F4);
         s.searchIntensity = std::clamp(game::Field<float>(v, 0xA00), 0.0f, 1.0f);
     }

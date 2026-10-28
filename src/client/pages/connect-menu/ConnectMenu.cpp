@@ -1,4 +1,5 @@
 #include "pages/connect-menu/ConnectMenu.h"
+#include "widgets/overlay/DiagnosticPanel.h"
 
 #include <windows.h>
 
@@ -25,6 +26,7 @@ constexpr uint32_t kText = 0xFFE6E9EF;
 constexpr uint32_t kGold = 0xFFE2C063;  // the game's mission-title cream
 
 bool g_visible = false;
+bool g_diagnosticView = false;
 bool g_autoShown = false;
 int g_tab = 0;  // 0 "connect", 1 "create"
 std::wstring g_nick, g_addr, g_port, g_password;
@@ -100,6 +102,7 @@ uint16_t PortValue() {
 void SetConnectMenuVisible(bool visible) {
     if (visible == g_visible) return;
     g_visible = visible;
+    g_diagnosticView = false;
     if (visible) {
         LoadFields();
         if (TheChat().IsOpen()) TheChat().Close();
@@ -127,6 +130,20 @@ void RenderConnectMenu() {
     auto& g = Gfx();
     float s = g.Scale();
     auto& net = Net();
+    const bool ownsDiagnosticInput = In().KeyboardCaptured() && In().MouseCaptured();
+    if (Cfg().debugOverlay && g_diagnosticView) {
+        g.Rect(0, 0, g.Width(), g.Height(), 0x99000000);
+        w::BeginFrame();
+        RenderDiagnosticPanel(ownsDiagnosticInput);
+        if (ownsDiagnosticInput && w::Button("diagnostic-back", 24 * s, 24 * s, 280 * s, 34 * s,
+                                            TR("К подключению", "Back to co-op"))) {
+            g_diagnosticView = false;
+            w::SetFocus("");
+        }
+        w::EndFrame();
+        w::DrawCursor(); // the existing F9 menu owns capture; diagnostics never acquires it
+        return;
+    }
     bool online = net.Online();
     auto phase = flow::GetPhase();
     bool busy = phase == flow::Phase::StartingServer || phase == flow::Phase::Connecting ||
@@ -148,6 +165,11 @@ void RenderConnectMenu() {
     g.Rect(0, 0, g.Width(), g.Height(), 0x99000000);
     w::BeginFrame();
     float cy = w::Panel(x, y, W, H, "SA:COOP") + 8 * s;
+    if (Cfg().debugOverlay && ownsDiagnosticInput &&
+        w::Button("diagnostic-open", 24 * s, 24 * s, 280 * s, 34 * s, TR("Диагностика", "Diagnostics"))) {
+        g_diagnosticView = true;
+        w::SetFocus("");
+    }
     float vx = x + W - 52 * s;
     g.Text(FONT_MENU_SMALL, vx, y + 36 * s, "v" COOP_VERSION_STR, kSaSlate, TEXT_RIGHT);
     // the language switch left of the version, the pointer at the active one; the choice is saved at once

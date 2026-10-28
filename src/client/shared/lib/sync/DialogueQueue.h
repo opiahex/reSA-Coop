@@ -16,21 +16,22 @@ struct DialogueQueue {
     };
     std::deque<Clip> clips;
     uint32_t latest = 0;
-    void Receive(uint8_t op, int event, uint32_t token, uint64_t now) {
-        if (!token) return;
+    bool Receive(uint8_t op, int event, uint32_t token, uint64_t now) {
+        if (!token || op < 1 || op > 3) return false;
         for (auto& c : clips) if (c.token == token) {
+            if (c.event != event) return false;
             if (op == 2) c.play = true;
             if (op == 3) c.clear = true;
-            return;
+            return true;
         }
-        if (op == 3 || (latest && (int32_t)(token - latest) <= 0)) return;
-        if (op != 1 && op != 2) return;
+        if (op == 3 || (latest && (int32_t)(token - latest) <= 0)) return false;
         latest = token;
         // An unused preload may be replaced; a line with a PLAY request may not.
         if (!clips.empty() && !clips.back().play) clips.pop_back();
         // Requested lines retire/cancel explicitly; a loading guest must not
         // silently lose the seventeenth spoken line.
         clips.push_back({event, token, op == 2, false, false, false, now, 0});
+        return true;
     }
     bool Retire(uint64_t now, bool finished) {
         if (clips.empty()) return false;

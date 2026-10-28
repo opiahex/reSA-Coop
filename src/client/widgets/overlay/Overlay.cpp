@@ -1,4 +1,5 @@
 #include "widgets/overlay/Overlay.h"
+#include "widgets/overlay/DiagnosticPanel.h"
 
 #include <algorithm>
 
@@ -82,46 +83,7 @@ void RenderOverlay() {
         for (auto& [id, p] : net.Peers()) row(p.name, p.isHost, p.ping, false, VoiceIsSpeaking(id));
     }
 
-    if (Cfg().debugOverlay) {
-        auto& nc = net.Net();
-        g.Text(FONT_SMALL, 16 * s, g.Height() * 0.5f,
-               Format("net in %llu KB / out %llu KB, state %d, phase %d", (unsigned long long)(nc.BytesIn() / 1024),
-                      (unsigned long long)(nc.BytesOut() / 1024), (int)net.GetState(), (int)flow::GetPhase()),
-               0xFFFFFF80, TEXT_OUTLINE);
-        float y = g.Height() * 0.5f + g.LineHeight(FONT_SMALL);
-        if (game::CPlayerPed* me = game::FindPlayerPed(0); me && me->InVehicle() && me->Vehicle()) {
-            game::CVehicle* v = me->Vehicle();
-            game::CPad* pad = game::GetPad(0);
-            g.Text(FONT_SMALL, 16 * s, y,
-                   Format("my car: model %d status %d engine %d driver %s gas %.2f speed %.1f cross %d getIn %d/%02X getOut %02X pass %d",
-                          v->ModelIndex(), v->Status(), v->EngineOn(), v->Driver() == me ? "me" : "other", v->GasPedal(),
-                          v->MoveSpeed().Length() * 50.0f, pad->NewState.ButtonCross,
-                          game::Field<uint8_t>(v, 0x485), game::Field<uint8_t>(v, 0x486), game::Field<uint8_t>(v, 0x487),
-                          v->NumPassengers()),
-                   0xFF80FFFF, TEXT_OUTLINE);
-            y += g.LineHeight(FONT_SMALL);
-            g.Text(FONT_SMALL, 16 * s, y,
-                   Format("   flags %08X %08X wheelsOnGround %d pos %.1f %.1f %.1f pad LX %d LY %d RS1 %d Sq %d", v->VehicleFlagsLo(),
-                          v->VehicleFlagsHi(), game::Field<uint8_t>(v, 0x961), v->GetPosition().x, v->GetPosition().y,
-                          v->GetPosition().z, pad->NewState.LeftStickX, pad->NewState.LeftStickY, pad->NewState.RightShoulder1,
-                          pad->NewState.ButtonSquare),
-                   0xFF80FFFF, TEXT_OUTLINE);
-            y += g.LineHeight(FONT_SMALL);
-        }
-        for (auto& [id, rp] : Players::Instance().All()) {
-            game::CVector p = rp.ped ? rp.ped->GetPosition() : game::CVector{};
-            game::CPlayerPed* me = game::FindPlayerPed(0);
-            float d = (me && rp.ped) ? (p - me->GetPosition()).Length() : -1.0f;
-            int task = rp.ped ? ActivePrimaryTaskType(rp.ped) : -1;
-            int seatHere = rp.ped && rp.ped->InVehicle() ? PassengerSeatOf(rp.ped->Vehicle(), rp.ped) : -9;
-            g.Text(FONT_SMALL, 16 * s, y,
-                   Format("remote %d: ped %s pos %.1f %.1f %.1f net %.1f %.1f %.1f dist %.1f mode %d veh %04X seat %d here %d task %d", id,
-                          rp.ped ? "ok" : "none", p.x, p.y, p.z, rp.state.pos.x, rp.state.pos.y, rp.state.pos.z, d,
-                          (int)rp.mode, rp.vehNetId, rp.seat, seatHere, task),
-                   0xFFFFFF80, TEXT_OUTLINE);
-            y += g.LineHeight(FONT_SMALL);
-        }
-    }
+    if (!core::ConnectMenuVisible()) RenderDiagnosticPanel(false);
 }
 
 }  // namespace coop::ui

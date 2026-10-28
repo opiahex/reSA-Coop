@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "entities/player/PlayerState.h"
+#include "common/lib/diagnostics/FlightRecorder.h"
 #include "entities/vehicle/VehicleState.h"
 #include "shared/game/Game.h"
 #include "shared/lib/core/Core.h"
@@ -33,6 +34,9 @@ struct RemotePlayer {
     uint64_t spawnedAt=0;
     uint64_t stateRecvMs = 0;   // local time of reception
     uint32_t lastStateTime = 0; // sender time of the latest applied state (drops reordered packets)
+    flight::Context diagnosticState{};
+    bool diagnosticApplyPending=false;
+    bool diagnosticMissingReported=false;
     SnapshotBuffer<OnFootState> history;
     game::CControllerState padNew{}, padOld{};
     PadState storyPad,previousStoryPad; // raw accepted input before visual enter/exit filtering

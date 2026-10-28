@@ -2,7 +2,9 @@
 
 [![Release](https://img.shields.io/github/v/release/opiahex/reSA-Coop?label=release)](https://github.com/opiahex/reSA-Coop/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/opiahex/reSA-Coop/total?label=downloads)](https://github.com/opiahex/reSA-Coop/releases)
-[![License](https://img.shields.io/github/license/opiahex/reSA-Coop)](LICENSE)
+[![License](https://img.shields.io/badge/license-MIT%20%2B%20Diagnostics-97CA00)](DIAGNOSTICS-LICENSE.txt)
+
+[![Telegram group](https://img.shields.io/badge/Telegram%20group-26A5E4?logo=telegram&logoColor=white)](https://t.me/resacoop)
 
 # reSA-Coop
 
@@ -71,4 +73,6 @@ python tools/build.py dist
 
 SA:COOP — [Karimov-Akbar](https://github.com/Karimov-Akbar/sa-coop). Разработка reSA-Coop — [opiahex](https://github.com/opiahex).
 
-Лицензия — [MIT](LICENSE). Уведомления об авторстве сохранены; лицензии ENet и MinHook включены в архив. Проект не связан с Rockstar Games.
+Базовый SA:COOP, ранее выпущенный код reSA-Coop и существующий интеграционный код сохраняют [MIT](LICENSE). Для оригинальных компонентов [reSA-Coop Diagnostic System by opiahex](https://github.com/opiahex/reSA-Coop) действуют [отдельные условия атрибуции](DIAGNOSTICS-LICENSE.txt); точный состав указан в [перечне файлов](DIAGNOSTICS-COMPONENTS.md). При распространении этих компонентов сохраняются opiahex и ссылка на исходный проект — см. [уведомление](DIAGNOSTICS-NOTICE.md).
+
+ENet и MinHook сохраняют свои лицензии, включённые в архив. Проект не связан с Rockstar Games.

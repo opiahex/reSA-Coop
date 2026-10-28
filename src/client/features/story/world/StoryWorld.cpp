@@ -34,7 +34,7 @@ uint32_t mapRevision=0,receivedMapRevision=0,snapshotRevision=0,snapshotExpected
 bool snapshotOpen=false,haveSnapshot=false;uint64_t requestedAt=0;
 uint32_t NextRevision(){if(++mapRevision==0)++mapRevision;return mapRevision;}
 std::array<uint32_t,5> progress{},sentProgress{};bool haveProgress=false,progressSent=false;
-uint64_t sentAt=0,appliedAt=0;uint32_t revision=0,receivedRevision=0;
+uint64_t sentAt=0,appliedAt=0,campaignCheckedAt=0;uint32_t revision=0,receivedRevision=0;
 bool Valid(const MapEdit&e){return(e.op==0x0363||e.op==0x088D||e.op==0x03B6)&&std::isfinite(e.at.x)&&std::isfinite(e.at.y)&&std::isfinite(e.at.z)&&e.at.Length()<25000&&std::isfinite(e.radius)&&e.radius>0&&e.radius<=200&&e.model>0&&e.model<20000&&(e.op!=0x03B6||(e.value>0&&e.value<20000));}
 int ResolveModel(int m){return m<0&&m>-395?Ref<int32_t>(0xA44B70+(uintptr_t)(-m)*0x1C+0x18):m;}
 void Remember(const MapEdit&e){
@@ -43,6 +43,34 @@ void Remember(const MapEdit&e){
 }
 void Send(const MapEdit&e){Writer w(proto::G_STORY_WORLD);w.U8(MAP);w.U32(mapRevision);w.U16(e.op);w.Vec({e.at.x,e.at.y,e.at.z});w.F32(e.radius);w.I32(e.model);w.I32(e.value);Net().Send(proto::CH_RELIABLE,w);}
 void SendIpl(const std::string&name,const IplState&state){Writer w(proto::G_STORY_WORLD);w.U8(IPL);w.U32(mapRevision);w.U8(state.op);w.Str(name,32);w.U32(state.incarnation);Net().Send(proto::CH_RELIABLE,w);}
+void CaptureCampaignIpls(bool publish){
+    // These two explicit campaign IPLs can have been removed before joining
+    // co-op. GTA's save only stores loaded+disabled, not an unloaded IPL's
+    // explicit removal. Seed the host's actual native state, never progression
+    // guesses or a blanket removal of road collisions.
+    if(!Net().Online()||!Net().IsHost()||!core::IsPlayerReady()||core::IsRestarting()||!flow::InHostWorld())return;
+    auto*pool=Ref<CPoolHeader*>(0x8E3FB0);if(!pool||!pool->objects||!pool->byteMap)return;
+    for(const char*name:{"barriers1","barriers2"}){
+        const int slot=Call<0x404AC0,int>(name);
+        if(slot<=0||slot>=pool->size||slot>=1061||pool->byteMap[slot]<0)continue;
+        const char*nativeName=Call<0x404A60,const char*>(slot);
+        if(!nativeName||strnlen(nativeName,33)>32||IplName(nativeName)!=name)continue;
+        auto*def=pool->objects+(size_t)slot*0x34;
+        if(!Field<uint8_t>(def,0x2F)||Field<uint8_t>(def,0x30))continue;
+        const bool loaded=Field<uint8_t>(def,0x2D)!=0;
+        // Resource states: 0 not loaded, 1 loaded, 2 requested, 3 reading,
+        // 4 finishing. A pending request must remain closed, not be mistaken
+        // for an explicit removal while asynchronous streaming completes.
+        const auto streaming=Ref<uint8_t>(addr::StreamingInfo+(uintptr_t)(25255+slot)*0x14+0x10);
+        if(streaming>4)continue;
+        const uint8_t op=(loaded||streaming)?0:1;
+        auto existing=ipls.find(name);if(existing!=ipls.end()&&existing->second.op==op)continue;
+        auto state=existing==ipls.end()?IplState{}:existing->second;state.op=op;NextRevision();
+        if(op==1){state.incarnation=mapRevision;ResetWorldObjectIpl(name,state.incarnation,true);}
+        ipls[name]=state;if(publish)SendIpl(name,state);
+        LOGI("Story campaign IPL captured name=%s op=%u loaded=%u streaming=%u incarnation=%u",name,op,loaded,streaming,state.incarnation);
+    }
+}
 void SendProgress(){
     std::array<uint32_t,5> values{};memcpy(values.data(),(void*)(0xB79000+(146-120)*4),12);memcpy(values.data()+3,(void*)0xB79380,8);
     if(progressSent&&values==sentProgress&&NowMs()-sentAt<3000)return;
@@ -166,6 +194,7 @@ void Receive(uint8_t from,Reader&r){
         progress=values;receivedRevision=rev;haveProgress=true;}
 }
 void Snapshot(){
+    CaptureCampaignIpls(false);
     Writer begin(proto::G_STORY_WORLD);begin.U8(SNAPSHOT_BEGIN);begin.U32(mapRevision);begin.U32((uint32_t)(edits.size()+ipls.size()));Net().Send(proto::CH_RELIABLE,begin);
     for(auto&e:edits)Send(e);for(auto&[name,state]:ipls)SendIpl(name,state);
     Writer end(proto::G_STORY_WORLD);end.U8(SNAPSHOT_END);end.U32(mapRevision);Net().Send(proto::CH_RELIABLE,end);
@@ -217,7 +246,10 @@ class StoryWorld:public Module{
     void OnPostProcess()override{
         UpdateDarkness();
         if(!Net().Online()||!core::IsPlayerReady()||!flow::InHostWorld())return;
-        if(Net().IsHost()){if(NowMs()-sentAt>500)SendProgress();return;}
+        if(Net().IsHost()){
+            if(NowMs()-campaignCheckedAt>=500){campaignCheckedAt=NowMs();CaptureCampaignIpls(true);}
+            if(NowMs()-sentAt>500)SendProgress();return;
+        }
         if(haveProgress){memcpy((void*)(0xB79000+(146-120)*4),progress.data(),12);memcpy((void*)0xB79380,progress.data()+3,8);}
         if(NowMs()-appliedAt<500)return;appliedAt=NowMs();auto*me=FindPlayerPed(0);
         ApplyIpls();ApplyEdits(me->GetPosition());
@@ -225,7 +257,7 @@ class StoryWorld:public Module{
     void OnPeerResync(uint8_t)override{if(Net().IsHost()){Snapshot();progressSent=false;}}
 
     void OnPeerJoin(uint8_t)override{progressSent=false;}
-    void OnGameShutdown()override{ClearDarkness();mapRevision=receivedMapRevision=0;snapshotOpen=haveSnapshot=false;requestedAt=0;edits.clear();ipls.clear();appliedFarIpls.clear();appliedIplIncarnations.clear();haveProgress=progressSent=false;receivedRevision=0;sentAt=appliedAt=0;}
+    void OnGameShutdown()override{ClearDarkness();mapRevision=receivedMapRevision=0;snapshotOpen=haveSnapshot=false;requestedAt=0;edits.clear();ipls.clear();appliedFarIpls.clear();appliedIplIncarnations.clear();haveProgress=progressSent=false;receivedRevision=0;sentAt=appliedAt=campaignCheckedAt=0;}
     void OnHostChanged(uint8_t)override{ClearDarkness();if(Net().IsHost()&&receivedMapRevision&&(!mapRevision||(int32_t)(receivedMapRevision-mapRevision)>0))mapRevision=receivedMapRevision;}
     void OnSessionEnd()override{OnGameShutdown();revision=0;}
 }feature;struct Reg{Reg(){core::RegisterModule(&feature);}}reg;

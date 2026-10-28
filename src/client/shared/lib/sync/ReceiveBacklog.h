@@ -19,17 +19,20 @@ inline uint64_t ReceivePacketLifetime(uint8_t channel) {
 // During a loading pause, discard expired movement/voice already in the queue.
 // Reliable events and world/profile transfers keep their original order. Dropping
 // new arrivals instead kept the oldest poses and discarded the recovery frames.
-template <class Packet>
-size_t ExpireReceiveBacklog(std::vector<Packet>& packets, uint64_t now, uint64_t& bytes) {
+template <class Packet,class OnExpire>
+size_t ExpireReceiveBacklog(std::vector<Packet>& packets, uint64_t now, uint64_t& bytes,OnExpire onExpire) {
     const auto before = packets.size();
     packets.erase(std::remove_if(packets.begin(), packets.end(), [&](const Packet& packet) {
         const auto lifetime = ReceivePacketLifetime(packet.channel);
         if (!lifetime || !packet.received || now < packet.received || now - packet.received <= lifetime) return false;
+        onExpire(packet);
         const auto size = packet.data.size();
         bytes = size > bytes ? 0 : bytes - size;
         return true;
     }), packets.end());
     return before - packets.size();
 }
+template<class Packet>
+size_t ExpireReceiveBacklog(std::vector<Packet>&packets,uint64_t now,uint64_t&bytes){return ExpireReceiveBacklog(packets,now,bytes,[](const Packet&){});}
 
 }  // namespace coop

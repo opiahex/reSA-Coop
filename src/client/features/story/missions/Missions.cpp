@@ -55,6 +55,7 @@
 #include "shared/lib/core/Core.h"
 #include "shared/lib/sync/SceneBarrier.h"
 #include "shared/lib/sync/DialogueQueue.h"
+#include "shared/lib/sync/DialogueContext.h"
 #include "shared/lib/sync/GroupReadiness.h"
 #include "shared/lib/sync/SchoolPolicy.h"
 #include "shared/api/progress/SchoolProgress.h"
@@ -1254,8 +1255,10 @@ void ReplayMissionText(uint8_t to){
 }
 
 bool g_nativeSubtitle=false,g_textIsSubtitle=false;
-struct SubtitlePacket{std::vector<uint8_t>bytes;uint64_t deadline=0,run=0;uint32_t phase=0;};
+struct SubtitlePacket{std::vector<uint8_t>bytes;uint64_t deadline=0;DialogueContext context;uint32_t phase=0;};
 std::vector<SubtitlePacket>g_pendingSubtitles;uint64_t g_replayingSubtitleDeadline=0;
+DialogueContext CurrentDialogueContext(){return {Net().IsHost()?Net().WorldEpoch():Net().PeerWorldEpoch(Net().HostId()),StoryRunId()};}
+DialogueContext SubtitleAudioContext(int slot);
 bool SubtitlesEnabled(){return g_storySubtitlePreference>=0?g_storySubtitlePreference!=0:Ref<uint8_t>(0xBA678C)!=0;}
 std::pair<int,uint32_t>SubtitleAudio();
 bool SubtitleWaiting(int slot,uint32_t token,uint32_t&time);
@@ -1278,7 +1281,7 @@ void SendText(uint8_t kind, const char* text, uint32_t time, uint16_t flag, cons
     w.U8(bools);
     bool mission = false;
     w.U32(text ? GxtHashOf(text, mission) : 0);
-    w.Str(mission ? MissionTable() : std::string(), 8);w.Bool(g_textIsSubtitle);auto binding=g_textIsSubtitle?SubtitleAudio():std::pair<int,uint32_t>{-1,0};w.I8((int8_t)binding.first);w.U32(binding.second);bool insertMission=false;w.Str(insert?insert:"",399);w.U32(insert?GxtHashOf(insert,insertMission):0);w.Str(insertMission?MissionTable():std::string(),8);w.U8(proto::kServerId);
+    w.Str(mission ? MissionTable() : std::string(), 8);w.Bool(g_textIsSubtitle);auto binding=g_textIsSubtitle?SubtitleAudio():std::pair<int,uint32_t>{-1,0};w.I8((int8_t)binding.first);w.U32(binding.second);SubtitleAudioContext(binding.first).Write(w);w.U32(CooperativeStoryPhase());bool insertMission=false;w.Str(insert?insert:"",399);w.U32(insert?GxtHashOf(insert,insertMission):0);w.Str(insertMission?MissionTable():std::string(),8);w.U8(proto::kServerId);
     if(kind==TXT_CLEAR)g_recentMissionText.clear();
     else if(kind==TXT_CLEAR_SMALL)g_recentMissionText.erase(TXT_MSG);
     else if(kind==TXT_HELP||kind==TXT_MSG||kind==TXT_MSG_Q){
@@ -1369,14 +1372,16 @@ void HandleText(uint8_t from, Reader& r) {
     uint8_t bools = r.U8();
     uint32_t hash = r.U32();
     std::string table = r.Str(8);
-    bool subtitle=r.Bool();int slot=r.I8();auto token=r.U32();auto insert=r.Str(399);auto insertHash=r.U32();auto insertTable=r.Str(8);
+    bool subtitle=r.Bool();int slot=r.I8();auto token=r.U32();DialogueContext context;if(!context.Read(r))return;auto phase=r.U32();auto insert=r.Str(399);auto insertHash=r.U32();auto insertTable=r.Str(8);
     auto to=r.U8();if(to!=proto::kServerId&&to!=Net().MyId())return;
     if (!r.Ok() || from != Net().HostId() || Net().IsHost() || !core::IsPlayerReady() || !flow::InHostWorld()) return;
     if(GuestPersonalAttempt())return;
     if(subtitle&&!SubtitlesEnabled())return;
-    if(subtitle&&SubtitleWaiting(slot,token,time)){
+    if(subtitle&&(context.Compare(CurrentDialogueContext())==DialogueContext::Stale||
+        (context.run==StoryRunId()&&phase<CooperativeStoryPhase())))return;
+    if(subtitle&&(context.Compare(CurrentDialogueContext())==DialogueContext::Future||phase>CooperativeStoryPhase()||SubtitleWaiting(slot,token,time))){
         auto deadline=g_replayingSubtitleDeadline?g_replayingSubtitleDeadline:NowMs()+15000;
-        if(NowMs()<deadline)g_pendingSubtitles.push_back({std::vector<uint8_t>(packetStart,packetStart+packetSize),deadline,StoryRunId(),CooperativeStoryPhase()});
+        if(NowMs()<deadline&&g_pendingSubtitles.size()<128)g_pendingSubtitles.push_back({std::vector<uint8_t>(packetStart,packetStart+packetSize),deadline,context,phase});
         return;
     }
     if(subtitle&&token&&!time)return;
@@ -2067,6 +2072,7 @@ void UpdatePartnerCutscene() {
 
 // Story dialogue is streamed separately from subtitles. Each guest waits for its own disk load.
 DialogueQueue g_audioSlots[4];
+DialogueContext g_audioContext,g_hostAudioContext[4];
 AudioTarget g_hostAudioTarget[4];
 std::map<uint32_t, AudioTarget> g_audioTargets[4];
 bool g_applyingAudio=false;
@@ -2078,13 +2084,15 @@ uint32_t g_hostAudioToken[4] = {};
 int g_hostAudio[4] = {-1, -1, -1, -1};
 bool g_hostAudioPlaying[4] = {};
 uint64_t g_hostAudioStamp[4]{};
+DialogueContext SubtitleAudioContext(int slot){return slot>=0&&slot<4?g_hostAudioContext[slot]:CurrentDialogueContext();}
 std::pair<int,uint32_t>SubtitleAudio(){
     int slot=-1;uint64_t latest=0;
-    for(int i=0;i<4;++i)if(g_hostAudio[i]>=0&&g_hostAudioStamp[i]>latest&&NowMs()-g_hostAudioStamp[i]<15000&&(!g_hostAudioPlaying[i]||!CallMethod<0x5072C0,bool>((void*)0xB6BC90,(uint8_t)i))){slot=i;latest=g_hostAudioStamp[i];}
+    for(int i=0;i<4;++i)if(g_hostAudioContext[i]==CurrentDialogueContext()&&g_hostAudio[i]>=0&&g_hostAudioStamp[i]>latest&&NowMs()-g_hostAudioStamp[i]<15000&&(!g_hostAudioPlaying[i]||!CallMethod<0x5072C0,bool>((void*)0xB6BC90,(uint8_t)i))){slot=i;latest=g_hostAudioStamp[i];}
     return {slot,slot<0?0:g_hostAudioToken[slot]};
 }
 bool SubtitleWaiting(int slot,uint32_t token,uint32_t&time){
     if(slot<0||slot>=4||!token)return false;
+    if(g_audioContext!=CurrentDialogueContext())return true;
     const auto&q=g_audioSlots[slot];
     for(const auto&c:q.clips)if(c.token==token){if(!c.started||!c.observedPlaying)return true;auto age=NowMs()-c.startedAt;time=age<time?time-(uint32_t)age:1500;return false;}
     if(q.latest&&(int32_t)(token-q.latest)<=0){time=0;return false;}
@@ -2093,27 +2101,64 @@ bool SubtitleWaiting(int slot,uint32_t token,uint32_t&time){
 bool DialogueBusy(){for(auto&q:g_audioSlots)if(!q.clips.empty()&&q.clips.front().play)return true;return !g_pendingSubtitles.empty();}
 void UpdateSubtitles(){
     auto pending=std::move(g_pendingSubtitles);g_pendingSubtitles.clear();
-    for(auto&p:pending)if(NowMs()<p.deadline&&p.run==StoryRunId()&&p.phase==CooperativeStoryPhase()){
+    for(auto&p:pending)if(NowMs()<p.deadline&&p.context.Compare(CurrentDialogueContext())!=DialogueContext::Stale&&
+        (p.context.run!=StoryRunId()||p.phase>=CooperativeStoryPhase())){
         g_replayingSubtitleDeadline=p.deadline;Reader r(p.bytes.data(),p.bytes.size());HandleText(Net().HostId(),r);
     }
     g_replayingSubtitleDeadline=0;
 }
-std::vector<std::vector<uint8_t>> g_pendingAudio;
+struct PendingAudioPacket{
+    DialogueContext context;
+    AudioTarget target;
+    std::array<uint32_t,4> limits{};
+    uint64_t deadline=0;
+    uint32_t token=0,connection=0;
+    int event=-1;
+    uint8_t op=0,slot=0,to=255,from=255;
+};
+std::vector<PendingAudioPacket> g_pendingAudio;
 using LoadAudioFn = void(__fastcall*)(void*, void*, uint8_t, int32_t);
 using SlotAudioFn = void(__fastcall*)(void*, void*, uint8_t);
 LoadAudioFn g_origLoadAudio = nullptr;
 SlotAudioFn g_origPlayAudio = nullptr, g_origClearAudio = nullptr;
+struct NativeDialogueSlot{DialogueContext context;uint32_t token=0;int event=-1;};
+NativeDialogueSlot g_nativeDialogue[4];
+void ClearNativeDialogue(uint8_t slot,uint32_t token){
+    auto&owner=g_nativeDialogue[slot];
+    if(!token||owner.token!=token||owner.context!=g_audioContext)return;
+    // A personal script can borrow the same native slot. Its allowed native
+    // load/play/clear revokes this lease before a delayed host CLEAR arrives.
+    if(core::IsPlayerReady()&&CallMethod<0x5072D0,int32_t>((void*)0xB6BC90,slot)==owner.event)
+        g_origClearAudio((void*)0xB6BC90,nullptr,slot);
+    owner={};
+}
+void AdoptDialogueContext(const DialogueContext&context){
+    if(g_audioContext==context)return;
+    for(uint8_t slot=0;slot<4;++slot){
+        ClearNativeDialogue(slot,g_nativeDialogue[slot].token);
+        g_audioSlots[slot]={};g_audioTargets[slot].clear();
+    }
+    g_audioContext=context;
+}
+bool PendingAudioCurrent(const PendingAudioPacket&packet){
+    auto*host=Net().Peer(packet.from);
+    if(packet.from!=Net().HostId()||!host||packet.connection!=host->incarnation||NowMs()>=packet.deadline)return false;
+    return packet.context.Compare(CurrentDialogueContext())!=DialogueContext::Stale;
+}
+void QueuePendingAudio(PendingAudioPacket packet){
+    if(PendingAudioCurrent(packet)&&g_pendingAudio.size()<128)g_pendingAudio.push_back(std::move(packet));
+}
 
 void SendMissionAudio(uint8_t op, uint8_t slot, int event, uint8_t to = proto::kServerId) {
     Writer w(proto::G_GAME_EVENT);
-    w.U8(op); w.U8(slot); w.I32(event); w.U32(g_hostAudioToken[slot]); w.U8(to); g_hostAudioTarget[slot].Write(w);
+    w.U8(op);g_hostAudioContext[slot].Write(w);w.U8(slot); w.I32(event); w.U32(g_hostAudioToken[slot]); w.U8(to); g_hostAudioTarget[slot].Write(w);
     if(op==2)LOGD("Dialogue send slot %u: placed %d, target %u/%04X",slot,g_hostAudioTarget[slot].placed,g_hostAudioTarget[slot].kind,g_hostAudioTarget[slot].id);
     Net().Send(proto::CH_RELIABLE, w);
     SyncTrace().Push({"dialogue_send",NowMs(),g_hostAudioToken[slot],event,to,slot,op});
 }
 void AudioReceipt(uint8_t slot,uint32_t token,int event,uint8_t stage){
     SyncTrace().Push({"dialogue_local",NowMs(),token,event,Net().MyId(),slot,stage});
-    Writer w(proto::G_AUDIO_RECEIPT);w.U8(slot);w.U32(token);w.I32(event);w.U8(stage);Net().Send(proto::CH_RELIABLE,w);
+    Writer w(proto::G_AUDIO_RECEIPT);g_audioContext.Write(w);w.U8(slot);w.U32(token);w.I32(event);w.U8(stage);Net().Send(proto::CH_RELIABLE,w);
 }
 void __fastcall HookLoadAudio(void* audio, void* edx, uint8_t slot, int32_t event) {
     if(Net().Online()&&!Net().IsHost()&&slot<4&&g_csState==0&&PersonalActivity(g_currentScript)){
@@ -2125,16 +2170,19 @@ void __fastcall HookLoadAudio(void* audio, void* edx, uint8_t slot, int32_t even
         }
     }
     if(SharedAudioSlot(slot))return;
+    if(slot<4)g_nativeDialogue[slot]={};
     g_origLoadAudio(audio, edx, slot, event);
     if (slot >= 4 || !SharedStoryScript(g_currentScript)) return;
     if (++g_hostAudioToken[slot] == 0) ++g_hostAudioToken[slot];
     g_hostAudio[slot] = event;g_hostAudioStamp[slot]=NowMs();
+    g_hostAudioContext[slot]=CurrentDialogueContext();
     g_hostAudioTarget[slot] = {};
     g_hostAudioPlaying[slot] = false;
     if (Replicating()) SendMissionAudio(1, slot, event);
 }
 void __fastcall HookPlayAudio(void* audio, void* edx, uint8_t slot) {
     if(SharedAudioSlot(slot))return;
+    if(slot<4)g_nativeDialogue[slot]={};
     g_origPlayAudio(audio, edx, slot);
     if (slot < 4 && SharedStoryScript(g_currentScript)) {
         g_hostAudioPlaying[slot] = true;g_hostAudioStamp[slot]=NowMs();
@@ -2143,6 +2191,7 @@ void __fastcall HookPlayAudio(void* audio, void* edx, uint8_t slot) {
 }
 void __fastcall HookClearAudio(void* audio, void* edx, uint8_t slot) {
     if(SharedAudioSlot(slot))return;
+    if(slot<4)g_nativeDialogue[slot]={};
     g_origClearAudio(audio, edx, slot);
     if (slot < 4 && Net().Online() && Net().IsHost() && (!g_currentScript || SharedStoryScript(g_currentScript))) {
         if (g_hostAudio[slot] >= 0) SendMissionAudio(3, slot, g_hostAudio[slot]);
@@ -2167,54 +2216,60 @@ CVector* __fastcall HookAudioAttach(void* audio,void* edx,uint8_t slot,CPhysical
 VoidFn g_originalSkipScene=nullptr;
 void __cdecl SharedSkipScene(){
     if(Net().Online()&&Net().IsHost()&&g_sharedScene){
-        Writer w(proto::G_GAME_EVENT);w.U8(5);for(auto token:g_hostAudioToken)w.U32(token);Net().Send(proto::CH_RELIABLE,w);
+        Writer w(proto::G_GAME_EVENT);w.U8(5);CurrentDialogueContext().Write(w);for(uint8_t slot=0;slot<4;++slot)w.U32(g_hostAudioContext[slot]==CurrentDialogueContext()?g_hostAudioToken[slot]:0);Net().Send(proto::CH_RELIABLE,w);
         for(auto&playing:g_hostAudioPlaying)playing=false;for(auto&event:g_hostAudio)event=-1;
         LOGI("Shared dialogue cancelled through current tokens after scene skip");
     }
     g_originalSkipScene();
 }
 
-void HandleMissionAudio(uint8_t from, Reader& r) {
-    std::vector<uint8_t> packet(r.Cursor(), r.Cursor() + r.Remaining());
-    uint8_t op=r.U8();
-    if(op==5){
-        std::array<uint32_t,4>limits;for(auto&t:limits)t=r.U32();
-        if(!r.Ok()||from!=Net().HostId()||Net().IsHost())return;
-        if(!core::IsPlayerReady()||flow::GetPhase()==flow::Phase::LoadingWorld){g_pendingAudio.push_back(std::move(packet));return;}
-        for(uint8_t i=0;i<4;++i){auto&q=g_audioSlots[i];bool loaded=!q.clips.empty()&&q.clips.front().loaded;
-            if(q.CancelThrough(limits[i])&&loaded&&NowMs()>=g_localActivityUntil)g_origClearAudio((void*)0xB6BC90,nullptr,i);
-            for(auto it=g_audioTargets[i].begin();it!=g_audioTargets[i].end();)it=(int32_t)(it->first-limits[i])<=0?g_audioTargets[i].erase(it):std::next(it);
+void ApplyMissionAudio(PendingAudioPacket packet) {
+    if(Net().IsHost()||!PendingAudioCurrent(packet))return;
+    const auto verdict=packet.context.Compare(CurrentDialogueContext());
+    if(!core::IsPlayerReady()||flow::GetPhase()==flow::Phase::LoadingWorld||verdict==DialogueContext::Future){QueuePendingAudio(std::move(packet));return;}
+    if(!flow::InHostWorld())return;
+    AdoptDialogueContext(packet.context);
+    if(packet.op==5){
+        for(uint8_t i=0;i<4;++i){auto&q=g_audioSlots[i];auto before=q.clips.empty()?0:q.clips.front().token;
+            if(q.CancelThrough(packet.limits[i]))ClearNativeDialogue(i,before);
+            for(auto it=g_audioTargets[i].begin();it!=g_audioTargets[i].end();)it=(int32_t)(it->first-packet.limits[i])<=0?g_audioTargets[i].erase(it):std::next(it);
         }
         return;
     }
-    uint8_t slot=r.U8();
-    int event = r.I32();
-    uint32_t token = r.U32();
-    uint8_t to = r.U8();
-    AudioTarget target; if (!target.Read(r)) return;
-    if (to != proto::kServerId && to != Net().MyId()) return;
-    if (!r.Ok() || slot >= 4 || from != Net().HostId() || Net().IsHost()) return;
-    if (!core::IsPlayerReady() || flow::GetPhase() == flow::Phase::LoadingWorld) {
-        if (g_pendingAudio.size() < 128) g_pendingAudio.push_back(std::move(packet));
-        return;
+    const auto slot=packet.slot;const auto token=packet.token;const auto event=packet.event;
+    if(GuestPersonalAttempt()){AudioReceipt(slot,token,event,6);return;}
+    if(!g_audioSlots[slot].Receive(packet.op,event,token,NowMs()))return;
+    if(packet.op==2)AudioReceipt(slot,token,event,0);
+    if(g_audioTargets[slot].size()>32)g_audioTargets[slot].clear();
+    g_audioTargets[slot][token]=packet.target;
+}
+void HandleMissionAudio(uint8_t from, Reader& r) {
+    auto*host=Net().Peer(from);
+    if(from!=Net().HostId()||Net().IsHost()||!host)return;
+    PendingAudioPacket packet;packet.from=from;packet.connection=host->incarnation;packet.deadline=NowMs()+30000;
+    packet.op=r.U8();if(!packet.context.Read(r))return;
+    if(packet.op==5){
+        for(auto&limit:packet.limits)limit=r.U32();
+        if(!r.Ok())return;
+    }else{
+        packet.slot=r.U8();packet.event=r.I32();packet.token=r.U32();packet.to=r.U8();
+        // Resolve the framed generation exactly once, under Session's original
+        // entity context. A deferred replay must retain this identity even if
+        // the same network ID later belongs to a different native entity.
+        if(!packet.target.Read(r))return;
+        if(packet.to!=proto::kServerId&&packet.to!=Net().MyId())return;
+        if(!r.Ok()||packet.slot>=4||packet.op<1||packet.op>3||!packet.token||packet.event<0||packet.event>=100000)return;
     }
-    if(!flow::InHostWorld())return;
-    if(GuestPersonalAttempt()){if(event>=0&&event<100000)AudioReceipt(slot,token,event,6);return;}
-    if (event >= 0 && event < 100000) {
-        g_audioSlots[slot].Receive(op, event, token, NowMs());
-        if(op==2)AudioReceipt(slot,token,event,0);
-        if(g_audioTargets[slot].size()>32)g_audioTargets[slot].clear();
-        g_audioTargets[slot][token]=target;
-    }
+    ApplyMissionAudio(std::move(packet));
 }
 void UpdateMissionAudio() {
+    AdoptDialogueContext(CurrentDialogueContext());
     if(GuestPersonalAttempt()||(g_csState==0&&NowMs()<g_localActivityUntil))return;
     g_applyingAudio=true;
     auto pending = std::move(g_pendingAudio);
     g_pendingAudio.clear();
     for (auto& packet : pending) {
-        Reader r(packet.data(), packet.size());
-        HandleMissionAudio(Net().HostId(), r);
+        ApplyMissionAudio(std::move(packet));
     }
     for (uint8_t slot = 0; slot < 4; ++slot) {
         auto& queue = g_audioSlots[slot];
@@ -2225,7 +2280,7 @@ void UpdateMissionAudio() {
         if (queue.Retire(now, finished)) {
             AudioReceipt(slot,before.token,before.event,before.started&&before.observedPlaying?5:before.clear&&!before.play?6:7);
             g_audioTargets[slot].erase(before.token);
-            g_origClearAudio((void*)0xB6BC90, nullptr, slot);
+            ClearNativeDialogue(slot,before.token);
             if (queue.clips.empty()) continue;
         }
         auto& a = queue.clips.front();
@@ -2233,6 +2288,7 @@ void UpdateMissionAudio() {
             g_origClearAudio((void*)0xB6BC90, nullptr, slot);
             g_origLoadAudio((void*)0xB6BC90, nullptr, slot, a.event);
             a.loaded = true;
+            g_nativeDialogue[slot]={g_audioContext,a.token,a.event};
             a.loadSince=now;AudioReceipt(slot,a.token,a.event,1);
         }
         // Native slots are 0..3; the SCM query subtracts one from its 1..4
@@ -2854,7 +2910,7 @@ void PartnerMissionCleanup() {
         auto&q=g_audioSlots[slot];
         if(!q.clips.empty()){
             const auto&a=q.clips.front();AudioReceipt(slot,a.token,a.event,6);
-            if(core::IsPlayerReady()&&NowMs()>=g_localActivityUntil&&q.clips.front().loaded)g_origClearAudio((void*)0xB6BC90,nullptr,slot);
+            ClearNativeDialogue(slot,a.token);
         }
         q.Cancel();g_audioTargets[slot].clear();
     }
@@ -2980,8 +3036,10 @@ public:
         mem::HookFn(0x44CD30,&SharedTimerProcess,&g_originalTimerProcess,"COnscreenTimer::Process (isolated host values)");
         mem::HookFn(0x44CC20,&SharedTimerDisplay,&g_originalTimerDisplay,"COnscreenTimer::ProcessForDisplay (isolated host values)");
         Net().SetHandler(proto::G_AUDIO_RECEIPT,[](uint8_t from,Reader&r){
+            DialogueContext context;if(!context.Read(r))return;
             auto slot=r.U8();auto token=r.U32();auto event=r.I32();auto stage=r.U8();
             if(!r.Ok()||!Net().IsHost()||!Net().Peer(from)||slot>=4||stage>7||!token)return;
+            if(context.Compare(CurrentDialogueContext())!=DialogueContext::Current)return;
             SyncTrace().Push({"dialogue_receipt",NowMs(),token,event,from,slot,stage});
         });
         Net().SetHandler(proto::G_MISSION_STATE,[](uint8_t from,Reader&r){
@@ -3092,7 +3150,7 @@ public:
     }
     void OnGameStarted() override {
         g_schoolFlag=false;
-        Reset();
+        Reset(true);
         if (Net().Online() && !Net().IsHost() && !core::IsOnMission()) {
             // A snapshot may carry the host's transient script flags; no local story thread will undo them here.
             Ref<uint8_t>(0xBAA45D) = 1;
@@ -3115,7 +3173,8 @@ public:
     }
 
 private:
-    static void Reset() {
+    static void Reset(bool keepPendingAudio=false) {
+        auto pendingAudio=keepPendingAudio?std::move(g_pendingAudio):std::vector<PendingAudioPacket>{};
         ClearStoryThreads();
         g_contacts.clear();g_contactHistory.clear();g_contactCopies.clear();g_contactsSent=g_contactsApplied=0;
         g_sceneClockReceived=g_sceneClockSent=0;g_sceneClockLatest=g_sceneClockSequence=0;
@@ -3126,6 +3185,7 @@ private:
         g_pendingAudio.clear();for(auto&targets:g_audioTargets)targets.clear();
         g_deadMissionPartner=-1;ReleaseStoryWarpHold();g_storyWarp={};g_storyWarpLatest=g_storyWarpSequence=0;g_sentStoryWarps={};g_lastWarpRun=g_lastWarpSent=0;
         for (auto& a : g_audioSlots) a = {};
+        g_audioContext={};for(auto&context:g_hostAudioContext)context={};for(auto&owner:g_nativeDialogue)owner={};
         for (auto& token : g_hostAudioToken) token = 0;
         for (auto& event : g_hostAudio) event = -1;
         for (auto& playing : g_hostAudioPlaying) playing = false;
@@ -3157,6 +3217,9 @@ private:
         g_skipOpen = false;
         g_skipYes.clear();
         g_skipNoMs = 0;
+        // Only the host's still-current bounded packets received during this
+        // load survive game-start cleanup. Shutdown/session reset retain none.
+        for(auto&packet:pendingAudio)if(PendingAudioCurrent(packet)&&g_pendingAudio.size()<128)g_pendingAudio.push_back(std::move(packet));
     }
 
     static void HostUpdate() {

@@ -7,6 +7,7 @@
 
 #include "common/api/protocol/Protocol.h"
 #include "common/lib/buffer/Buffer.h"
+#include "common/lib/diagnostics/FlightRecorder.h"
 #include "shared/api/net-client/NetClient.h"
 #include "shared/lib/sync/EpochFence.h"
 #include "shared/lib/sync/EntityGenerations.h"
@@ -68,6 +69,7 @@ public:
     size_t EntityPacketsWaiting()const{return m_entityWaiting.size();}
     void AdvanceWorldEpoch(){if(++m_worldEpoch==0)++m_worldEpoch;}
     uint32_t WorldEpoch()const{return m_worldEpoch;}
+    flight::Context DiagnosticContext()const{return m_diagnosticContext;}
     uint32_t PeerWorldEpoch(uint8_t peer)const{return peer<m_epochs.peers.size()?m_epochs.peers[peer]:0;}
     uint64_t StalePacketsDiscarded()const{return m_epochs.discarded;}
     uint64_t QueuedPacketsDiscarded()const{return m_expiredPackets+m_net.ExpiredReceivePackets();}
@@ -97,8 +99,9 @@ public:
 private:
     void HandleService(uint8_t id, Reader& r);
     bool DispatchGame(uint8_t from,uint8_t id,uint8_t channel,uint32_t epoch,uint32_t connection,const std::vector<EntityRef>&refs,const uint8_t*data,size_t size,uint64_t received,bool queue);
-    struct DeferredEntityPacket{uint8_t from=0,id=0,channel=0;uint32_t epoch=0,connection=0;uint64_t received=0;std::vector<EntityRef> refs;std::vector<uint8_t> data;};
+    struct DeferredEntityPacket{uint8_t from=0,id=0,channel=0;uint32_t epoch=0,connection=0;uint64_t received=0;std::vector<EntityRef> refs;std::vector<uint8_t> data;flight::Context diagnostic{};};
     EntityGenerations m_entities;
+    flight::Context m_diagnosticContext{};
     std::vector<EntityRef> m_entityContext;
     std::vector<DeferredEntityPacket> m_entityWaiting;
 

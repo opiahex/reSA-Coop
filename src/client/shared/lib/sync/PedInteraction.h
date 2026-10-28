@@ -19,6 +19,13 @@ struct PedInteraction {
     game::CVector offset,euler;Quat rotation;
     bool turret=false;uint16_t turretAngle=0;float turretRange=0,turretMode=0;
     AnimationState layers[LayerCount];float weights[LayerCount]{1,1,1,1,1,1};
+    bool FallingOrGettingUp()const{
+        // Native task205..209: GetUp, GetUpAndStandStill, Fall,
+        // FallAndGetUp and FallAndStayDown. Their owner controls the full
+        // reaction even when the association is flagged PARTIAL.
+        for(unsigned i=0;i<depth&&i<12;++i)if(chain[i]>=205&&chain[i]<=209)return true;
+        return (task>=205&&task<=209)||(leaf>=205&&leaf<=209);
+    }
     void Write(Writer&w)const{
         w.U8(leader);w.U32(revision);w.U8(depth);for(unsigned i=0;i<depth&&i<12;++i)w.U16(chain[i]);w.I8(sequenceStep);w.U16(sequenceRepeat);
         w.U8(partnerKind);if(partnerKind){if(partnerKind==1)w.Entity(ENTITY_PED,partnerId);else w.U16(partnerId);w.Vec({partnerOffset.x,partnerOffset.y,partnerOffset.z});w.F32(partnerHeading);}
@@ -29,6 +36,8 @@ struct PedInteraction {
         for(int i=0;i<LayerCount;++i){layers[i].Write(w);if(layers[i].Present())w.Unit8(weights[i]);}
     }
     bool Read(Reader&r){
+        // Optional sections belong to this packet, not the previous action.
+        *this={};
         leader=r.U8();if(leader>=3&&leader!=255)return false;revision=r.U32();depth=r.U8();if(depth>12)return false;for(unsigned i=0;i<depth;++i){chain[i]=r.U16();if(chain[i]>=4096)return false;}sequenceStep=r.I8();sequenceRepeat=r.U16();
         partnerKind=r.U8();if(partnerKind>2)return false;if(partnerKind){partnerId=r.U16();auto p=r.Vec();partnerOffset={p.x,p.y,p.z};partnerHeading=r.F32();if(partnerOffset.Length()>30||std::fabs(partnerHeading)>7||(partnerKind==1&&!partnerId)||(partnerKind==2&&partnerId>=3))return false;}if(sequenceStep < -1 || sequenceStep >7)return false;
         rope=r.Bool();if(rope)for(auto&p:ropePoints){auto v=r.Vec();p={v.x,v.y,v.z};if(!std::isfinite(p.x)||!std::isfinite(p.y)||!std::isfinite(p.z)||p.Length()>25000)return false;}
@@ -36,7 +45,7 @@ struct PedInteraction {
         couple=r.Bool();if(couple){auto p=r.Vec();partnerVelocity={p.x,p.y,p.z};if(!std::isfinite(p.x)||!std::isfinite(p.y)||!std::isfinite(p.z)||partnerVelocity.Length()>200)return false;}handArm=r.U8();if(handArm!=255&&handArm>1)return false;
         if(handArm<2){handBone=r.I16();auto p=r.Vec();handOffset={p.x,p.y,p.z};handSpeed=r.F32();handBlend=r.I32();if(handBone < -1||handBone>255||!std::isfinite(handOffset.x)||!std::isfinite(handOffset.y)||!std::isfinite(handOffset.z)||handOffset.Length()>3||!std::isfinite(handSpeed)||handSpeed<0||handSpeed>10||handBlend<0||handBlend>10000)return false;}
         task=r.U16();leaf=r.U16();parentKind=r.U8();
-        if(parentKind){if(parentKind==5){if(!train.Read(r)||!train.Valid())return false;parentId=train.id;}else parentId=r.U16();auto p=r.Vec(),e=r.Vec();offset={p.x,p.y,p.z};euler={e.x,e.y,e.z};rotation.Read(r);turret=r.Bool();if(turret){turretAngle=r.U16();turretRange=r.F32();turretMode=r.F32();}}
+        if(parentKind){if(parentKind==5){if(!train.Read(r)||!train.Valid())return false;parentId=train.id;}else parentId=r.U16();auto p=r.Vec(),e=r.Vec();offset={p.x,p.y,p.z};euler={e.x,e.y,e.z};rotation.Read(r);if(!r.Ok())return false;turret=r.Bool();if(turret){turretAngle=r.U16();turretRange=r.F32();turretMode=r.F32();}}
         for(int i=0;i<LayerCount;++i){if(!layers[i].Read(r))return false;if(layers[i].Present())weights[i]=r.Unit8();}
         return r.Ok()&&(task==0xFFFF||task<4096)&&(leaf==0xFFFF||leaf<4096)&&parentKind<=5&&std::isfinite(turretRange)&&std::isfinite(turretMode)&&std::fabs(turretRange)<100&&std::fabs(turretMode)<100&&offset.Length()<100&&euler.Length()<100&&(!parentKind||parentKind==3||parentId);
     }

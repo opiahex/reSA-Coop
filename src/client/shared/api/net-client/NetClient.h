@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "common/lib/buffer/Buffer.h"
+#include "common/lib/diagnostics/FlightRecorder.h"
 
 namespace coop {
 
@@ -21,6 +22,7 @@ public:
         uint8_t channel;
         std::vector<uint8_t> data;
         uint64_t received=0;
+        flight::Context diagnostic{};
     };
 
     ~NetClient() { Stop(); }
@@ -29,7 +31,7 @@ public:
     void Stop();  // graceful disconnect
 
     void Send(uint8_t channel, const Writer& w);
-    void Send(uint8_t channel, const uint8_t* data, size_t size);
+    void Send(uint8_t channel, const uint8_t* data, size_t size,flight::Context diagnostic={});
     // Moves all received packets into `out`. Connection events are reported through State().
     void Poll(std::vector<Packet>& out);
 

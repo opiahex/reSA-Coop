@@ -11,6 +11,7 @@
 
 #include "common/api/protocol/Protocol.h"
 #include "common/lib/log/Log.h"
+#include "common/lib/diagnostics/PassengerTrace.h"
 #include "shared/lib/sync/SeatClaims.h"
 #include "shared/lib/sync/TrainSupport.h"
 #include "common/lib/util/Util.h"
@@ -30,6 +31,10 @@
 #include "shared/ui/renderer/Renderer.h"
 
 namespace coop {
+static void EndPassengerDiagnostic(RemotePlayer&rp,passenger_trace::Reason reason){
+    if(rp.diagnosticApplyPending)passenger_trace::Emit(rp.diagnosticState,passenger_trace::NativeApply,reason,Net().MyId());
+    rp.diagnosticApplyPending=false;rp.diagnosticMissingReported=false;rp.diagnosticState={};
+}
 
 using namespace game;
 using game::script::Cmd;
@@ -623,7 +628,9 @@ void FillCommon(OnFootState& st, CPlayerPed* me) {
     st.fightingStyle = me->FightingStyle();
     st.attackMoves = me->AllowedAttackMoves();
     st.flags = me->Health() <= 0 || me->PedState() == 54 || me->PedState() == 55 ? OnFootState::F_DEAD : 0;
-    st.health = ClampByte(me->Health());st.breath=me->PlayerData()?std::clamp(Field<float>(me->PlayerData(),0x44),0.f,1000000.f):1000.f;
+    st.health=std::clamp(me->Health(),0.f,1000000.f);
+    st.maxHealth=std::isfinite(me->MaxHealth())&&me->MaxHealth()>0?std::min(me->MaxHealth(),1000000.f):100.f;
+    st.breath=me->PlayerData()?std::clamp(Field<float>(me->PlayerData(),0x44),0.f,1000000.f):1000.f;
     st.wanted = WantedLevel(me);
     st.policeFlags = PoliceFlags(me);
     st.armour = ClampByte(me->Armour());
@@ -656,7 +663,7 @@ void FillCommon(OnFootState& st, CPlayerPed* me) {
 void WriteCommon(Writer& w, const OnFootState& st) {
     st.pad.Write(w);
     st.cam.Write(w);
-    w.U8(st.health);w.F32(st.breath);
+    w.F32(st.health);w.F32(st.maxHealth);w.F32(st.breath);
     w.U8(st.armour);
     w.U8(st.weapon);
     w.U16(st.ammo);
@@ -672,7 +679,7 @@ void WriteCommon(Writer& w, const OnFootState& st) {
 bool ReadCommon(Reader& r, OnFootState& st) {
     st.pad.Read(r);
     st.cam.Read(r);
-    st.health = r.U8();st.breath=r.F32();if(!std::isfinite(st.breath)||st.breath<0||st.breath>1000000)return false;
+    st.health=r.F32();st.maxHealth=r.F32();st.breath=r.F32();if(!st.ValidVitals())return false;
     st.armour = r.U8();
     st.weapon = r.U8();
     st.ammo = r.U16();
@@ -828,6 +835,7 @@ void Players::OnSessionStart() {
 void Players::OnPeerJoin(uint8_t id) { Touch(id); }
 void Players::OnPeerResync(uint8_t id) {
     if(auto*rp=Get(id)){
+        EndPassengerDiagnostic(*rp,passenger_trace::Resync);
         rp->history.Clear();rp->hasState=false;rp->lastStateTime=0;rp->vehGeneration=0;
         rp->seatTransition={};rp->enteringVeh=0;rp->enterTaskMs=rp->exitTaskMs=0;
         rp->padNew=rp->padOld={};rp->padFresh=false;
@@ -839,7 +847,7 @@ void Players::OnSessionEnd() {
     m_seatReceived.clear();m_seatCheck=0;
     ReleaseMeleeBlocks();
     m_rider=-1;m_riderReleaseUntil=0;
-    for (auto& [id, rp] : m_remote) DestroyRemote(rp);
+    for (auto& [id, rp] : m_remote){EndPassengerDiagnostic(rp,passenger_trace::SessionEnded);DestroyRemote(rp);}
     m_remote.clear();
     g_ourDriveBy.clear();
 }
@@ -847,6 +855,7 @@ void Players::OnSessionEnd() {
 void Players::OnPeerLeave(uint8_t id) {
     auto it = m_remote.find(id);
     if (it == m_remote.end()) return;
+    EndPassengerDiagnostic(it->second,passenger_trace::PeerLeft);
     DestroyRemote(it->second);
     m_remote.erase(it);
 }
@@ -860,6 +869,7 @@ void Players::OnGameStarted() {
     m_exitReported = false;
     // world was (re)created: our peds are gone, they will be respawned from the next states
     for (auto& [id, rp] : m_remote) {
+        EndPassengerDiagnostic(rp,passenger_trace::Resync);
         rp.ped = nullptr;
         rp.pedHandle = -1;
         rp.blip = 0;
@@ -1046,6 +1056,8 @@ void Players::HandleOnFoot(uint8_t from, Reader& r) {
     if (!rp.seatTransition.leaving && (rp.mode != RemotePlayer::Mode::OnFoot || (rp.ped && rp.ped->InVehicle())))
         rp.seatTransition.Begin(rp.vehNetId, st.time, NowMs());
     ClearChangedSupport(rp.ped,rp.state.motion.objectSupport?0:rp.state.motion.support,st.motion.objectSupport?0:st.motion.support);
+    if(rp.diagnosticApplyPending)passenger_trace::Emit(rp.diagnosticState,passenger_trace::NativeApply,passenger_trace::Replaced,Net().MyId());
+    rp.diagnosticApplyPending=false;rp.diagnosticState={};
     rp.state = st;
     rp.hasState = true;
     rp.stateRecvMs = NowMs();
@@ -1065,7 +1077,7 @@ void Players::HandleDriver(uint8_t from, Reader& r) {
     if (from == Net().MyId()) return;
     uint16_t netId = r.U16();
     VehicleState vs;
-    vs.Read(r);
+    if (!vs.Read(r)) return;
     OnFootState st;
     if(!ReadCommon(r, st))return;
     if (!r.Ok()) return;
@@ -1081,6 +1093,8 @@ void Players::HandleDriver(uint8_t from, Reader& r) {
     rp.previousStoryPad=rp.storyPad;rp.storyPad=st.pad;
     st.pad.buttons &= ~PadState::B_TRIANGLE;
     ClearChangedSupport(rp.ped,rp.state.motion.objectSupport?0:rp.state.motion.support,st.motion.objectSupport?0:st.motion.support);
+    if(rp.diagnosticApplyPending)passenger_trace::Emit(rp.diagnosticState,passenger_trace::NativeApply,passenger_trace::Replaced,Net().MyId());
+    rp.diagnosticApplyPending=false;rp.diagnosticState={};
     rp.state = st;
     rp.hasState = true;
     rp.stateRecvMs = NowMs();
@@ -1094,19 +1108,21 @@ void Players::HandleDriver(uint8_t from, Reader& r) {
 }
 
 void Players::HandlePassenger(uint8_t from, Reader& r) {
-    if (from == Net().MyId()) return;
+    auto context=Net().DiagnosticContext();
+    auto trace=[&](passenger_trace::Reason reason){passenger_trace::Emit(context,passenger_trace::Decode,reason,Net().MyId());};
+    if (from == Net().MyId()){trace(passenger_trace::Self);return;}
     uint16_t netId = r.U16();
     int8_t seat = r.I8();
     uint32_t time = r.U32();
     Vec3 p = r.Vec();
     OnFootState st;
-    if(!ReadCommon(r, st))return;
-    if (!r.Ok() || seat < 0 || seat > 7) return;
+    if(!ReadCommon(r, st)){trace(passenger_trace::CommonDecode);return;}
+    if (!r.Ok() || seat < 0 || seat > 7){trace(!r.Ok()?passenger_trace::Malformed:passenger_trace::InvalidSeat);return;}
     RemotePlayer& rp = Touch(from);
-    if(rp.hasState&&(int32_t)(st.motion.epoch-rp.state.motion.epoch)<0)return;
-    if (rp.hasState && (int32_t)(time - rp.lastStateTime) < 0) return;
+    if(rp.hasState&&(int32_t)(st.motion.epoch-rp.state.motion.epoch)<0){trace(passenger_trace::OldMotion);return;}
+    if (rp.hasState && (int32_t)(time - rp.lastStateTime) < 0){trace(passenger_trace::OldTime);return;}
     if (rp.mode == RemotePlayer::Mode::OnFoot && rp.seatTransition.confirmed) rp.seatTransition = {};
-    if (rp.seatTransition.jacked && rp.seatTransition.HoldSeat(netId, NowMs())) return;
+    if (rp.seatTransition.jacked && rp.seatTransition.HoldSeat(netId, NowMs())){trace(passenger_trace::SeatHeld);return;}
     rp.lastStateTime = time;
     st.time = time;
     st.pos = {p.x, p.y, p.z};
@@ -1122,6 +1138,10 @@ void Players::HandlePassenger(uint8_t from, Reader& r) {
     rp.vehNetId = netId;
     rp.vehGeneration=Net().ExpectedEntityGeneration(ENTITY_VEHICLE,netId);
     rp.seat = seat;
+    trace(passenger_trace::Ok);
+    if(rp.diagnosticApplyPending)passenger_trace::Emit(rp.diagnosticState,passenger_trace::NativeApply,passenger_trace::Replaced,Net().MyId());
+    rp.diagnosticState=context;rp.diagnosticApplyPending=context.msg!=0;rp.diagnosticMissingReported=false;
+    if(context.msg){flight::Event event{};event.context=context;event.stage=passenger_trace::Accepted;event.localPeer=Net().MyId();event.health=st.health;event.maxHealth=st.maxHealth;event.armour=st.armour;event.motionEpoch=st.motion.epoch;flight::Record(event);}
 }
 
 void Players::HandleEnterCar(uint8_t from, Reader& r) {
@@ -1228,6 +1248,14 @@ void Players::ApplyState(RemotePlayer& rp) {
     }
     if (rp.scriptAnimFull) rp.padNew = {};
 
+    // Vitals also belong to the death snapshot, including a driver still in its seat.
+    float diagnosticBefore=ped->Health();
+    ped->Health()=(st.flags&OnFootState::F_DEAD)?0.0f:st.health;
+    ped->MaxHealth()=st.maxHealth;
+    ped->Armour()=(float)st.armour;
+    if(ped->PlayerData())Field<float>(ped->PlayerData(),0x44)=st.breath;
+    if(rp.diagnosticApplyPending){flight::Event event{};event.context=rp.diagnosticState;event.stage=passenger_trace::NativeApply;event.localPeer=Net().MyId();event.health=st.health;event.maxHealth=ped->MaxHealth();event.armour=ped->Armour();event.beforeHealth=diagnosticBefore;event.afterHealth=ped->Health();event.motionEpoch=st.motion.epoch;event.nativeHandle=(uint32_t)rp.pedHandle;flight::Record(event);rp.diagnosticApplyPending=false;}
+
     // death is decided by the owner's game (the local ped has all proofs): play it once; after the
     // respawn a fresh ped replaces the dead one, which cannot be revived
     if (st.flags & OnFootState::F_DEAD) {
@@ -1244,9 +1272,6 @@ void Players::ApplyState(RemotePlayer& rp) {
         return;
     }
 
-    ped->Health() = (float)st.health;
-    if(ped->PlayerData())Field<float>(ped->PlayerData(),0x44)=st.breath;
-    ped->Armour() = (float)st.armour;
     // ScenePartner owns these native peds for the cutscene. Old seat, phone,
     // weapon and jetpack tasks must not replace its staged animation.
     if(Ref<uint8_t>(0xB5F851)){rp.padNew={};rp.padOld={};return;}
@@ -1640,6 +1665,7 @@ void Players::SendVehicleState(CVehicle* v) {
         w.Entity(ENTITY_VEHICLE,nv->netId,ENTITY_SNAPSHOT);
         vs.Write(w);
         WriteCommon(w, common);
+        passenger_trace::Publication diagnosticPublication(common.health,common.maxHealth,common.armour,common.motion.epoch);
         Net().Send(proto::CH_STATE, w);
         if(transition)Net().Send(proto::CH_RELIABLE,w);
     } else {
@@ -1652,6 +1678,7 @@ void Players::SendVehicleState(CVehicle* v) {
         CVector p = v->GetPosition();
         w.Vec({p.x, p.y, p.z});
         WriteCommon(w, common);
+        passenger_trace::Publication diagnosticPublication(common.health,common.maxHealth,common.armour,common.motion.epoch);
         Net().Send(proto::CH_STATE, w);
         if(transition)Net().Send(proto::CH_RELIABLE,w);
     }
@@ -1671,10 +1698,12 @@ void Players::OnPreProcess() {
         // (its game loads the same cutscene and can be silent that long)
         bool active = rp.hasState && (NowMs() - rp.stateRecvMs < 5000 || (rp.ped && Ref<uint8_t>(0xB5F851)));
         if (!active) {
+            EndPassengerDiagnostic(rp,passenger_trace::StateExpired);
             if (rp.ped) DestroyRemote(rp);
             continue;
         }
         if (!rp.ped) SpawnRemote(rp);
+        if(!rp.ped&&rp.diagnosticApplyPending&&!rp.diagnosticMissingReported){passenger_trace::Emit(rp.diagnosticState,passenger_trace::NativeApply,passenger_trace::NativeMissing,Net().MyId());rp.diagnosticMissingReported=true;}
         if (rp.ped) StartPendingEnter(rp);
     }
     // Free old seats first, then install drivers before their passengers. A
@@ -1826,7 +1855,9 @@ void Players::SendLocalState() {
     st.vel = me->MoveSpeed() * 50.0f;
     st.rotation = me->CurrentRotation();
     st.aimRotation = me->AimingRotation();
-    st.health = ClampByte(me->Health());st.breath=me->PlayerData()?std::clamp(Field<float>(me->PlayerData(),0x44),0.f,1000000.f):1000.f;
+    st.health=std::clamp(me->Health(),0.f,1000000.f);
+    st.maxHealth=std::isfinite(me->MaxHealth())&&me->MaxHealth()>0?std::min(me->MaxHealth(),1000000.f):100.f;
+    st.breath=me->PlayerData()?std::clamp(Field<float>(me->PlayerData(),0x44),0.f,1000000.f):1000.f;
     st.armour = ClampByte(me->Armour());
     CWeapon& w = me->ActiveWeapon();
     st.weapon = (uint8_t)w.type;
@@ -1978,12 +2009,12 @@ void Players::DrawNameTag(RemotePlayer& rp) {
     g.Text(ui::FONT_SMALL, sx, sy - lh - 8 * s, name, ui::WithAlpha(nameColor, alpha), ui::TEXT_CENTER | ui::TEXT_OUTLINE);
     float bw = 64 * s, bh = 6 * s;
     float bx = sx - bw / 2, by = sy - 6 * s;
-    float hp = std::clamp(rp.ped->Health() / 100.0f, 0.0f, 1.0f);
+    float hp = rp.state.HealthFraction();
     g.Rect(bx - 1, by - 1, bw + 2, bh + 2, ui::WithAlpha(0xFF000000, alpha));
     g.Rect(bx, by, bw, bh, ui::WithAlpha(0xFF501414, alpha));
     g.Rect(bx, by, bw * hp, bh, ui::WithAlpha(0xFFDC3232, alpha));
-    if (rp.ped->Armour() > 0) {
-        float ar = std::clamp(rp.ped->Armour() / 100.0f, 0.0f, 1.0f);
+    if (rp.state.armour > 0) {
+        float ar = std::clamp(rp.state.armour / 100.0f, 0.0f, 1.0f);
         by -= bh + 3 * s;
         g.Rect(bx - 1, by - 1, bw + 2, bh + 2, ui::WithAlpha(0xFF000000, alpha));
         g.Rect(bx, by, bw, bh, ui::WithAlpha(0xFF3C3C3C, alpha));

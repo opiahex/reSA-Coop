@@ -454,7 +454,7 @@ void ReplayBoundAction(NetPed&np,float age){
     np.animBlock=st.animBlock;np.animIdx=st.animIdx;np.animTime=st.animTime;
     // Some native contact clips carry PARTIAL but their task still owns the
     // actor's movement (knife victim, handshakes); do not restart locomotion.
-    np.animFull=st.animBlock!=kNoAnim&&(!(st.animFlags&anim::F_PARTIAL)||st.interaction.partnerKind);
+    np.animFull=st.animBlock!=kNoAnim&&(!(st.animFlags&anim::F_PARTIAL)||st.interaction.partnerKind||st.interaction.FallingOrGettingUp());
     if(np.animFull){np.baseBlock=st.animBlock;np.baseIdx=st.animIdx;}
     else np.baseBlock=kNoAnim;
     if(st.animBlock!=kNoAnim){
@@ -531,7 +531,7 @@ bool TaskPending(CPed* ped) {
 using SetMoveAnimFn = void(__fastcall*)(CPed*, void*);
 SetMoveAnimFn g_origSetMoveAnim = nullptr;
 void __fastcall HookSetMoveAnim(CPed* ped, void* edx) {
-    if (NetPed* np = Peds::Instance().Find(ped); np && np->owner != Net().MyId() && (np->animFull||np->extraFull)) return;
+    if (NetPed* np = Peds::Instance().Find(ped); np && np->owner != Net().MyId() && (np->animFull||np->extraFull||np->knockdownReplay)) return;
     if (RemotePlayer* rp = Players::Instance().FindByPed(ped); rp && rp->scriptAnimFull) return;
     g_origSetMoveAnim(ped, edx);
 }
@@ -934,7 +934,7 @@ CPed* Peds::SpawnMirror(NetPed& np) {
     ped->CurrentRotation() = ped->AimingRotation() = st.heading;
     ped->AreaCode() = st.area;
     if(!(st.flags&PedSyncState::F_ENTERING))np.carContact=false;
-    np.ped = ped;np.deadApplied=false;
+    np.ped = ped;np.deadApplied=false;np.knockdownReplay=false;np.animFull=false;
     np.handle = handle;
     m_byPtr[ped] = np.netId;
     return ped;
@@ -1051,6 +1051,8 @@ void Peds::HandleOwner(uint8_t from, Reader& r) {
 }
 
 void Peds::Adopt(NetPed& np) {
+    if(np.knockdownReplay){np.animFull=false;np.baseBlock=kNoAnim;}
+    np.knockdownReplay=false;
     if(IsAlive(np)&&np.model==285&&np.pedType==PED_TYPE_COP&&np.ped->PedType()!=PED_TYPE_COP){
         auto at=np.state.pos;auto old=np.ped;m_byPtr.erase(old);Cmd(0x009B).I(np.handle).Run();np.ped=nullptr;np.handle=-1;
         int handle=-1;Cmd(0x009A).I(PED_TYPE_COP).I(285).F(at.x).F(at.y).F(at.z-1).Out(&handle).Run();
@@ -1168,6 +1170,14 @@ void Peds::HandleAction(uint8_t from,Reader&r){
 }
 
 void Peds::ApplyMirror(NetPed& np) {
+    // Reset before any streaming, death, weapon or binding early return.
+    // A previous reaction must not suppress a later life's native movement.
+    bool falling=np.hasState&&np.ped&&!(np.state.flags&(PedSyncState::F_DEAD|PedSyncState::F_IN_VEHICLE))&&
+        !np.state.interaction.parentKind&&np.state.interaction.FallingOrGettingUp();
+    if(!falling){
+        if(np.knockdownReplay){np.animFull=false;np.baseBlock=kNoAnim;}
+        np.knockdownReplay=false;
+    }
     if(!np.hasState)return;
     const PedSyncState& st = np.state;
     uint64_t now = NowMs();
@@ -1182,7 +1192,7 @@ void Peds::ApplyMirror(NetPed& np) {
     auto*sceneCar=story&&st.vehNetId?Vehicles::Instance().Find(st.vehNetId):nullptr;
     bool relevant=nearPlayer||((st.area==area||st.area==13)&&((st.pos-centre).Length2D()<(story?1100.f:280.f)||(sceneCar&&Vehicles::Alive(*sceneCar))));
     if(!relevant){
-        if(IsAlive(np)&&now-np.lastRelevantMs>5000){auto*old=np.ped;m_byPtr.erase(old);Cmd(0x009B).I(np.handle).Run();np.ped=nullptr;np.handle=-1;np.animBlock=np.baseBlock=kNoAnim;np.animFull=false;np.lastTaskMove=0;np.gunMode=0;}
+        if(IsAlive(np)&&now-np.lastRelevantMs>5000){auto*old=np.ped;m_byPtr.erase(old);Cmd(0x009B).I(np.handle).Run();np.ped=nullptr;np.handle=-1;np.animBlock=np.baseBlock=kNoAnim;np.animFull=false;np.knockdownReplay=false;np.lastTaskMove=0;np.gunMode=0;}
         return;
     }
     np.lastRelevantMs=now;
@@ -1197,6 +1207,7 @@ void Peds::ApplyMirror(NetPed& np) {
     if (!IsAlive(np)) {  // deleted by the game (should not happen to mission peds): spawn again
         m_byPtr.erase(ped);
         np.ped = nullptr;
+        np.knockdownReplay=false;np.animFull=false;np.baseBlock=kNoAnim;
         return;
     }
     ped->AreaCode() = st.area;
@@ -1289,6 +1300,30 @@ void Peds::ApplyMirror(NetPed& np) {
         ReplayBoundAction(np,np.interactionAge);
         return;
     }
+    // A received native fall/get-up owns the movement as well as the clip.
+    // Letting GO_STRAIGHT/STAND tasks run while waiting for its association
+    // repeatedly replaces the reaction and snaps the victim upright.
+    bool knocked=!(st.flags&PedSyncState::F_IN_VEHICLE)&&!st.interaction.parentKind&&st.interaction.FallingOrGettingUp();
+    if(knocked){
+        if(ped->InVehicle()){
+            Cmd(0x0362).I(np.handle).F(st.pos.x).F(st.pos.y).F(st.pos.z-1).Run();
+            np.enterVeh=0;np.enterTaskMs=np.leaveTaskMs=0;
+        }
+        if(!np.knockdownReplay){Cmd(0x0687).I(np.handle).Run();np.lastTaskMove=0;np.gunMode=0;}
+        np.knockdownReplay=true;
+        float age=std::min(.2f,(now-np.recvMs)/1000.f);
+        CVector target=st.pos+st.vel*age;
+        if(np.poses.Size()>1)target=np.poses.At(now,[](const NetPed::Pose&a,const NetPed::Pose&b,float t){
+            auto pose=b;if((b.pos-a.pos).Length()<8)pose.pos=a.pos+(b.pos-a.pos)*t;return pose;
+        },[](NetPed::Pose&pose,float age,bool stale){if(!stale)pose.pos=pose.pos+pose.vel*age;}).pos;
+        SetEntityPosition(ped,target);ped->MoveSpeed()=st.vel*(1.f/50.f);
+        // The authoritative transform already includes the native physics;
+        // do not integrate the delayed reaction a second time locally.
+        ped->PhysicalFlags()|=0x2000u;
+        AlignContactHeading(np,st.heading);ReplayBoundAction(np,age);
+        return;
+    }
+    np.knockdownReplay=false;
     // ---- vehicles: the game's own enter/leave tasks, warps only as a fallback
     if (st.flags & PedSyncState::F_IN_VEHICLE) {
         NetVehicle* nv = (Net().EntityLink(ENTITY_PED,np.netId,ENTITY_VEHICLE,st.vehNetId)?Vehicles::Instance().Find(st.vehNetId):nullptr);
@@ -1625,7 +1660,7 @@ void Peds::OnPreProcess() {
         }
         ApplyMirror(np);
         auto* ped=np.ped;
-        if(!IsAlive(np)||!ped->RwObject()||ped->InVehicle()||IsPedDead(ped))continue;
+        if(!IsAlive(np)||!ped->RwObject()||ped->InVehicle()||IsPedDead(ped)||np.knockdownReplay)continue;
         bool lasting=false;
         for(void* a=anim::First(ped->RwObject());a;a=anim::Next(a))
             if(!(anim::Flags(a)&anim::F_PARTIAL)&&anim::BlendDelta(a)>=0){lasting=true;break;}
@@ -1652,7 +1687,7 @@ void Peds::OnPostProcess() {
     // walk clock during ProcessControl. Restore the owner's clock as well as
     // its rate afterwards, before the next rendered frame.
     if (ready) for (auto& [id, np] : m_byId)
-        if (np.owner != Net().MyId() && IsAlive(np) && !np.animFull && !np.extraFull &&
+        if (np.owner != Net().MyId() && IsAlive(np) && !np.animFull && !np.extraFull && !np.knockdownReplay &&
             !(np.state.flags & (PedSyncState::F_DEAD | PedSyncState::F_IN_VEHICLE | PedSyncState::F_ENTERING | PedSyncState::F_AIMING)))
             ReplayInteractionPose(np.ped->RwObject(),np.state.motion,np.pairedAction&&np.state.interaction.couple?
                 np.interactionAge:std::min(.2f,(NowMs()-np.recvMs)/1000.f));
@@ -1683,18 +1718,17 @@ void Peds::OnSessionEnd() {
     handContacts.clear();
     coupleClocks.clear();
     for(auto&[id,np]:m_byId)HoldCorpseOutside(np,false);
-    // A provisional body still has mirror proofs/decision maker. Disconnect
-    // cancels its lease; it must not remain as an invulnerable local mission ped.
-    for(auto&[id,np]:m_byId)if(np.pendingAdoption&&IsAlive(np))Cmd(0x009B).I(np.handle).Run();
-    // mirrors stay in the world as ordinary random peds
-    for (auto& [id, np] : m_byId)
-        if (np.owner != Net().MyId() && IsAlive(np)) {
-            np.ped->PhysicalFlags()&=~0x2000u;
-            Cmd(0x02AB).I(np.handle).I(0).I(0).I(0).I(0).I(0).Run();
-            Cmd(0x01C2).I(np.handle).Run();  // MARK_CHAR_AS_NO_LONGER_NEEDED (default decision maker, wander task)
-        }
+    // Local disconnect ends this world's replicas. Turning them into native
+    // ambient peds loses their identities: a reconnect then creates a second
+    // copy beside every released body. Other clients retain real ownership
+    // through OnPeerLeave; this only removes our foreign/provisional bodies.
+    std::vector<uint16_t> copies;
+    for(auto&[id,np]:m_byId)
+        if(np.pendingAdoption||np.owner!=Net().MyId())copies.push_back(id);
+    for(auto id:copies)Forget(id,true);
     m_byId.clear();
     m_byPtr.clear();
+    m_giveAway.clear();
     m_wasReady = false;
 }
 
@@ -1736,8 +1770,8 @@ void Peds::OnGameStarted() {
 }
 
 void Peds::OnGameShutdown() {
-    // Session end leaves mirrors alive as ordinary native peds, so retain their
-    // weapon blocks until the native world (and its tasks) is actually unloaded.
+    // Owned native peds may remain after leaving a session. Retain their
+    // weapon blocks until the native world and its tasks are actually unloaded.
     ReleaseWeaponAnimations();
     handContacts.clear();
     Net().AdvanceWorldEpoch(); OnGameStarted(); }

@@ -6,6 +6,7 @@
 #include "common/api/net/Net.h"
 #include "common/api/protocol/Protocol.h"
 #include "common/lib/log/Log.h"
+#include "common/lib/diagnostics/PassengerTrace.h"
 #include "common/lib/util/Util.h"
 #include "shared/config/Config.h"
 #include "shared/lib/sync/ReceiveBacklog.h"
@@ -129,26 +130,30 @@ void NetClient::Stop() {
     }
     m_state = State::Idle;
     std::lock_guard<std::mutex> a(m_outMutex);
+    for(const auto&p:m_out)passenger_trace::Emit(p.diagnostic,passenger_trace::OutQueued,passenger_trace::NotConnected,p.diagnostic.source);
     m_out.clear();
     m_outBytes=0;
     // what came after the last poll (a refusal's reason, a world chunk) belonged to that connection: it was handled
     // in the next one ("the world arrived damaged")
     std::lock_guard<std::mutex> b(m_inMutex);
+    for(const auto&p:m_in)passenger_trace::Emit(p.diagnostic,passenger_trace::TransportReceive,passenger_trace::NotConnected);
     m_in.clear();
     m_inBytes=0;
 }
 
 void NetClient::Send(uint8_t channel, const Writer& w) { Send(channel, w.Data(), w.Size()); }
 
-void NetClient::Send(uint8_t channel, const uint8_t* data, size_t size) {
-    if (m_state != State::Connected || size == 0) return;
+void NetClient::Send(uint8_t channel, const uint8_t* data, size_t size,flight::Context diagnostic) {
+    if (m_state != State::Connected || size == 0){passenger_trace::Emit(diagnostic,passenger_trace::OutQueued,passenger_trace::NotConnected,diagnostic.source);return;}
     std::lock_guard<std::mutex> lock(m_outMutex);
     if(size>32*1024*1024||m_outBytes+size>32*1024*1024||m_out.size()>=32768){
+        passenger_trace::Emit(diagnostic,passenger_trace::OutQueued,passenger_trace::QueueLimit,diagnostic.source);
         LOGW("Network outgoing queue limit reached packets=%u bytes=%llu incoming=%llu", (unsigned)m_out.size(),
              (unsigned long long)m_outBytes.load(), (unsigned long long)m_inBytes.load());
         m_failure=Failure::OutgoingBacklog;m_quit=true;m_state=State::Disconnected;m_disconnectEvent=true;return;
     }
-    m_out.push_back(Packet{channel, std::vector<uint8_t>(data, data + size)});
+    m_out.push_back(Packet{channel, std::vector<uint8_t>(data, data + size),0,diagnostic});
+    passenger_trace::Emit(diagnostic,passenger_trace::OutQueued,passenger_trace::Ok,diagnostic.source);
     m_outBytes+=size;
 }
 
@@ -246,11 +251,13 @@ void NetClient::ThreadMain(std::string host, uint16_t port) {
         }
         if (connected) {
             for (auto& p : outLocal) {
-                ENetPacket* pkt = makePacket(p);if(!pkt){if(m_quit)break;continue;}
-                if (enet_peer_send(peer, p.channel, pkt) != 0) enet_packet_destroy(pkt);
+                ENetPacket* pkt = makePacket(p);if(!pkt){passenger_trace::Emit(p.diagnostic,passenger_trace::TransportSend,passenger_trace::AllocationFailed,p.diagnostic.source);if(m_quit)break;continue;}
+                int sent=enet_peer_send(peer,p.channel,pkt);passenger_trace::Emit(p.diagnostic,passenger_trace::TransportSend,sent?passenger_trace::SendFailed:passenger_trace::Ok,p.diagnostic.source);
+                if (sent != 0) enet_packet_destroy(pkt);
                 m_bytesOut += p.data.size();
             }
         }
+        else for(const auto&p:outLocal)passenger_trace::Emit(p.diagnostic,passenger_trace::TransportSend,passenger_trace::NotConnected,p.diagnostic.source);
         outLocal.clear();
 
         if (!connected && relayAt && (GetTickCount64() >= relayAt || peer->state == ENET_PEER_STATE_DISCONNECTED)) {
@@ -298,14 +305,17 @@ void NetClient::ThreadMain(std::string host, uint16_t port) {
                 case ENET_EVENT_TYPE_RECEIVE: {
                     m_bytesIn += ev.packet->dataLength;
                     Packet p{ev.channelID, std::vector<uint8_t>(ev.packet->data, ev.packet->data + ev.packet->dataLength),NowMs()};
+                    p.diagnostic=passenger_trace::Packet(p.data.data(),p.data.size(),p.channel,true);
+                    passenger_trace::Emit(p.diagnostic,passenger_trace::TransportReceive);
                     enet_packet_destroy(ev.packet);
                     std::lock_guard<std::mutex> lock(m_inMutex);
                     if (m_in.size() >= 4000 || m_inBytes + p.data.size() > 32 * 1024 * 1024) {
                         uint64_t bytes = m_inBytes.load();
-                        m_expiredReceivePackets += ExpireReceiveBacklog(m_in, p.received, bytes);
+                        m_expiredReceivePackets += ExpireReceiveBacklog(m_in, p.received, bytes,[](const Packet&expired){passenger_trace::Emit(expired.diagnostic,passenger_trace::TransportReceive,passenger_trace::Expired);});
                         m_inBytes = bytes;
                     }
                     if(m_inBytes+p.data.size()>32*1024*1024||m_in.size()>=32768){
+                        passenger_trace::Emit(p.diagnostic,passenger_trace::TransportReceive,passenger_trace::QueueLimit);
                         LOGW("Network incoming queue limit reached packets=%u bytes=%llu poll_age=%llu", (unsigned)m_in.size(),
                              (unsigned long long)m_inBytes.load(), (unsigned long long)(NowMs() - m_lastPoll.load()));
                         m_failure=Failure::IncomingBacklog;m_quit=true;m_state=State::Disconnected;m_disconnectEvent=true;break;
@@ -348,8 +358,9 @@ void NetClient::ThreadMain(std::string host, uint16_t port) {
             outLocal.swap(m_out);m_outBytes=0;
         }
         for (auto& p : outLocal) {
-            ENetPacket* pkt = makePacket(p);if(!pkt){if(m_quit)break;continue;}
-            if (enet_peer_send(peer, p.channel, pkt) != 0) enet_packet_destroy(pkt);
+            ENetPacket* pkt = makePacket(p);if(!pkt){passenger_trace::Emit(p.diagnostic,passenger_trace::TransportSend,passenger_trace::AllocationFailed,p.diagnostic.source);if(m_quit)break;continue;}
+            int sent=enet_peer_send(peer,p.channel,pkt);passenger_trace::Emit(p.diagnostic,passenger_trace::TransportSend,sent?passenger_trace::SendFailed:passenger_trace::Ok,p.diagnostic.source);
+            if (sent != 0) enet_packet_destroy(pkt);
         }
         outLocal.clear();
         // graceful quit: data = 1 tells the server it was not a timeout

@@ -168,7 +168,7 @@ private:
     void KeepCarWhileInside(game::CPlayerPed* me);
     void ReleaseKeptCar();
     game::CVehicle* SpawnMirror(const VehicleSpawn& sp);
-    game::CVehicle* FindAdoptable(uint16_t model, const game::CVector& pos);
+    game::CVehicle* FindAdoptable(uint16_t model, const game::CVector& pos, const game::CVehicle* excluded = nullptr);
 
     std::map<uint16_t, NetVehicle> m_byId;
     std::map<game::CVehicle*, uint16_t> m_byPtr;
@@ -186,6 +186,10 @@ private:
     int8_t m_lastArea = 0;
     std::map<uint8_t, RecentVehicles> m_recent;
     std::vector<VehicleSpawn> m_restoreRecent;
+    // A copy we could not safely delete on disconnect (for example, the car
+    // the local player is sitting in). Rebind only its exact network birth.
+    struct RetainedCopy { int handle=-1; uint16_t model=0; uint64_t generation=0, expires=0; };
+    std::map<uint16_t, RetainedCopy> m_retainedCopies;
 };
 
 // Vehicles that are synchronised at all (trains are left to each game). An RC toy is its player's game's car with

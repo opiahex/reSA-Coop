@@ -12,4 +12,6 @@ The game itself is not included. Definitive Edition is unsupported.
 https://github.com/opiahex/reSA-Coop
 https://github.com/opiahex/reSA-Coop/blob/main/CHANGELOG.md
 
-MIT license; original SA:COOP copyright and ENet/MinHook notices are included in coop/licenses.
+Existing MIT and ENet/MinHook licenses are included in coop/licenses.
+Original diagnostic components by opiahex use the separate DIAGNOSTICS-LICENSE.txt and DIAGNOSTICS-NOTICE.md in that directory.
+Original diagnostic system source: https://github.com/opiahex/reSA-Coop

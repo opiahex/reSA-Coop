@@ -1,0 +1,92 @@
+reSA-Coop Diagnostic System Attribution License 1.0
+Local identifier: LicenseRef-reSA-Coop-Diagnostics-Attribution-1.0
+
+Copyright (c) 2026 opiahex
+Original diagnostic system source: https://github.com/opiahex/reSA-Coop
+
+1. Covered Component and boundaries
+
+This license applies only to copyright-protected original diagnostic material
+identified in DIAGNOSTICS-COMPONENTS.md for reSA-Coop 0.2.36-3p, and to copies,
+modified versions and substantial portions of that material. The listed files
+identify the component; listing a file does not create copyright in every line.
+Snapshot hashes identify the reviewed version, not a restriction on modification.
+
+This license grants only rights the licensors are entitled to grant. It does not
+cover inherited MIT material, third-party code, game assets, interfaces, facts,
+addresses, algorithms as such, or other material not subject to those rights.
+Earlier MIT grants remain unchanged. This license does not withdraw them, add
+conditions to their exercise, or license the whole application containing this
+component. Other project files retain their respective existing licenses.
+
+2. Permission
+
+Subject to the conditions below, permission is granted, free of charge, to use,
+copy, modify, merge, publish, distribute, sublicense and sell the Covered
+Component in source or compiled form, including in other forks, mods and
+programs. Private use does not require publication or a public notice.
+Redistribution or sublicensing must preserve the conditions applicable to the
+Covered Component; it must not present that material as available without them.
+This license does not require publication of source code or apply its terms to
+independent code merely combined with the Covered Component.
+
+3. Required attribution on distribution
+
+When distributing the Covered Component, modified versions or substantial
+portions of it, including compiled copies:
+
+(a) Source distributions must retain this license, DIAGNOSTICS-NOTICE.md and
+    existing copyright, attribution and source-link notices for covered material.
+
+(b) Compiled distributions must include this license and the diagnostic notice
+    in an accompanying licenses directory, documentation or another readily
+    accessible file delivered with the binary. A source-code-only notice or an
+    online-only link is not a substitute for these accompanying documents.
+
+(c) If the distributed project has a README or comparable user-facing project
+    documentation, include a visible statement identifying the component as
+    the reSA-Coop Diagnostic System by opiahex and providing the source URL
+    https://github.com/opiahex/reSA-Coop. If no such documentation exists,
+    provide an accessible attribution document with the distribution.
+
+(d) If the distributed product includes a user interface for this diagnostic
+    component, make its name, the opiahex attribution and the same source URL
+    accessible in that interface through About, Credits or Licenses. If none
+    exists, provide an equivalent accessible attribution view. The full license
+    need not be displayed on screen. No interface is required for a component
+    distributed without a user interface. No permanent banner, startup screen,
+    fixed visual layout or particular font is required.
+
+(e) Do not remove these notices from covered material or misrepresent its
+    original authorship. You may identify your own modifications and authorship
+    accurately, in addition to the required original attribution.
+
+The accompanying diagnostic notice must identify:
+
+    reSA-Coop Diagnostic System
+    Copyright (c) 2026 opiahex
+    Original diagnostic system source: https://github.com/opiahex/reSA-Coop
+
+An acceptable README or interface attribution is:
+
+    reSA-Coop Diagnostic System by opiahex
+    https://github.com/opiahex/reSA-Coop
+
+The existing reSA-Coop diagnostic About text identifying opiahex as its developer
+and maintainer and displaying the source URL also satisfies the interface rule.
+
+4. Other licenses and endorsement
+
+Preserve applicable MIT and other notices for SA:COOP, reSA-Coop, ENet, MinHook
+and all other third-party material. Combining this component with their code
+does not replace their licenses. This license does not authorize use of names
+or marks to imply endorsement by opiahex, Karimov-Akbar or other contributors.
+
+5. Disclaimer
+
+THE COVERED COMPONENT IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+TO THE EXTENT PERMITTED BY APPLICABLE LAW, THE AUTHORS AND COPYRIGHT HOLDERS
+SHALL NOT BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE COVERED COMPONENT OR ITS USE.

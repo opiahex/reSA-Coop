@@ -1,5 +1,6 @@
 #include "common/lib/log/Log.h"
 #include "common/lib/profile/Profile.h"
+#include "common/lib/diagnostics/FlightRecorder.h"
 
 #include <windows.h>
 
@@ -14,6 +15,7 @@ static FILE* g_file = nullptr;
 static bool g_console = false;
 static Level g_min = Level::Debug;
 static void (*g_sink)(Level, const char*) = nullptr;
+static std::wstring g_diagnosticPath;
 
 void Open(const std::wstring& path, bool alsoConsole) {
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -26,7 +28,17 @@ void Open(const std::wstring& path, bool alsoConsole) {
     g_file = _wfopen(path.c_str(), L"wb");
     if (g_file) fputs("\xEF\xBB\xBF", g_file);  // UTF-8 BOM so Notepad shows Cyrillic correctly
     g_console = alsoConsole;
+    g_diagnosticPath=path;
 }
+void StartDiagnostics(){
+    static bool attempted=false;if(attempted)return;attempted=true;
+    char recording[8]{};
+    if(GetEnvironmentVariableA("COOP_FLIGHT_RECORDER",recording,sizeof recording)==1&&recording[0]=='1'){
+        LARGE_INTEGER stamp{};QueryPerformanceCounter(&stamp);
+        if(!flight::Start(g_diagnosticPath+L".flight-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(stamp.QuadPart)+L".jsonl"))LOGW("Flight recorder requested but could not start; capture unavailable");
+    }
+}
+bool StopDiagnostics(){return flight::Stop();}
 
 void SetMinLevel(Level lvl) { g_min = lvl; }
 void SetSink(void (*sink)(Level, const char*)) { g_sink = sink; }

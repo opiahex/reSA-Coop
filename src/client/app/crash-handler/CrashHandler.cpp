@@ -1,4 +1,6 @@
 #include "app/crash-handler/CrashHandler.h"
+#include "app/crash-handler/FlightTail.h"
+#include "app/crash-handler/ExceptionAccess.h"
 
 #include <windows.h>
 #include <psapi.h>
@@ -8,6 +10,7 @@
 
 #include "common/config/version/Version.h"
 #include "common/lib/log/Log.h"
+#include "common/lib/diagnostics/FlightRecorder.h"
 #include "common/lib/util/Util.h"
 
 namespace coop {
@@ -70,6 +73,7 @@ void ModuleRange(HMODULE mod, uintptr_t& base, uintptr_t& end) {
 }
 
 void WriteReport(EXCEPTION_POINTERS* ep, bool firstChance) {
+    PersistFlightTail(firstChance); // independent of damaged context/CRT log/stack
     if (InterlockedIncrement(firstChance ? &g_firstChanceReports : &g_unhandledReports) > (firstChance ? 6 : 2)) return;
     FILE* f = _wfopen(g_crashPath.c_str(), L"ab");
     if (!f) return;
@@ -83,7 +87,7 @@ void WriteReport(EXCEPTION_POINTERS* ep, bool firstChance) {
             st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, firstChance ? "first-chance" : "UNHANDLED");
     fprintf(f, "Exception %08X at %s\r\n", (unsigned)er->ExceptionCode, where);
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2)
-        fprintf(f, "  %s address %08X\r\n", er->ExceptionInformation[0] ? "write to" : "read from",
+        fprintf(f, "  %s address %08X\r\n", AccessViolationOperation(er->ExceptionInformation[0]),
                 (unsigned)er->ExceptionInformation[1]);
     fprintf(f, "EAX=%08X EBX=%08X ECX=%08X EDX=%08X ESI=%08X EDI=%08X\r\nEBP=%08X ESP=%08X EIP=%08X EFL=%08X\r\n",
             (unsigned)ctx->Eax, (unsigned)ctx->Ebx, (unsigned)ctx->Ecx, (unsigned)ctx->Edx, (unsigned)ctx->Esi,
@@ -93,6 +97,10 @@ void WriteReport(EXCEPTION_POINTERS* ep, bool firstChance) {
     uintptr_t stackBase = (uintptr_t)((NT_TIB*)NtCurrentTeb())->StackBase;
     uintptr_t to = std::min<uintptr_t>(stackBase, (uintptr_t)ctx->Esp + 4096);
     WriteStack(f, (const uint8_t*)ctx->Esp, to - ctx->Esp);
+    // Best effort only: never wait on a recorder producer or its disk worker.
+    flight::Event tail[64];auto snapshot=flight::Snapshot(tail,64);
+    fprintf(f,"Flight tail count=%u busy=%u accepted=%u busyDrops=%u lifecycleDrops=%u overwrites=%u drainDrops=%u ioErrors=%u qpcFrequency=%llu\r\n",(unsigned)snapshot.count,snapshot.busy,snapshot.counters.accepted,snapshot.counters.busyDrops,snapshot.counters.lifecycleDrops,snapshot.counters.historyOverwrites,snapshot.counters.drainDrops,snapshot.counters.ioErrors,(unsigned long long)flight::TickFrequency());
+    for(size_t i=0;i<snapshot.count;++i){const auto&e=tail[i];fprintf(f,"  seq=%llu ticks=%llu pid=%u tid=%u local=%u stage=%u reason=%u source=%u recipient=%u incarnation=%u world=%u msg=%u channel=%u time=%u entity=%u generation=%llu fingerprint=%llu native=%u motionEpoch=%u hp=%.9g max=%.9g armour=%.9g before=%.9g after=%.9g\r\n",(unsigned long long)e.localSeq,(unsigned long long)e.ticks,e.pid,e.tid,e.localPeer,e.stage,e.reason,e.context.source,e.context.recipient,e.context.incarnation,e.context.world,e.context.msg,e.context.channel,e.context.wireTime,e.context.entity,(unsigned long long)e.context.generation,(unsigned long long)e.context.fingerprint,e.nativeHandle,e.motionEpoch,e.health,e.maxHealth,e.armour,e.beforeHealth,e.afterHealth);}
     fclose(f);
     LOGE("Exception %08X at %s (%s) - see crash.log", (unsigned)er->ExceptionCode, where,
          firstChance ? "first-chance" : "unhandled");
@@ -194,6 +202,7 @@ void StartHangDetector(unsigned seconds) {
 }
 
 void InstallCrashHandler(const std::wstring& coopDir) {
+    InitFlightTail(coopDir); // pre-open outside exception handling; optional
     g_crashPath = coopDir + L"crash.log";
     ModuleRange(GetModuleHandleW(nullptr), g_exeBase, g_exeEnd);
     HMODULE self = nullptr;

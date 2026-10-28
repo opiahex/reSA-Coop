@@ -151,14 +151,20 @@ void SendDamage(uint8_t kind, uint8_t owner, uint16_t netId, int weapon, float d
     WriteHitEvidence(w,target);
     // Keep the actual source captured at the hit. Later RC role/seat changes
     // must not turn an unrelated player's old shot into a mission RC attack.
-    auto*source=kind==TARGET_VEHICLE&&sourceVehicle&&IsVehicleValid(sourceVehicle)&&IsLocalPlayerEntity(sourceVehicle)?Vehicles::Instance().Find(sourceVehicle):nullptr;
+    bool sourceForTarget=kind==TARGET_VEHICLE||(kind==TARGET_PED&&weapon==WEAPON_RAMMEDBYCAR);
+    auto*source=sourceForTarget&&sourceVehicle&&IsVehicleValid(sourceVehicle)&&IsLocalPlayerEntity(sourceVehicle)?Vehicles::Instance().Find(sourceVehicle):nullptr;
     bool hasSource=source&&Vehicles::Alive(*source)&&source->owner==Net().MyId()&&Net().EntityLive(ENTITY_VEHICLE,source->netId);
+    if(kind==TARGET_PED&&weapon==WEAPON_RAMMEDBYCAR&&!hasSource){
+        LOGD("NPC ram not sent id=%04X: authoritative source unavailable",netId);
+        return;
+    }
     w.Bool(hasSource);
     if(hasSource){
         auto generation=Net().EntityGeneration(ENTITY_VEHICLE,source->netId);
-        // The source is optional: its destruction must not discard a valid
-        // hit on the victim. A reused source ID simply loses story RC credit.
-        w.Entity(ENTITY_VEHICLE,source->netId,ENTITY_OPTIONAL,255,generation);w.U16(source->model);w.U64(generation);w.U32((uint32_t)NowMs());
+        // Non-collision hits can still apply after their source disappears;
+        // ram reactions require this exact car instead of a later driver seat.
+        uint8_t sourceUse=kind==TARGET_PED&&weapon==WEAPON_RAMMEDBYCAR?ENTITY_USE:ENTITY_OPTIONAL;
+        w.Entity(ENTITY_VEHICLE,source->netId,sourceUse,255,generation);w.U16(source->model);w.U64(generation);w.U32((uint32_t)NowMs());
         StoryRemoteRole role;bool rc=CooperativeRemoteRole(Net().MyId(),role)&&role.car==sourceVehicle;
         w.U64(rc?role.run:0);w.U32(rc?role.phase:0);w.U32(rc?role.assignment:0);
     }
@@ -242,8 +248,9 @@ void __fastcall HookKillPedWithCar(CPed* ped, void* edx, CVehicle* car, float im
         if (NetPed* np = Peds::Instance().Find(ped); np && np->owner != Net().MyId()) {
             if (driver == FindPlayerPed(0) && !np->deadApplied && NowMs() - np->lastRamMs > 500) {
                 np->lastRamMs = np->lastHitMs = NowMs();
+                auto*source=Vehicles::Instance().EnsureNetworked(car);
                 SendDamage(TARGET_PED, np->owner, np->netId, WEAPON_RAMMEDBYCAR, std::clamp(impulse, 1.0f, 5000.0f), 0, 0,
-                           ped->GetPosition());
+                           ped->GetPosition(),source?source->veh:nullptr);
                 Call<0x532010>(np->pedType == PED_TYPE_COP ? CRIME_DAMAGED_COP : CRIME_DAMAGED_PED, (CEntity*)ped, driver);
                 LOGI("Rammed ped %04X of player %d (impulse %.0f)", np->netId, np->owner, impulse);
             }
@@ -339,26 +346,35 @@ void HandleDamage(uint8_t from, Reader& r) {
     if(kind==TARGET_VEHICLE)if(auto*nv=Vehicles::Instance().Find(netId))target=nv->veh;
     if(from>=3||!ReadHitEvidence(r,target))return;
     CVehicle*sourceVehicle=nullptr;
-    if(r.Bool()){
+    bool hasSource=r.Bool();
+    if(hasSource){
         auto sourceId=r.U16(),sourceModel=r.U16();auto sourceGeneration=r.U64();auto sourceTime=r.U32();
         auto sourceRun=r.U64();auto sourcePhase=r.U32(),sourceAssignment=r.U32();
         auto*source=Vehicles::Instance().Find(sourceId);
         StoryRemoteRole role;bool roleMatches=!sourceRun||(CooperativeRemoteRole(from,role)&&role.car==(source?source->veh:nullptr)&&role.run==sourceRun&&role.phase==sourcePhase&&role.assignment==sourceAssignment);
-        if(kind==TARGET_VEHICLE&&rp&&rp->ped&&rp->hasState&&NowMs()-rp->stateRecvMs<1500&&
+        bool sourceForTarget=kind==TARGET_VEHICLE||(kind==TARGET_PED&&weapon==WEAPON_RAMMEDBYCAR);
+        if(sourceForTarget&&rp&&rp->hasState&&NowMs()-rp->stateRecvMs<1500&&
            source&&Vehicles::Alive(*source)&&source->owner==from&&source->model==sourceModel&&
            sourceGeneration&&Net().EntityGeneration(ENTITY_VEHICLE,sourceId)==sourceGeneration&&
-           roleMatches&&(source->veh->Driver()==rp->ped||CooperativeRemoteController(source->veh)==rp->ped)&&
+           roleMatches&&(kind==TARGET_PED?rp->ClaimsDriver(sourceId,sourceGeneration,source->veh->AreaCode(),NowMs()):
+                         (rp->ped&&(source->veh->Driver()==rp->ped||CooperativeRemoteController(source->veh)==rp->ped)))&&
            (int32_t)(rp->lastStateTime-sourceTime)<=1500&&(int32_t)(sourceTime-rp->lastStateTime)<=1500)
             sourceVehicle=source->veh;
     }
     if(!r.Ok()||r.Remaining()||!damageSeen[from].Accept(sequence)||TrainingIgnoresContact(target,attacker))return;
     if (kind == TARGET_PED) {
         if (CPed* ped = Peds::Instance().FindOwned(netId)) {
+            if(weapon==WEAPON_RAMMEDBYCAR&&!sourceVehicle)return;
             {
                 KeepWanted keep;
                 AsPlayersHit player(ped);
                 bool fire=false;if(ped->Health()>0&&CallMethod<0x5448B0,bool>(ped,weapon,&fire))RecordStoryDamage(ped,from,weapon);
-                CVehicle* car = rp && rp->ped && rp->ped->InVehicle() ? rp->ped->Vehicle() : nullptr;
+                // The actual vehicle reference can arrive before its remote
+                // driver's native seat is materialised. Losing that seat must
+                // not discard a real bicycle/motorcycle impact.
+                // RAM always uses the captured, validated source. A missing
+                // source must never bind to a car entered after the impact.
+                CVehicle* car = sourceVehicle;
                 auto* me = FindPlayerPed(0);
                 bool unloaded = (ped->AreaCode()!=13&&ped->AreaCode() != me->AreaCode()) || (ped->GetPosition() - me->GetPosition()).Length2D() > 120;
                 if (unloaded) {

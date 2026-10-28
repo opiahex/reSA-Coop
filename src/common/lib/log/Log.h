@@ -7,6 +7,9 @@ enum class Level { Debug, Info, Warn, Error };
 
 // Opens (truncates) the log file. Safe to call once per process.
 void Open(const std::wstring& path, bool alsoConsole = false);
+// Outside DllMain only. Open merely remembers the destination.
+void StartDiagnostics();
+bool StopDiagnostics();
 void SetMinLevel(Level lvl);
 void Write(Level lvl, const char* fmt, ...);
 // Callback for mirroring log lines (e.g. to the server console UI).

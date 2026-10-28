@@ -69,6 +69,7 @@ int wmain(int argc, wchar_t** argv) {
     }
     EnsureDirectory(dataDir);
     log::Open(dataDir + L"server.log", true);
+    log::StartDiagnostics();
 
     if (!FileExists(configPath)) WriteDefaultConfig(configPath);
     Ini ini;
@@ -103,6 +104,7 @@ int wmain(int argc, wchar_t** argv) {
     if (!g_server.Start(cfg)) {
         LOGE("Сервер не запущен. Нажмите Enter для выхода.");
         getchar();
+        log::StopDiagnostics();
         return 1;
     }
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
@@ -121,5 +123,6 @@ int wmain(int argc, wchar_t** argv) {
     input.detach();
 
     g_server.Run();
+    log::StopDiagnostics();
     return 0;
 }

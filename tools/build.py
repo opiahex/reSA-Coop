@@ -217,7 +217,8 @@ def assemble_dist(debug):
     shutil.rmtree(dist, ignore_errors=True)
     (dist / "coop").mkdir(parents=True)
     shutil.copy2(src / "coop.dll", dist / "coop.asi")  # any ASI loader picks up *.asi
-    for name in ("coop.pdb", "coop-server.exe"):
+    # Keep debug symbols in build/ for crash analysis, outside the player package.
+    for name in ("coop-server.exe",):
         if (src / name).exists():
             shutil.copy2(src / name, dist / "coop" / name)
     (dist / "coop" / "loader").mkdir()
@@ -230,6 +231,8 @@ def assemble_dist(debug):
     licenses = dist / "coop" / "licenses"  # the binaries carry ENet and MinHook: their notices go along
     licenses.mkdir()
     shutil.copy2(ROOT / "LICENSE", licenses / "SA-COOP.txt")
+    for name in ("DIAGNOSTICS-LICENSE.txt", "DIAGNOSTICS-NOTICE.md", "DIAGNOSTICS-COMPONENTS.md"):
+        shutil.copy2(ROOT / name, licenses / name)
     shutil.copy2(ROOT / "third_party" / "enet" / "LICENSE", licenses / "ENet.txt")
     shutil.copy2(ROOT / "third_party" / "minhook" / "LICENSE.txt", licenses / "MinHook.txt")
     archive = shutil.make_archive(str(ROOT / "dist" / "SA-COOP"), "zip", dist)

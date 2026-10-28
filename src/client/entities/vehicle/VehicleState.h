@@ -34,7 +34,7 @@ struct VehicleState {
     WheelState wheels;
     game::CVector searchTarget;
     float searchIntensity = 0;
-    float rotorSpeed = 0; // CHeli: native rotor spool, separate from engine-on bit
+    float rotorSpeed = 0; // CHeli rotor or CPlane propeller speed, separate from engine-on bit
     uint16_t towChild=0,towParent=0;
     TrainAttachment train;game::CVector trainOffset;Quat trainRotation;
     // Physical car-to-car binding (0683), distinct from a tow hitch or train.

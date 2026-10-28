@@ -1,6 +1,8 @@
 #pragma once
 // Serialisable snapshots of a player (shared by the sender and the receiver).
 #include <cstdint>
+#include <algorithm>
+#include <cmath>
 
 #include "common/lib/buffer/Buffer.h"
 #include "shared/game/Game.h"
@@ -65,8 +67,8 @@ struct OnFootState {
     uint32_t time = 0;  // sender clock (ms)
     game::CVector pos, vel;
     float rotation = 0, aimRotation = 0;
-    float breath=1000;
-    uint8_t health = 100, armour = 0;
+    float health = 100, maxHealth = 100, breath = 1000;
+    uint8_t armour = 0;
     uint8_t weapon = 0;
     uint16_t ammo = 0;
     uint8_t flags = 0;  // F_*
@@ -81,6 +83,15 @@ struct OnFootState {
     JetpackState jetpack;
 
     enum : uint8_t { F_DUCKING = 1, F_IN_AIR = 2, F_DEAD = 4, F_SWIMMING = 8, F_JETPACK = 16, F_IN_TRAIN = 32, F_PHONE = 64 };
+
+    bool ValidVitals() const {
+        return std::isfinite(health) && health >= 0 && health <= 1000000 &&
+               std::isfinite(maxHealth) && maxHealth > 0 && maxHealth <= 1000000 &&
+               std::isfinite(breath) && breath >= 0 && breath <= 1000000;
+    }
+    float HealthFraction() const {
+        return (flags & F_DEAD) || !ValidVitals() ? 0.0f : std::clamp(health / maxHealth, 0.0f, 1.0f);
+    }
 
     void Write(Writer& w) const;
     bool Read(Reader& r);

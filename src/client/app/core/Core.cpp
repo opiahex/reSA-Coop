@@ -4,6 +4,7 @@
 #include <d3d9.h>
 
 #include <algorithm>
+#include <atomic>
 
 #include "app/crash-handler/CrashHandler.h"
 #include "app/patches/Patches.h"
@@ -24,6 +25,7 @@
 #include "shared/ui/input/Input.h"
 #include "shared/ui/renderer/Renderer.h"
 #include "widgets/overlay/Overlay.h"
+#include "widgets/overlay/DiagnosticPanel.h"
 
 namespace coop::core {
 
@@ -42,6 +44,7 @@ VoidFn g_origDebugTextIngame = nullptr;
 VoidFn g_origDebugTextMenu = nullptr;
 VoidFn g_origShutDownForRestart = nullptr;
 VoidFn g_origInitWhenRestarting = nullptr;
+std::atomic<bool> g_initialised{false};
 bool g_restarting = false;  // between CGame::ShutDownForRestart and InitialiseWhenRestarting
 int g_initDepth = 0;        // inside CGame::InitialiseWhenRestarting
 int g_loadDepth=0;         // scripts are not executable while save pointers are being relocated
@@ -75,6 +78,7 @@ void CommonFrame();
 
 
 void __cdecl HookGameProcess() {
+    if(!g_initialised){g_origGameProcess();return;}
     uint64_t started=NowMs(),slowest=0;const char*slowName="-";
     auto measure=[&](Module*m,bool pre){auto at=NowMs();if(pre)m->OnPreProcess();else m->OnPostProcess();auto elapsed=NowMs()-at;if(elapsed>slowest){slowest=elapsed;slowName=m->Name();}};
     ++g_frameNo;
@@ -96,6 +100,7 @@ void __cdecl HookGameProcess() {
 
 void __fastcall HookMenuProcess(void* self, void* edx) {
     g_origMenuProcess(self, edx);
+    if(!g_initialised)return;
     // FrontendIdle: CGame::Process is not running
     if (game::GameState() != game::GAME_STATE_IDLE) {
         ++g_frameNo;
@@ -108,6 +113,7 @@ int g_screenshotScale = 2;
 uint64_t g_screenshotAt = 0;
 
 void RenderOverlay() {
+    if(!g_initialised)return;
     auto& g = ui::Gfx();
     if (!g_screenshotPath.empty() && NowMs() >= g_screenshotAt) {  // before our overlay is drawn
         if (!g.SaveFrame(g_screenshotPath, g_screenshotScale)) LOGW("Screenshot %s failed", g_screenshotPath.c_str());
@@ -146,8 +152,12 @@ void __cdecl HookDebugTextMenu() {
 // call without passing it on left a player with no chat, no F9 window and no invite code to give: after 30 frames
 // without it (in the menu or in the game, not on a loading screen) it is drawn at IDirect3DDevice9::Present instead.
 using PresentFn = HRESULT(WINAPI*)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
-PresentFn g_origPresent = nullptr;
+std::atomic<PresentFn> g_origPresent{nullptr};
+bool g_presentAttempted=false;std::atomic<bool> g_presentVerified{false};
 HRESULT WINAPI HookPresent(IDirect3DDevice9* dev, const RECT* src, const RECT* dst, HWND wnd, const RGNDATA* dirty) {
+    auto original=g_origPresent.load(std::memory_order_acquire);
+    if(!original)return D3DERR_INVALIDCALL;
+    if(!g_presentVerified.load(std::memory_order_acquire))return original(dev,src,dst,wnd,dirty);
     static int missed = 0;
     static bool said = false;
     int state = game::GameState();
@@ -163,7 +173,7 @@ HRESULT WINAPI HookPresent(IDirect3DDevice9* dev, const RECT* src, const RECT* d
         RenderOverlay();
         dev->EndScene();
     }
-    return g_origPresent(dev, src, dst, wnd, dirty);
+    return original(dev, src, dst, wnd, dirty);
 }
 
 void __cdecl HookShutDownForRestart() {
@@ -218,13 +228,20 @@ void HandleChatSubmit(const std::string& text) {
 }
 
 void CommonFrame() {
+    log::StartDiagnostics(); // first ordinary frame, after DLL loader lock
     Heartbeat();
     if (g_lastCommonFrame == g_frameNo) return;
     g_lastCommonFrame = g_frameNo;
 
-    if (!g_origPresent)
-        if (auto* dev = (IDirect3DDevice9*)game::D3DDevice())
-            g_origPresent = (PresentFn)mem::SwapVTable(*(void***)dev, 17, (void*)&HookPresent);  // IDirect3DDevice9::Present
+    if(!g_presentAttempted)if(auto*dev=(IDirect3DDevice9*)game::D3DDevice()){
+        g_presentAttempted=true;void**table=nullptr;SIZE_T objectRead=0;
+        bool objectValid=ReadProcessMemory(GetCurrentProcess(),dev,&table,sizeof table,&objectRead)&&objectRead==sizeof table;
+        auto slot=objectValid?mem::ReadVTableSlot(table,17):mem::SlotReadResult{};
+        MEMORY_BASIC_INFORMATION target{};auto protection=slot.value&&VirtualQuery(slot.value,&target,sizeof target)?target.Protect&0xff:0;
+        bool callable=target.State==MEM_COMMIT&&!(target.Protect&PAGE_GUARD)&&(protection==PAGE_EXECUTE||protection==PAGE_EXECUTE_READ||protection==PAGE_EXECUTE_READWRITE||protection==PAGE_EXECUTE_WRITECOPY);
+        if(slot.ok&&callable&&slot.value!=(void*)&HookPresent){g_origPresent.store((PresentFn)slot.value,std::memory_order_release);auto result=mem::TrySwapVTable(table,17,(void*)&HookPresent,slot.value,true);g_presentVerified.store(result.state==mem::PatchState::Installed,std::memory_order_release);}
+        if(!g_presentVerified.load(std::memory_order_acquire))LOGE("Present fallback disabled: vtable installation was not confirmed");
+    }
     if (!ui::In().Installed()) {
         if (void* hwnd = game::GameWindow()) {
             ui::In().Install(hwnd);
@@ -267,6 +284,7 @@ void CommonFrame() {
 
     ui::TheChat().ProcessInput();
     ui::ProcessConnectMenu();
+    ui::UpdateDiagnosticSnapshot(NowMs());
 }
 
 std::wstring CoopDirFromModule(void* hModule) {
@@ -553,8 +571,18 @@ void Init(void* hModule) {
     WIN32_FILE_ATTRIBUTE_DATA fad{};
     GetFileAttributesExW(exePath, GetFileExInfoStandard, &fad);
     LOGI("gta_sa.exe size: %u", (unsigned)fad.nFileSizeLow);
-    // 1.0 US signature (both HOODLUM and "compact" executables share all addresses)
-    if (*(uint32_t*)0x82457C != 0x94BF) {
+    // Fixed addresses require the native 1.0 US image layout. Read via the OS
+    // before touching target memory; an unsupported/unmapped site must reject.
+    uint32_t signature=0;SIZE_T read=0;
+    auto image=(uintptr_t)GetModuleHandleW(nullptr);
+    IMAGE_DOS_HEADER dos{};IMAGE_NT_HEADERS32 pe{};
+    bool identity=image==0x400000&&ReadProcessMemory(GetCurrentProcess(),(void*)image,&dos,sizeof dos,&read)&&read==sizeof dos&&
+        dos.e_magic==IMAGE_DOS_SIGNATURE&&dos.e_lfanew>0&&dos.e_lfanew<1024*1024&&
+        ReadProcessMemory(GetCurrentProcess(),(void*)(image+dos.e_lfanew),&pe,sizeof pe,&read)&&read==sizeof pe&&
+        pe.Signature==IMAGE_NT_SIGNATURE&&pe.FileHeader.Machine==IMAGE_FILE_MACHINE_I386&&
+        pe.OptionalHeader.Magic==IMAGE_NT_OPTIONAL_HDR32_MAGIC&&pe.OptionalHeader.ImageBase==image&&pe.OptionalHeader.SizeOfImage>0x424580&&
+        ReadProcessMemory(GetCurrentProcess(),(void*)0x82457C,&signature,sizeof signature,&read)&&read==sizeof signature&&signature==0x94BF;
+    if (!identity) {
         LOGE("Unsupported gta_sa.exe (size %u). SA:COOP requires GTA SA 1.0 US.", (unsigned)fad.nFileSizeLow);
         MessageBoxW(nullptr,
                     TR(L"SA:COOP работает только с GTA San Andreas версии 1.0 US.\n"
@@ -568,24 +596,31 @@ void Init(void* hModule) {
                     L"SA:COOP", MB_ICONWARNING);
         return;
     }
+    LOGI("GTA image identity: base=%08X timestamp=%08X imageSize=%u checksum=%08X signature=%08X",(unsigned)image,(unsigned)pe.FileHeader.TimeDateStamp,(unsigned)pe.OptionalHeader.SizeOfImage,(unsigned)pe.OptionalHeader.CheckSum,signature);
 
     if (!mem::Init()) return;
 
+    auto patchFailures=mem::PatchFailureSerial();
     patches::Apply();
+    if(mem::PatchFailureSerial()!=patchFailures||mem::HasUnsafePatchFailure()){LOGE("Co-op initialisation blocked after patch failure; dependent hooks were not installed");return;}
 
     // frame hooks (call-site redirections; chain to whatever was there before)
-    mem::RedirectCallFn(0x53E981, &HookGameProcess, &g_origGameProcess);      // Idle -> CGame::Process
-    mem::RedirectCallFn(0x53E7A5, &HookMenuProcess, &g_origMenuProcess);      // FrontendIdle -> CMenuManager::Process
-    mem::RedirectCallFn(0x53EBE4, &HookDebugTextIngame, &g_origDebugTextIngame);  // Idle -> DebugDisplayTextBuffer
-    mem::RedirectCallFn(0x53E86C, &HookDebugTextMenu, &g_origDebugTextMenu);  // FrontendIdle -> DebugDisplayTextBuffer
-    mem::HookFn(0x6190A0, &HookGenerateGameFilename, &g_origGenerateGameFilename, "C_PcSave::GenerateGameFilename");
-    mem::HookFn(0x53C550, &HookShutDownForRestart, &g_origShutDownForRestart, "CGame::ShutDownForRestart");
-    mem::HookFn(0x5D17B0,&HookGenericLoad,&g_originalLoad,"CGenericGameStorage::GenericLoad script relocation guard");
-    mem::HookFn(0x53C680, &HookInitialiseWhenRestarting, &g_origInitWhenRestarting, "CGame::InitialiseWhenRestarting");
+    if(!mem::RedirectCallFn(0x53E981, &HookGameProcess, &g_origGameProcess)||
+       !mem::RedirectCallFn(0x53E7A5, &HookMenuProcess, &g_origMenuProcess)||
+       !mem::RedirectCallFn(0x53EBE4, &HookDebugTextIngame, &g_origDebugTextIngame)||
+       !mem::RedirectCallFn(0x53E86C, &HookDebugTextMenu, &g_origDebugTextMenu)||
+       !mem::HookFn(0x6190A0, &HookGenerateGameFilename, &g_origGenerateGameFilename, "C_PcSave::GenerateGameFilename")||
+       !mem::HookFn(0x53C550, &HookShutDownForRestart, &g_origShutDownForRestart, "CGame::ShutDownForRestart")||
+       !mem::HookFn(0x5D17B0,&HookGenericLoad,&g_originalLoad,"CGenericGameStorage::GenericLoad script relocation guard")||
+       !mem::HookFn(0x53C680, &HookInitialiseWhenRestarting, &g_origInitWhenRestarting, "CGame::InitialiseWhenRestarting")){
+        LOGE("Co-op initialisation blocked: a required frame/load hook was not confirmed");return;
+    }
 
     for (auto* m : Modules()) {
         LOGI("Module: %s", m->Name());
+        patchFailures=mem::PatchFailureSerial();
         m->OnInstallHooks();
+        if(mem::PatchFailureSerial()!=patchFailures||mem::HasUnsafePatchFailure()){LOGE("Co-op initialisation blocked after module %s patch failure",m->Name());return;}
     }
 
     ui::TheChat().onSubmit = HandleChatSubmit;
@@ -623,6 +658,7 @@ void Init(void* hModule) {
     // auto-connect (launcher / test setups) is performed on the first main-menu frame:
     // the user files directory and the network stack are not ready inside DllMain
     g_pendingAutoConnect = cfg.autoConnect;
+    g_initialised=true;
     LOGI("Initialisation complete");
 }
 

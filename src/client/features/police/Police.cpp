@@ -10,6 +10,7 @@
 #include "shared/game/Anim.h"
 #include "shared/game/PlayerContext.h"
 #include "shared/lib/memory/Memory.h"
+#include "shared/lib/sync/PopulationShare.h"
 #include "common/lib/log/Log.h"
 #include "common/lib/util/Util.h"
 
@@ -49,6 +50,10 @@ CPlayerPed* SelectTarget(CEntity* source,bool generation=false){
     }
     CPlayerPed*best=nullptr;float score=1e9f;
     auto consider=[&](CPlayerPed*p){if(!Available(p,pos,area))return;
+        // Only the elected simulator supplies another viewer's pursuit cars.
+        // A nearby but independently generating zone keeps its own budget.
+        if(generation)if(auto*rp=Players::Instance().FindByPed(p);rp&&
+            (rp->id>=PopulationSources().size()||PopulationSources()[rp->id]!=Net().MyId()))return;
         float distance=(p->GetPosition()-pos).Length();
         float value=generation?-1000.f*Field<uint32_t>(p->Wanted(),0x2C)+distance:distance;
         if(value<score){best=p;score=value;}};
@@ -67,6 +72,15 @@ public:
     }
     ~Context(){slot.reset();PlayerInFocus()=savedFocus;activeTarget=savedTarget;}
 };
+using StreamFn=void(__cdecl*)();StreamFn originalStreamModels=nullptr;
+void __cdecl StreamPoliceModels(){
+    // Generation already borrows the wanted guest, but native streaming used
+    // the innocent local player's CWanted and made SWAT/FBI/army cars
+    // deletable before that generator could choose them. Use the same suspect
+    // during the original model request phase, then restore both player slots.
+    if(!Net().Online()||!core::IsPlayerReady()||core::IsRestarting())return originalStreamModels();
+    Context c(SelectTarget(nullptr,true));originalStreamModels();
+}
 bool AmbientCop(CPed*p){
     if(!p||p->PedType()!=PED_TYPE_COP||p->CreatedBy()!=1)return false;
     auto*n=Peds::Instance().Find(p);return !n||n->owner==Net().MyId();
@@ -180,6 +194,12 @@ class Police:public Module {
             LOGI("Police world loaded: local wanted=%u chaos=%u",Field<uint32_t>(me->Wanted(),0x2C),Field<uint32_t>(me->Wanted(),0));
     }
     void OnInstallHooks()override{
+        // CStreaming::Update -> StreamVehiclesAndPeds, cdecl void(). Do not
+        // replace a changed callsite/third-party chain with an assumed ABI.
+        static constexpr uint8_t expectedStreamCall[]={0xE8,0x1A,0xCF,0xFF,0xFF};
+        if(mem::Check(0x40E7E1,expectedStreamCall,sizeof expectedStreamCall))
+            mem::RedirectCallFn(0x40E7E1,&StreamPoliceModels,&originalStreamModels);
+        else LOGW("Police model streaming hook skipped: incompatible callsite 0040E7E1");
         mem::HookFn(0x5DE160,&CopControl,&originalCop,"CCopPed::ProcessControl");
         mem::HookFn(0x4B3440,&DamageCrime,&originalDamageCrime,"CEventDamage::ReportCriminalEvent personal offender");
         mem::HookFn(0x4BB740,&StolenCopCar,&originalStolenCar,"CEventHandler::ComputeCopCarBeingStolenResponse personal offender");

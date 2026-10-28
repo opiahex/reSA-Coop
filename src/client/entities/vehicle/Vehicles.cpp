@@ -70,6 +70,19 @@ bool OccupiedTowChain(CVehicle* v) {
     return false;
 }
 
+bool RetainedCarInUse(CVehicle* v) {
+    if (!IsVehicleValid(v) || ScriptHolds(v) || OccupiedTowChain(v) || v->Driver()) return true;
+    for (int i=0;i<8;++i) if (v->Passengers()[i]) return true;
+    auto supports=[v](CPed* ped) {
+        return ped && IsPedValid(ped) &&
+            ((ped->InVehicle() && ped->Vehicle()==v) || Field<CEntity*>(ped,0x568)==v ||
+             Field<CEntity*>(ped,0x584)==v || ped->AttachedTo()==v);
+    };
+    if (supports(FindPlayerPed(0))) return true;
+    for (const auto& [id,rp] : Players::Instance().All()) if (supports(rp.ped)) return true;
+    return false;
+}
+
 void SetVehicleMatrix(CVehicle* v, const CVector& pos, const Quat& q) {
     CMatrix* m = v->Matrix();
     if (!m) return;
@@ -431,6 +444,20 @@ void Vehicles::UpdateRecentProtection() {
 NetVehicle* Vehicles::EnsureNetworked(CVehicle* v) {
     if (!v || !IsVehicleValid(v) || !IsSyncableVehicle(v)) return nullptr;
     if (NetVehicle* nv = Find(v)) return nv;
+    // A retained foreign copy must not be announced under a new local ID
+    // while the original birth is being received during a quick reconnect.
+    for (auto it=m_retainedCopies.begin();it!=m_retainedCopies.end();++it) {
+        const auto id=it->first;const auto saved=it->second;
+        if (saved.handle!=GetVehicleRef(v) || saved.model!=v->ModelIndex()) continue;
+        if (NowMs()<saved.expires || (Net().EntityLive(ENTITY_VEHICLE,id) &&
+            Net().EntityGeneration(ENTITY_VEHICLE,id)==saved.generation) || RetainedCarInUse(v)) return nullptr;
+        // The original birth did not return and nothing uses this foreign copy.
+        // Delete it rather than re-announcing an orphan under a fresh local ID.
+        m_retainedCopies.erase(it);
+        StopEntering(v);
+        Cmd(0x00A6).I(saved.handle).Run();
+        return nullptr;
+    }
     if(auto old=m_byPtr.find(v);old!=m_byPtr.end()){
         const auto id=old->second;auto stale=m_byId.find(id);
         if(stale!=m_byId.end()&&stale->second.owner==Net().MyId()){Writer gone(proto::G_VEH_REMOVE);gone.Entity(ENTITY_VEHICLE,id,ENTITY_REMOVE);gone.Bool(true);Net().Send(proto::CH_RELIABLE,gone);}
@@ -619,7 +646,7 @@ void Vehicles::ObserveScriptOwnership(NetVehicle& nv) {
     }
 }
 
-CVehicle* Vehicles::FindAdoptable(uint16_t model, const CVector& pos) {
+CVehicle* Vehicles::FindAdoptable(uint16_t model, const CVector& pos, const CVehicle* excluded) {
     CPoolHeader* pool = VehiclePool();
     if (!pool) return nullptr;
     CPlayerPed* me = FindPlayerPed(0);
@@ -628,7 +655,13 @@ CVehicle* Vehicles::FindAdoptable(uint16_t model, const CVector& pos) {
     for (int i = 0; i < pool->size; ++i) {
         if (pool->byteMap[i] < 0) continue;
         auto* v = (CVehicle*)(pool->objects + (size_t)i * kVehiclePoolElemSize);
-        if (v->ModelIndex() != model || m_byPtr.count(v)) continue;
+        if (v==excluded || v->ModelIndex() != model || m_byPtr.count(v)) continue;
+        // An unresolved copy belongs to its saved birth even when a different
+        // network ID for the same model appears at the same location.
+        bool quarantined=false;
+        for (const auto& [id,saved] : m_retainedCopies)
+            if (saved.handle==GetVehicleRef(v) && saved.model==v->ModelIndex()) { quarantined=true; break; }
+        if (quarantined) continue;
         if (me && me->InVehicle() && me->Vehicle() == v) continue;
         // a script's car stays its own: released as an ordinary car later, its script lost it and crashed
         if (v->CreatedBy() == VEHICLE_CREATED_MISSION) continue;
@@ -687,17 +720,31 @@ void Vehicles::HandleCreate(uint8_t from, Reader& r) {
 bool Vehicles::CreateMirror(const VehicleSpawn& sp) {
     if (Find(sp.netId)) return true;  // announced again meanwhile and made already
     bool adopted = false;
-    CVehicle* v = FindAdoptable(sp.model, sp.pos);
+    bool retained = false;
+    CVehicle* v = nullptr;
+    CVehicle* excluded = nullptr;
+    if (auto saved=m_retainedCopies.find(sp.netId); saved!=m_retainedCopies.end()) {
+        auto* candidate=GetVehicle(saved->second.handle);
+        if (saved->second.generation && saved->second.generation==Net().EntityGeneration(ENTITY_VEHICLE,sp.netId) &&
+            saved->second.model==sp.model && IsVehicleValid(candidate) && candidate->ModelIndex()==sp.model && !Find(candidate)) {
+            v=candidate;retained=true;
+        } else excluded=candidate;
+        // Keep an unmatched live copy quarantined until it is safe to delete;
+        // otherwise the traffic scanner can reannounce it under a new ID.
+        if (retained || !IsVehicleValid(candidate) || candidate->ModelIndex()!=saved->second.model)
+            m_retainedCopies.erase(saved);
+    }
+    if (!v) v = FindAdoptable(sp.model, sp.pos, excluded);
     if (v) {
         adopted = true;
-        if(Field<int8_t>(v,0x438)!=sp.components[0]||Field<int8_t>(v,0x439)!=sp.components[1]){
+        if(!retained&&(Field<int8_t>(v,0x438)!=sp.components[0]||Field<int8_t>(v,0x439)!=sp.components[1])){
             const auto saved=Ref<uint16_t>(0x8A6458);
             WorldRemove(v);CallVirtual<8>(v);
             for(int c=0;c<2;++c)Ref<int8_t>(0x8A6458+c)=sp.components[c];
             CallVirtual<5>(v,(uint32_t)sp.model);Ref<uint16_t>(0x8A6458)=saved;WorldAdd(v);
             // Its original upgrades/paint/damage are reconciled from its owner.
         }
-        SetVehicleMatrix(v, sp.pos, sp.rot);
+        if(!retained)SetVehicleMatrix(v, sp.pos, sp.rot);
         memcpy(v->Colors(), sp.colors, 4);  // the same parked car can have other random colours here
         v->Health() = sp.health;
     } else {
@@ -711,8 +758,9 @@ bool Vehicles::CreateMirror(const VehicleSpawn& sp) {
     nv.handle = GetVehicleRef(v);
     nv.owner = sp.owner;
     nv.model = sp.model;
-    nv.createdByUs = !adopted;
+    nv.createdByUs = retained || !adopted;
     nv.script = sp.script;
+    nv.heldHere = retained && ScriptHolds(v);
     nv.playerUsed = sp.playerUsed;
     if (adopted) Protect(nv);
     m_byPtr[v] = sp.netId;
@@ -1081,7 +1129,10 @@ void ApplyParts(CVehicle* v, const VehicleState& st) {
     // only what this vehicle has as well (VehicleState::Capture's rules): a net id that meant another vehicle here wrote
     // a plane's gear (CPlane::SetGearUp) or a tank's turret into a bike or a boat
     int type = v->VehicleSubClass(), model = v->ModelIndex();
-    if(type==VEHICLE_TYPE_HELI&&(st.extras&VehicleState::X_ROTOR))Field<float>(v,0x84C)=st.rotorSpeed;
+    if(st.extras&VehicleState::X_ROTOR){
+        if(type==VEHICLE_TYPE_HELI)Field<float>(v,0x84C)=st.rotorSpeed;
+        else if(type==VEHICLE_TYPE_PLANE)Field<float>(v,0x9C4)=st.rotorSpeed;
+    }
     if ((st.extras & VehicleState::X_MISC) && (type <= VEHICLE_TYPE_PLANE || type == VEHICLE_TYPE_TRAILER))
         Field<uint16_t>(v, 0x86C) = st.misc;
     if ((st.extras & VehicleState::X_GEAR) && type == VEHICLE_TYPE_PLANE) {
@@ -1506,7 +1557,10 @@ void Vehicles::OnPostProcess() {
                 nv.veh->SetEngineOn((nv.state.flags&VehicleState::F_ENGINE)!=0);
                 nv.veh->PhysicalFlags()=(nv.veh->PhysicalFlags()&~0x100u)|((nv.state.water&1)?0x100u:0);
                 nv.veh->VehicleFlagsLo()=(nv.veh->VehicleFlagsLo()&~0x40000000u)|((nv.state.water&2)?0x40000000u:0);
-                if(nv.veh->VehicleSubClass()==VEHICLE_TYPE_HELI&&(nv.state.extras&VehicleState::X_ROTOR))Field<float>(nv.veh,0x84C)=nv.state.rotorSpeed;
+                if(nv.state.extras&VehicleState::X_ROTOR){
+                    if(nv.veh->VehicleSubClass()==VEHICLE_TYPE_HELI)Field<float>(nv.veh,0x84C)=nv.state.rotorSpeed;
+                    else if(nv.veh->VehicleSubClass()==VEHICLE_TYPE_PLANE)Field<float>(nv.veh,0x9C4)=nv.state.rotorSpeed;
+                }
                 nv.veh->SteerAngle() = nv.state.steer;
                 nv.veh->BrakePedal() = nv.state.brake;
                 nv.veh->GasPedal() = nv.state.gas;
@@ -1552,13 +1606,15 @@ void Vehicles::OnPostProcess() {
             LOGI("Vehicle %04X of the host's mission goes back to the host", nv.netId);
             continue;
         }
-        const bool engine=nv.veh->EngineOn();const bool heli=nv.veh->VehicleSubClass()==VEHICLE_TYPE_HELI;
-        const float rotor=heli?Field<float>(nv.veh,0x84C):0;
-        if(engine!=nv.lastEngine||(heli&&std::fabs(rotor-nv.lastRotor)>.005f&&now-nv.lastSendMs>=100)){
+        const bool engine=nv.veh->EngineOn();const int type=nv.veh->VehicleSubClass();
+        const bool aircraft=type==VEHICLE_TYPE_HELI||type==VEHICLE_TYPE_PLANE;
+        const float rawRotor=aircraft?Field<float>(nv.veh,type==VEHICLE_TYPE_HELI?0x84C:0x9C4):0.f;
+        const float rotor=std::isfinite(rawRotor)?std::clamp(rawRotor,0.f,5.f):0.f;
+        if(engine!=nv.lastEngine||(aircraft&&std::fabs(rotor-nv.lastRotor)>.005f&&now-nv.lastSendMs>=100)){
             nv.lastEngine=engine;nv.lastRotor=rotor;nv.lastChangeMs=now;nv.lastSendMs=now;SendState(nv,true);
         }
         float speed = nv.veh->MoveSpeed().Length() * 50.0f;
-        if (speed > 0.1f || nv.veh->TurnSpeed().Length()>.0002f || (heli&&rotor>.001f) ||
+        if (speed > 0.1f || nv.veh->TurnSpeed().Length()>.0002f || (aircraft&&rotor>.001f) ||
             std::fabs(nv.veh->Health()-nv.sentHealth)>=1.f) nv.lastChangeMs = now;
         bool active = now - nv.lastChangeMs < 3000;
         bool towed = Field<CVehicle*>(nv.veh, 0x4C4) != nullptr;  // CVehicle::m_pTowingVehicle
@@ -1577,12 +1633,26 @@ void Vehicles::OnSessionEnd() {
     ReleaseKeptCar();
     m_recent.clear();
     m_restoreRecent.clear();
-    // mirrors stay in the world as this game's cars (the other game's scripts hold nothing here any more)
-    for (auto& [id, nv] : m_byId)
-        if (IsMirror(nv) || nv.playerUsed || nv.origBy) {
-            nv.script = false;
-            Release(nv);
+    // Foreign cars created solely for the network are not local traffic. If
+    // released here, the next connection re-announces them under new IDs while
+    // their original owner also recreates them. Native originals and local
+    // ownership remain; a vehicle supporting the local player or held by a
+    // local script is retained and can rebind only to its exact birth.
+    auto* me=FindPlayerPed(0);
+    std::vector<uint16_t> discard;
+    for (auto& [id, nv] : m_byId) {
+        if (IsMirror(nv) && nv.createdByUs && Alive(nv)) {
+            auto* v=nv.veh;
+            const bool supportsLocal=me && ((me->InVehicle() && me->Vehicle()==v) ||
+                Field<CEntity*>(me,0x568)==v || Field<CEntity*>(me,0x584)==v ||
+                me->AttachedTo()==v || OccupiedTowChain(v));
+            if (!supportsLocal && !ScriptHolds(v)) { discard.push_back(id); continue; }
+            const auto generation=Net().EntityGeneration(ENTITY_VEHICLE,id);
+            if (generation) m_retainedCopies[id]={nv.handle,nv.model,generation,0};
         }
+        if (IsMirror(nv) || nv.playerUsed || nv.origBy) { nv.script=false; Release(nv); }
+    }
+    for (auto id : discard) Forget(id,true);
     m_byId.clear();
     m_byPtr.clear();
     m_pending.clear();
@@ -1616,7 +1686,10 @@ void Vehicles::OnPeerLeave(uint8_t id) {
     }
 }
 
-void Vehicles::OnSessionStart() { m_ids.Reset((uint32_t)NowMs()); }
+void Vehicles::OnSessionStart() {
+    m_ids.Reset((uint32_t)NowMs());
+    for (auto& [id, saved] : m_retainedCopies) saved.expires=NowMs()+15000;
+}
 
 void Vehicles::OnGameStarted() {
     m_scriptLocks.clear();
@@ -1636,6 +1709,7 @@ void Vehicles::OnGameStarted() {
 
 void Vehicles::OnGameShutdown() {
     m_restoreRecent.clear();
+    m_retainedCopies.clear(); // native pool handles no longer identify this world
     if (Net().Online()) for (const auto& [id, nv] : m_byId) {
         if (IsMirror(nv) || !nv.playerUsed || nv.script || !IsVehicleValid(nv.veh) || nv.veh->Health() <= 0 || ScriptHolds(nv.veh)) continue;
         VehicleSpawn spawn;

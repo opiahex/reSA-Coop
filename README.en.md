@@ -2,7 +2,9 @@
 
 [![Release](https://img.shields.io/github/v/release/opiahex/reSA-Coop?label=release)](https://github.com/opiahex/reSA-Coop/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/opiahex/reSA-Coop/total?label=downloads)](https://github.com/opiahex/reSA-Coop/releases)
-[![License](https://img.shields.io/github/license/opiahex/reSA-Coop)](LICENSE)
+[![License](https://img.shields.io/badge/license-MIT%20%2B%20Diagnostics-97CA00)](DIAGNOSTICS-LICENSE.txt)
+
+[![Telegram group](https://img.shields.io/badge/Telegram%20group-26A5E4?logo=telegram&logoColor=white)](https://t.me/resacoop)
 
 # reSA-Coop
 
@@ -71,4 +73,6 @@ The installable archive is `dist/SA-COOP.zip`. Game files are not included.
 
 SA:COOP by [Karimov-Akbar](https://github.com/Karimov-Akbar/sa-coop). reSA-Coop development by [opiahex](https://github.com/opiahex).
 
-Licensed under [MIT](LICENSE). Copyright notices are retained; ENet and MinHook licenses are included in the archive. This project is not affiliated with Rockstar Games.
+Base SA:COOP, previously released reSA-Coop material and existing MIT integration code retain the [MIT license](LICENSE). The original [reSA-Coop Diagnostic System by opiahex](https://github.com/opiahex/reSA-Coop) uses [separate attribution terms](DIAGNOSTICS-LICENSE.txt) for the [listed component files](DIAGNOSTICS-COMPONENTS.md). Preserve opiahex and the original-source link when distributing those components; see [the notice](DIAGNOSTICS-NOTICE.md).
+
+ENet and MinHook retain their own licenses, included in the archive. This project is not affiliated with Rockstar Games.

@@ -7,6 +7,7 @@
 #include "common/api/net/Net.h"
 #include "common/config/version/Version.h"
 #include "common/lib/log/Log.h"
+#include "common/lib/diagnostics/PassengerTrace.h"
 #include "common/lib/util/Util.h"
 
 namespace coop::server {
@@ -209,6 +210,8 @@ void Server::Leave(Player& p, LeaveReason why, const std::string& reason) {
 
 void Server::OnPacket(ENetPeer* peer, uint8_t channel, const uint8_t* data, size_t size, uint32_t flags) {
     Player* p = FindByPeer(peer);
+    auto diagnostic=passenger_trace::Packet(data,size,channel,false,p?p->id:255,peer?peer->connectID:0);
+    passenger_trace::Emit(diagnostic,passenger_trace::ServerReceive,!p||!p->joined?passenger_trace::NotJoined:passenger_trace::Ok,proto::kServerId);
     if (!p || size == 0) return;
     uint8_t id = data[0];
     Reader r(data + 1, size - 1);
@@ -669,12 +672,13 @@ void Server::SaveProfile(Player& p, const std::vector<uint8_t>& data) {
 }
 
 void Server::Relay(Player& from, uint8_t channel, const uint8_t* data, size_t size, uint32_t flags) {
-    if (channel >= CH_COUNT) return;
+    auto diagnostic=passenger_trace::Packet(data,size,channel,false,from.id,from.peer->connectID);
+    if (channel >= CH_COUNT){passenger_trace::Emit(diagnostic,passenger_trace::Relay,passenger_trace::Malformed,proto::kServerId);return;}
     bool stateChannel=channel==CH_STATE;
     channel = RelayedChannel(channel, from.id);
     // [id][sender][connection incarnation][opaque payload]
     ENetPacket* pkt = enet_packet_create(nullptr, size + 5, flags & (ENET_PACKET_FLAG_RELIABLE | ENET_PACKET_FLAG_UNSEQUENCED));
-    if(!pkt)return;
+    if(!pkt){passenger_trace::Emit(diagnostic,passenger_trace::Relay,passenger_trace::AllocationFailed,proto::kServerId);return;}
     pkt->data[0] = data[0];
     pkt->data[1] = from.id;
     memcpy(pkt->data+2,&from.peer->connectID,4);
@@ -682,10 +686,12 @@ void Server::Relay(Player& from, uint8_t channel, const uint8_t* data, size_t si
     bool sent = false;
     for (auto& o : m_players) {
         if (!o.joined || &o == &from) continue;
+        diagnostic.recipient=o.id;
         // states for a player still loading or in the menu piled up there and came stale all at once (voice goes on:
         // players talk while one of them loads)
-        if (stateChannel && o.status != STATUS_INGAME) continue;
-        sent = enet_peer_send(o.peer, channel, pkt) == 0 || sent;  // a peer going away takes nothing
+        if (stateChannel && o.status != STATUS_INGAME){passenger_trace::Emit(diagnostic,passenger_trace::Relay,passenger_trace::NotInGame,proto::kServerId);continue;}
+        int outcome=enet_peer_send(o.peer,channel,pkt);passenger_trace::Emit(diagnostic,passenger_trace::Relay,outcome?passenger_trace::SendFailed:passenger_trace::Ok,proto::kServerId);
+        sent = outcome == 0 || sent;  // a peer going away takes nothing
     }
     if (!sent) enet_packet_destroy(pkt);
 }

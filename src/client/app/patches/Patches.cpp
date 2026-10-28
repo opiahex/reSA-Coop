@@ -7,6 +7,7 @@
 #include <tlhelp32.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
 #include "common/lib/log/Log.h"
@@ -238,12 +239,15 @@ int __cdecl HookSelectDevice() {
 int g_winW = 0, g_winH = 0;
 using GetAdapterDisplayModeFn = HRESULT(WINAPI*)(IDirect3D9*, UINT, D3DDISPLAYMODE*);
 using Direct3DCreate9Fn = IDirect3D9*(WINAPI*)(UINT);
-GetAdapterDisplayModeFn g_origGetAdapterDisplayMode = nullptr;
+std::atomic<GetAdapterDisplayModeFn> g_origGetAdapterDisplayMode{nullptr};
 Direct3DCreate9Fn g_origD3DCreate = nullptr;
+bool g_adapterAttempted=false;std::atomic<bool> g_adapterVerified{false};
 
 HRESULT WINAPI HookGetAdapterDisplayMode(IDirect3D9* d3d, UINT adapter, D3DDISPLAYMODE* mode) {
-    HRESULT hr = g_origGetAdapterDisplayMode(d3d, adapter, mode);
-    if (SUCCEEDED(hr) && mode && g_winW > 0) {
+    auto original=g_origGetAdapterDisplayMode.load(std::memory_order_acquire);
+    if(!original)return D3DERR_INVALIDCALL;
+    HRESULT hr = original(d3d, adapter, mode);
+    if (g_adapterVerified.load(std::memory_order_acquire) && SUCCEEDED(hr) && mode && g_winW > 0) {
         mode->Width = (UINT)g_winW;
         mode->Height = (UINT)g_winH;
     }
@@ -252,10 +256,15 @@ HRESULT WINAPI HookGetAdapterDisplayMode(IDirect3D9* d3d, UINT adapter, D3DDISPL
 
 IDirect3D9* WINAPI HookDirect3DCreate9(UINT sdk) {
     IDirect3D9* d3d = g_origD3DCreate(sdk);
-    if (d3d && !g_origGetAdapterDisplayMode) {
-        void** vt = *reinterpret_cast<void***>(d3d);
-        g_origGetAdapterDisplayMode =
-            (GetAdapterDisplayModeFn)mem::SwapVTable(vt, 8, (void*)&HookGetAdapterDisplayMode);
+    if (d3d && !g_adapterAttempted) {
+        g_adapterAttempted=true;
+        void**vt=nullptr;SIZE_T objectRead=0;
+        bool objectValid=ReadProcessMemory(GetCurrentProcess(),d3d,&vt,sizeof vt,&objectRead)&&objectRead==sizeof vt;
+        auto slot=objectValid?mem::ReadVTableSlot(vt,8):mem::SlotReadResult{};
+        MEMORY_BASIC_INFORMATION target{};auto protection=slot.value&&VirtualQuery(slot.value,&target,sizeof target)?target.Protect&0xff:0;
+        bool callable=target.State==MEM_COMMIT&&!(target.Protect&PAGE_GUARD)&&(protection==PAGE_EXECUTE||protection==PAGE_EXECUTE_READ||protection==PAGE_EXECUTE_READWRITE||protection==PAGE_EXECUTE_WRITECOPY);
+        if(slot.ok&&callable&&slot.value!=(void*)&HookGetAdapterDisplayMode){g_origGetAdapterDisplayMode.store((GetAdapterDisplayModeFn)slot.value,std::memory_order_release);auto result=mem::TrySwapVTable(vt,8,(void*)&HookGetAdapterDisplayMode,slot.value,true);g_adapterVerified.store(result.state==mem::PatchState::Installed,std::memory_order_release);}
+        if(!g_adapterVerified.load(std::memory_order_acquire))LOGE("Windowed adapter override disabled: vtable installation was not confirmed");
     }
     return d3d;
 }
