@@ -302,8 +302,16 @@ bool IsSyncableVehicle(CVehicle* v) { return !v->IsTrain(); }
 using SteerFn = void(__cdecl*)(CVehicle*);
 SteerFn g_origSteerAI = nullptr;
 void __cdecl HookSteerAICarWithPhysics(CVehicle* v) {
-    if (Net().Online() && v)
-        if (NetVehicle* nv = Vehicles::Instance().Find(v); nv && (Vehicles::Instance().IsMirror(*nv)||nv->authorityHeld||nv->crewStaged)) return;
+    if (Net().Online() && v) {
+        if (NetVehicle* nv = Vehicles::Instance().Find(v)) {
+            if (Vehicles::Instance().IsMirror(*nv)||nv->authorityHeld||nv->crewStaged) return;
+            // A returned player car can retain its old traffic route while empty.
+            // Its current owner keeps native physics, without an absent driver's AI.
+            if (nv->owner==Net().MyId() && nv->playerUsed && !nv->script && !nv->heldHere &&
+                v->VehicleSubClass()==VEHICLE_TYPE_AUTOMOBILE && !v->Driver() &&
+                !Field<CVehicle*>(v,0x4C4) && !Field<CVehicle*>(v,0x4C8) && !ScriptHolds(v)) return;
+        }
+    }
     ProcessPoliceVehicle(v,g_origSteerAI);
 }
 using AddSearchLightFn=void(__cdecl*)(const CVector&,const CVector&,float,float,uint32_t,uint8_t,uint8_t);
