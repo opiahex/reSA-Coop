@@ -12,6 +12,8 @@ Play GTA San Andreas with a host and two guests. The host loads a save and start
 
 [Download](https://github.com/opiahex/reSA-Coop/releases/latest) · [Changelog RU / EN](CHANGELOG.md) · [Русский](README.md)
 
+Current source: **0.2.39-3p, protocol 46, profile format 7**. Protocol 45 builds are incompatible: update the host, server and both guests together. The packaged release may differ from `main`.
+
 ## Fixes
 
 - Vehicle duplication and disappearance during carjacking, disconnects and interior transitions.
@@ -24,6 +26,10 @@ Play GTA San Andreas with a host and two guests. The host loads a save and start
 Supported story rides provide extra vehicles or seats for guests when the mission calls for them. A normal ride does not become a scripted shooting sequence.
 
 See the [changelog](CHANGELOG.md) for the full history. Not every mission or third-party mod combination has been tested. Report problems in [Issues](https://github.com/opiahex/reSA-Coop/issues).
+
+The server now coordinates entity ownership, generations and vehicle handoff together with its occupants. Verified cases cover a vehicle and NPC duplicated after reconnecting, NPC death following BMX/NRG impacts, extra road barriers on guests, and an empty vehicle driving itself after `/tp` and exit.
+
+Known cases remain with initial aircraft state, police, newly spawned driverless traffic, collision jitter and shared combat with static NPCs. A complete Photo Opportunity playthrough is not verified. The changelog records the limits of gameplay checks.
 
 ## Installation
 

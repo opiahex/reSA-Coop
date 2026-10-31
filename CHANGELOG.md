@@ -2,7 +2,47 @@
 
 Первая публикация форка объединяет локальные версии **0.2.6-3p–0.2.24-3p** и перенесённые исправления SA:COOP.
 Это перечень итоговых изменений по подсистемам: промежуточные экспериментальные решения, которые были заменены, отдельными возможностями не считаются.
-Текущая база — **0.2.37-3p, протокол 45**. Все участники и сервер должны обновляться вместе.
+Текущая база — **0.2.39-3p, протокол 46**. Все участники и сервер должны обновляться вместе.
+
+## 0.2.39-3p
+
+### Русский
+
+**Протокол 46 несовместим с 45.** Обновляйте хост, сервер и обоих гостей вместе. Формат личных профилей 7 сохранён; сохраняйте настройки, сохранения и `coop/server-data`.
+
+- Сервер хранит владельца, поколение и версию полномочий сущности. Передача машины и экипажа проходит остановку прежней симуляции, подготовку и подтверждение готовности; устаревший владелец не принимает управление обратно своим старым состоянием.
+- При обычном переподключении использованная машина и её NPC восстанавливаются по точным сетевым идентификаторам после загрузки мира. Сохраняются места, HP и текущая нативная задача пассажира.
+- Исправлены передача HP/смерти игроков из транспорта, конфликт слотов задачи смерти NPC после наезда и отдельные пути реакции на урон, столкновения и огонь.
+- При возврате пустой машины хосту после `/tp` и выхода прежняя AI трафика больше не даёт ей газ. Физика, реальные водители, сюжетные машины и буксировка сохраняют прежние пути.
+- Убрана лишняя сетевая рассылка наружных охранников SF impound: локальные служебные NPC больше не накладываются друг на друга от каждого клиента. Их общий HP и бой этим изменением не реализованы.
+- Передаются сюжетные дорожные IPL и мировые характеристики; личный профиль гостя не перезаписывает прогресс мира хоста.
+- Уточнены синхронизация сюжетной ходьбы/бега, очереди реплик, состояния миссионных объектов и подготовка моделей полиции. Это не исправление всей Photo Opportunity или всех случаев появления полиции.
+- Расширены ограниченные наблюдения за задачами и событиями NPC, числовые ссылки на инструменты диагностики и защита текущих native-сущностей. Закрытие всей диагностической программы не заявляется.
+
+Проверено в настоящих Host + 2 Guest: обычное переподключение машины с живым NPC-пассажиром (78/78), открытая у хоста/закрытая у гостей дорога с последующим подключением и повторной синхронизацией (103/103), летальный BMX и физический результат летального NRG. После TP/выхода/передачи хосту у пустой машины не возникает газ, горизонтальное смещение за 5 секунд равно нулю у всех троих.
+
+Полный TP-прогон остаётся FAIL: краткие вертикальные скорости превысили строгий порог, у одного гостя записаны 217 потерь диагностической очереди. Полный NRG-прогон также остаётся FAIL из-за равной временной метки двух соседних диагностических событий; фактические смерть, задача и анимация подтверждены отдельно. Эти результаты не заменяются общим PASS.
+
+Открыты начальное состояние самолётов, другие случаи пустого трафика и полиции, дрожание после столкновений, общий бой статичных NPC и прочие варианты переподключения. Полное прохождение и финал Photo Opportunity не подтверждены; диагностическое покрытие остаётся частичным.
+
+### English
+
+**Protocol 46 is incompatible with 45.** Update the host, server and both guests together. Personal profile format 7 is unchanged; preserve settings, saves and `coop/server-data`.
+
+- The server tracks entity owners, generations and authority leases. Vehicle and occupant handoff stops the former simulation, prepares the new owner and waits for native readiness; stale state cannot reclaim ownership.
+- Ordinary reconnects restore a used vehicle and its NPCs by exact network identity after world loading, preserving seats, HP and the passenger's current native task.
+- Fixed transport-origin player HP/death replication, conflicting NPC death-task slots following vehicle impacts, and selected damage, collision and fire paths.
+- An empty vehicle returned to the host after `/tp` and exit no longer receives throttle from its old traffic AI. Native physics, real drivers, scripted vehicles and towing retain their existing paths.
+- SF impound exterior guards are no longer broadcast independently by every client. These local service actors no longer produce overlapping copies; shared guard HP and combat are not implemented by this change.
+- Story road IPLs and world stats are replicated; a guest's personal profile no longer overwrites the host's world progress.
+- Improved scripted walk/run replication, dialogue queues, mission-object state and police model preparation. This does not claim to fix all of Photo Opportunity or every police-spawning case.
+- Expanded bounded NPC task/event observations, numeric diagnostic references and native entity lifetime checks. Diagnostic completion is not claimed.
+
+Real Host + 2 Guest checks cover ordinary vehicle/live-passenger reconnects (78/78), a host-open/guest-closed road followed by join and resnapshot (103/103), fatal BMX impacts and the physical outcome of a fatal NRG impact. After TP/exit/host handoff, the empty car has no throttle and no horizontal coordinate displacement for 5 seconds on all three clients.
+
+The complete TP run remains FAIL: short vertical velocities exceeded its strict threshold, and one guest recorded 217 diagnostic queue drops. The complete NRG run also remains FAIL because two adjacent diagnostic events have equal timestamps; death, task and animation were verified separately. These results are not relabelled as an overall PASS.
+
+Initial aircraft state, other driverless-traffic and police cases, collision jitter, shared static-NPC combat and additional reconnect variants remain open. A full Photo Opportunity playthrough and finale are not verified; diagnostic coverage remains partial.
 
 ## 0.2.37-3p
 
