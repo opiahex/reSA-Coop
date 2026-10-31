@@ -11,8 +11,9 @@
 #include <cstdarg>
 #include <cstdio>
 #include <string>
+#include "shared/lib/memory/HookInspector.h"
 namespace coop::ui::diagnostic {
-constexpr size_t kNativeRows=16,kNativeText=384;
+constexpr size_t kNativeRows=32,kNativeText=384;
 inline std::string DiagnosticAge(uint64_t now,uint64_t stamp,bool known){
     return known&&stamp&&now>=stamp?std::to_string(now-stamp):"UNKNOWN";
 }
@@ -31,6 +32,7 @@ struct NativeSnapshot {
     std::array<NativeRow,kNativeRows> rows{};
     size_t count=0;
     bool truncated=false;
+    bool nativeReady=false; // copied readiness from this actual owning-thread capture
     uint64_t mission=0;
     bool missionKnown=false;
     void Add(NativeKind kind,uint8_t peer,bool entityKnown,uint16_t entity,const char*fmt,...){
@@ -41,7 +43,14 @@ struct NativeSnapshot {
         if(size<0){r.text[0]=0;truncated=true;}else if(size>=int(r.text.size()))truncated=true;
     }
 };
-// Called only by the existing owning-game-thread 250 ms snapshot gate. The
-// independent thread check happens before any native/game/session access.
+// Manual/UI capture remains game-thread owned. The independent thread check
+// happens before any native/game/session access; copied cache carries its recording token.
 bool CaptureNativeSnapshot(NativeSnapshot&out,uint32_t owningThread,uint16_t selectedEntity=0);
+// Core-owned ready hint and recorder atomics only per frame; due native captures
+// run at most once per1000ms, with an immediate first eligible frame/new token.
+void UpdateAutomaticNativeContext(uint32_t owningThread,bool owningReadyHint);
+// Writer-thread export of copied game-thread data plus historical registry.
+// No live native entity reads. False means a missing/incomplete sidecar.
+bool ExportDiagnosticContext(const wchar_t* snapshotPath) noexcept;
+bool CacheDiagnosticInspection(const hookinspect::Sample&sample,bool requested) noexcept;
 }

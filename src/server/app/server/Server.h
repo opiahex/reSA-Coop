@@ -9,6 +9,7 @@
 
 #include "common/api/protocol/Protocol.h"
 #include "common/lib/buffer/Buffer.h"
+#include "common/lib/sync/EntityAuthority.h"
 #include "features/internet/Internet.h"
 
 namespace coop::server {
@@ -78,6 +79,7 @@ private:
     void ResetProfiles();
 
     void Relay(Player& from, uint8_t channel, const uint8_t* data, size_t size, uint32_t flags);
+    void SendAuthorityDecisions();
     // to == nullptr: everyone. The server's own texts come in both languages (en empty: the same in English).
     void SendChat(Player* to, uint8_t fromId, uint32_t rgba, const std::string& text, const std::string& en = {});
     void Broadcast(uint8_t channel, const Writer& w, int exceptId = -1);
@@ -100,6 +102,7 @@ private:
     Config m_cfg;
     ENetHost* m_host = nullptr;
     Internet m_internet;
+    authority::Coordinator m_authority;
     std::array<Player, proto::kMaxPlayers + 3> m_players{};  // spare pre-hello connections; game IDs stay 0..2
     volatile bool m_running = false;
     std::vector<uint8_t> m_world;  // current world save

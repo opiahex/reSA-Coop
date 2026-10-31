@@ -7,8 +7,9 @@ Original diagnostic system source: https://github.com/opiahex/reSA-Coop
 1. Covered Component and boundaries
 
 This license applies only to copyright-protected original diagnostic material
-identified in DIAGNOSTICS-COMPONENTS.md for reSA-Coop 0.2.36-3p, and to copies,
-modified versions and substantial portions of that material. The listed files
+identified in DIAGNOSTICS-COMPONENTS.md, including the original 0.2.36-3p
+components and the additional original diagnostic files listed for later
+snapshots, and to copies, modified versions and substantial portions of that material. The listed files
 identify the component; listing a file does not create copyright in every line.
 Snapshot hashes identify the reviewed version, not a restriction on modification.
 

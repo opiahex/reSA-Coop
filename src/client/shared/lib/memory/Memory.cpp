@@ -53,12 +53,26 @@ bool ObservationImage(uintptr_t addr, char* module, size_t moduleSize, uint32_t&
     rva = static_cast<uint32_t>(addr - base); timestamp = nt.FileHeader.TimeDateStamp;
     return true;
 }
+// A logical diagnostic name never authorizes a memory operation.
+// Read at most kId bytes through the OS; invalid input retains the site-based ID.
+bool ObservationId(const char* input, char (&out)[hookreg::kId]) noexcept {
+    if(!input)return false;const uintptr_t base=reinterpret_cast<uintptr_t>(input);
+    char copy[hookreg::kId]{};
+    for(size_t i=0;i<sizeof(copy);++i){
+        if(i>UINTPTR_MAX-base)return false;unsigned char c=0;SIZE_T got=0;
+        if(!ReadProcessMemory(GetCurrentProcess(),reinterpret_cast<const void*>(base+i),&c,1,&got)||got!=1)return false;
+        if(!c){if(!i)return false;memcpy(out,copy,i+1);return true;}
+        if(!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='.'||c=='_'||c=='-'))return false;
+        copy[i]=static_cast<char>(c);
+    }
+    return false;
+}
 struct Observation {
     hookreg::Ticket ticket{};
     bool active = false;
     Observation(hookreg::Kind kind, const char* label, uintptr_t addr, size_t size,
                 const void* desired = nullptr, const char* purpose = nullptr, const void* expected = nullptr,
-                hookreg::Chain chain = hookreg::Chain::NotChecked) noexcept {
+                hookreg::Chain chain = hookreg::Chain::NotChecked, const char* logicalId = nullptr) noexcept {
         if (!addr || !size || size > std::numeric_limits<uint32_t>::max()) return;
         hookreg::Spec spec{};
         uint32_t rva = 0, timestamp = 0;
@@ -68,6 +82,7 @@ struct Observation {
             std::snprintf(spec.module, sizeof(spec.module), "private-memory");
             std::snprintf(spec.id, sizeof(spec.id), "runtime-%s-%llX", label, (unsigned long long)addr);
         }
+        if(logicalId)(void)ObservationId(logicalId,spec.id);
         std::snprintf(spec.owner, sizeof(spec.owner), "memory-helper");
         if (purpose) {
             SIZE_T got = 0;
@@ -443,16 +458,26 @@ SwapResult SwapImpl(void** vtable, int index, void* fn, void* expected, bool che
 }
 } // namespace
 
-SwapResult TrySwapVTable(void** vtable, int index, void* fn, void* expected, bool checkExpected, void** chain) {
+namespace {
+SwapResult SwapVTableObserved(void** vtable, int index, void* fn, void* expected, bool checkExpected, void** chain, const char* logicalId, const char* purpose) {
     const uintptr_t base = reinterpret_cast<uintptr_t>(vtable);
     const uintptr_t site = base && index >= 0 && static_cast<uintptr_t>(index) <= (UINTPTR_MAX - base) / sizeof(void*)
                            ? base + static_cast<uintptr_t>(index) * sizeof(void*) : 0;
     // This is the caller's expected pointer, not proof of a native executable or ABI.
-    Observation obs(hookreg::Kind::Vtable, "vtable", site, sizeof(fn), &fn, nullptr, checkExpected ? &expected : nullptr);
+    Observation obs(hookreg::Kind::Vtable, "vtable", site, sizeof(fn), &fn, purpose, checkExpected ? &expected : nullptr, hookreg::Chain::NotChecked, logicalId);
     const auto result = SwapImpl(vtable, index, fn, expected, checkExpected, chain);
     if (!result.write.Ok()) InterlockedIncrement(&patchFailureSerial);
     obs.Finish(WriteOutcome(result.write), WriteError(result.write), reinterpret_cast<uintptr_t>(result.previous));
     return result;
+}
+} // namespace
+
+SwapResult TrySwapVTable(void** vtable, int index, void* fn, void* expected, bool checkExpected, void** chain) {
+    return SwapVTableObserved(vtable,index,fn,expected,checkExpected,chain,nullptr,nullptr);
+}
+SwapResult TrySwapNamedVTable(void** vtable, int index, void* fn, void* expected, bool checkExpected,
+                            const char* logicalId, const char* purpose, void** chain) {
+    return SwapVTableObserved(vtable,index,fn,expected,checkExpected,chain,logicalId,purpose);
 }
 
 SwapResult TrySwapScmSlot(uintptr_t slot,void* fn,void* native,void* expected,void** chain,bool ownChain){

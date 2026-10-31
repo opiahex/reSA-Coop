@@ -96,6 +96,10 @@ inline bool RedirectCallFn(uintptr_t addr, F detour, F* previous) {
 
 SlotReadResult ReadVTableSlot(void** vtable, int index);
 SwapResult TrySwapVTable(void** vtable, int index, void* fn, void* expected, bool checkExpected, void** chain = nullptr);
+// Telemetry-only logical ID/purpose; actual site remains separate. Invalid/unreadable
+// ID falls back to historical site ID and never changes patch/result semantics.
+SwapResult TrySwapNamedVTable(void** vtable, int index, void* fn, void* expected, bool checkExpected,
+                            const char* logicalId, const char* purpose, void** chain = nullptr);
 // Checked SCM dispatch replacement; native is manifest evidence, expected is the inspected current chain.
 SwapResult TrySwapScmSlot(uintptr_t slot, void* fn, void* native, void* expected, void** chain, bool ownChain = false);
 // Returns nullptr unless the write and readback were confirmed.

@@ -52,10 +52,23 @@ struct EventV2 {
     uint8_t owner;
 };
 struct FrameV2 {HeaderV2 header;EventV2 events[64];};
+struct CaptureV3 {
+    uint32_t attempted,filtered,sampledOut,criticalDrops,criticalBuffered,criticalPending,criticalReserveFull,incompleteMetadata;
+    uint32_t scmPreAttempted,scmPreSampled,scmPreFiltered,scmPreRateLimited,scmPreBusy;
+    uint32_t nativePreAttempted,nativePreFiltered,nativePreSampled,nativePreBusy,nativePreBudget;
+    uint32_t policyAvailable,categories,stateEvery,scmEvery,scmSpansPerSecond,nativeObservationsPerSecond;
+    uint8_t peer,packet;uint16_t entity;
+    uint64_t recordingStartTicks;uint32_t recordingEpoch,recordingEnabled;
+};
+struct HeaderV3 {HeaderV2 base;CaptureV3 capture;};
+struct NumberV3 {uint16_t key;uint8_t type;uint64_t bits;};
+struct EventV3 {EventV2 base;uint8_t numberCount,numberFlags;NumberV3 numbers[flight::kNumbers];};
+struct FrameV3 {HeaderV3 header;EventV3 events[64];};
 #pragma pack(pop)
 static_assert(std::is_trivially_copyable_v<HeaderV1> && std::is_trivially_copyable_v<EventV1>);
 static_assert(sizeof(HeaderV1)<256 && sizeof(EventV1)<256);
 static_assert(std::is_trivially_copyable_v<FrameV2> && sizeof(EventV2)<256);
+static_assert(std::is_trivially_copyable_v<FrameV3> && sizeof(EventV3)<256 && sizeof(HeaderV3)<256);
 
 // Startup/lifecycle worker only. The handler never closes or initializes a file.
 // A stopped recording keeps its file until a later, serialized Arm or exit.
@@ -64,7 +77,7 @@ inline volatile LONG busy=0, firstAttempts=0,unhandledAttempts=0,broken=0;
 inline volatile LONG active=0;
 inline uint32_t processId=0;
 inline uint64_t qpcFrequency=0;
-inline FrameV2 frame{};
+inline FrameV3 frame{};
 inline flight::Event snapshot[64]{};
 
 inline bool Arm(const std::wstring& coopDir) {
@@ -117,18 +130,26 @@ inline bool Persist(bool firstChance) noexcept {
     InterlockedIncrement(lane);
     auto result=flight::Snapshot(snapshot,64);
     size_t n=std::min<size_t>(result.count,64);
-    auto& h=frame.header.base;
-    h.magic[0]='R';h.magic[1]='S';h.magic[2]='F';h.magic[3]='T';h.schema=2;
-    h.headerBytes=(uint16_t)sizeof(HeaderV2);h.eventBytes=(uint16_t)sizeof(EventV2);h.reserved=0;
-    h.frameBytes=(uint32_t)(sizeof(HeaderV2)+n*sizeof(EventV2));h.count=(uint32_t)n;
+    auto& h=frame.header.base.base;
+    h.magic[0]='R';h.magic[1]='S';h.magic[2]='F';h.magic[3]='T';h.schema=3;
+    h.headerBytes=(uint16_t)sizeof(HeaderV3);h.eventBytes=(uint16_t)sizeof(EventV3);h.reserved=0;
+    h.frameBytes=(uint32_t)(sizeof(HeaderV3)+n*sizeof(EventV3));h.count=(uint32_t)n;
     h.busy=result.busy?1u:0u;h.pid=processId;h.protocol=kProtocolVersion;h.kind=firstChance?1u:2u;h.qpcFrequency=qpcFrequency;
     const auto& c=result.counters;
     h.counters={c.accepted,c.busyDrops,c.lifecycleDrops,c.historyOverwrites,c.drainDrops,c.ioErrors,
         c.segmentsEvicted,c.eventsEvicted,c.rotationFailures,c.exportFailed};
+    const auto capture=flight::CaptureStats();const bool captureAvailable=!capture.busy&&!result.busy&&capture.recordingEpoch==result.recordingEpoch&&capture.recordingStartTicks==result.recordingStartTicks;const auto&policy=capture.policy;auto&extended=frame.header.capture;
+    extended={capture.attempted,capture.filtered,capture.sampledOut,capture.criticalDrops,
+        capture.criticalBuffered,capture.criticalPending,capture.criticalReserveFull,capture.incompleteMetadata,
+        capture.scmPreAttempted,capture.scmPreSampled,capture.scmPreFiltered,capture.scmPreRateLimited,capture.scmPreBusy,
+        capture.nativePreAttempted,capture.nativePreFiltered,capture.nativePreSampled,capture.nativePreBusy,capture.nativePreBudget,
+        !captureAvailable?0u:1u,!captureAvailable?0u:policy.categories,!captureAvailable?0u:policy.stateEvery,!captureAvailable?0u:policy.scmEvery,
+        !captureAvailable?0u:policy.scmSpansPerSecond,!captureAvailable?0u:policy.nativeObservationsPerSecond,
+        !captureAvailable?uint8_t(255):policy.peer,!captureAvailable?uint8_t(0):policy.packet,!captureAvailable?uint16_t(0):policy.entity,result.recordingStartTicks,result.recordingEpoch,result.recordingEnabled?1u:0u};
     constexpr char version[]=COOP_VERSION_STR;
     for(size_t i=0;i<sizeof h.version;++i)h.version[i]=i<sizeof(version)?version[i]:0;
     for(size_t i=0;i<n;++i){
-        const auto& e=snapshot[i];const auto& x=e.context;auto& full=frame.events[i];auto& d=full.base;
+        const auto& e=snapshot[i];const auto& x=e.context;auto& observation=frame.events[i];auto& full=observation.base;auto& d=full.base;
         d={x.fingerprint,x.generation,e.ticks,e.localSeq,x.wireTime,x.incarnation,x.world,
            e.motionEpoch,e.nativeHandle,e.pid,e.tid,x.entity,e.stage,e.reason,
            x.msg,x.channel,x.source,x.recipient,e.localPeer,
@@ -136,8 +157,21 @@ inline bool Persist(bool firstChance) noexcept {
         full.span=e.span;full.missionRun=e.missionRun;full.scriptBirth=e.scriptBirth;
         full.missionPhase=e.missionPhase;full.scriptOffset=e.scriptOffset;full.ownerEpoch=e.ownerEpoch;
         full.opcode=e.opcode;full.detailKnown=e.detailKnown;full.owner=e.owner;
+        constexpr uint8_t known=flight::NumbersTruncated|flight::NumbersInvalid|flight::DuplicateNumber|
+            flight::InvalidMetric|flight::InvalidNumberType|flight::NonFiniteNumber;
+        observation.numberCount=(uint8_t)std::min<size_t>(e.numberCount,flight::kNumbers);
+        observation.numberFlags=e.numberFlags&known;
+        if(e.numberFlags&~known)observation.numberFlags|=flight::NumbersInvalid;
+        if(e.numberCount>flight::kNumbers)observation.numberFlags|=flight::NumbersTruncated|flight::NumbersInvalid;
+        for(size_t j=0;j<flight::kNumbers;++j){auto&target=observation.numbers[j];target={};
+            if(j>=observation.numberCount)continue;
+            const auto&value=e.numbers[j];bool valid=flight::ValidNumber(value);
+            for(size_t k=0;k<j;++k)if(value.key!=flight::Metric::None&&value.key==e.numbers[k].key){valid=false;observation.numberFlags|=flight::DuplicateNumber;}
+            if(valid){target={(uint16_t)value.key,(uint8_t)value.type,value.bits};if(value.type==flight::NumberType::Unavailable)observation.numberFlags|=flight::NumbersInvalid;}
+            else observation.numberFlags|=flight::NumbersInvalid|flight::InvalidMetric;
+        }
     }
-    frame.header.crc32=0;frame.header.crc32=FrameCrc(&frame,h.frameBytes);
+    frame.header.base.crc32=0;frame.header.base.crc32=FrameCrc(&frame,h.frameBytes);
     DWORD written=0;BOOL ok=WriteFile(file,&frame,h.frameBytes,&written,nullptr);
     if(!ok||written!=h.frameBytes)InterlockedExchange(&broken,1);
     InterlockedExchange(&busy,0);

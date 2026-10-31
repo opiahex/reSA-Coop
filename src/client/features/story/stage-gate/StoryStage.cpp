@@ -1,4 +1,5 @@
 #include <array>
+#include "common/lib/diagnostics/FlightRecorder.h"
 #include "shared/api/story-world/StoryWorld.h"
 #include <map>
 #include <set>
@@ -23,6 +24,32 @@ uint64_t phaseRun=0;uint32_t phase=0;bool transitionPending=false,recoveryPendin
 uint64_t reportAt=0,hostReportAt=0;uint8_t blockedReason=0;uint16_t blockedEntity=0;uint8_t blockedKind=0;
 uint64_t clockRun=0;uint32_t pausedTime=0,gateTime=0;std::map<void*,std::pair<void*,uint64_t>>armed;
 Gate host,client;uint32_t sequence=0;uint64_t ackSent=0,completedRun=0;uint32_t completedToken=0;
+// Local cached stage transitions, not proof of mission completion/native control.
+uint32_t DiagnosticControlFlags(){return (transitionPending?1u:0u)|(recoveryPending?2u:0u);}
+flight::Event StageDiagnostic(uint16_t stage,uint16_t reason){
+    flight::Event e{};e.context=Net().DiagnosticContext();e.stage=stage;e.reason=reason;e.localPeer=Net().MyId();
+    if(!e.context.msg&&Net().Online()){e.context.source=Net().MyId();e.context.incarnation=Net().MyIncarnation();e.context.world=Net().WorldEpoch();}
+    e.span=flight::NextDiagnosticSpan();e.detailKnown|=flight::SpanKnown;
+    if(phaseRun){e.missionRun=phaseRun;e.missionPhase=phase;e.detailKnown|=flight::MissionKnown;}
+    return e;
+}
+void RecordPhaseTransition(uint16_t reason,uint64_t beforeRun,uint32_t beforePhase,uint64_t proposedRun,uint32_t proposedPhase,uint32_t beforeFlags=UINT32_MAX){
+    if(!flight::Enabled())return;auto e=StageDiagnostic(820,reason);
+    // End/reset retains the known old cache identity; its world can be UNKNOWN
+    // after disconnect. No old connection/world is guessed from the new session.
+    if(!phaseRun&&beforeRun){e.missionRun=beforeRun;e.missionPhase=beforePhase;e.detailKnown|=flight::MissionKnown;}
+    flight::AddUnsigned(e,flight::Metric::FromRun,beforeRun);flight::AddUnsigned(e,flight::Metric::ToRun,phaseRun);
+    flight::AddUnsigned(e,flight::Metric::FromPhase,beforePhase);flight::AddUnsigned(e,flight::Metric::ToPhase,phase);
+    flight::AddUnsigned(e,flight::Metric::ProposedRun,proposedRun);flight::AddUnsigned(e,flight::Metric::ProposedPhase,proposedPhase);
+    flight::AddUnsigned(e,flight::Metric::ControlFlags,DiagnosticControlFlags());if(beforeFlags!=UINT32_MAX)flight::AddUnsigned(e,flight::Metric::BeforeControlFlags,beforeFlags);(void)flight::Record(e);
+}
+void RecordControlTransition(uint32_t operation,uint32_t before,bool requested){
+    if(!flight::Enabled())return;auto e=StageDiagnostic(821,0);
+    flight::AddUnsigned(e,flight::Metric::Operation,operation);flight::AddUnsigned(e,flight::Metric::BeforeControlFlags,before);
+    flight::AddUnsigned(e,flight::Metric::ControlFlags,DiagnosticControlFlags());flight::AddUnsigned(e,flight::Metric::RequestedDecision,requested?1:0);
+    flight::AddUnsigned(e,flight::Metric::ObservedDecision,(operation==1?transitionPending:recoveryPending)?1:0);(void)flight::Record(e);
+}
+
 void SendGate(){
     bool removed=false;for(auto i=host.entities.begin();i!=host.entities.end();){bool alive=i->kind==ENTITY_VEHICLE?Vehicles::Instance().Find(i->id)&&Vehicles::Alive(*Vehicles::Instance().Find(i->id)):i->kind==ENTITY_PED?GetPed(Peds::Instance().HandleOf(i->id))!=nullptr:SharedMissionObjectById(i->id)!=nullptr;
         if(!alive||Net().EntityGeneration(i->kind,i->id)!=i->generation){i=host.entities.erase(i);removed=true;}else ++i;}
@@ -119,25 +146,31 @@ bool AwaitCooperativeStage(void*script,int opcode,uint16_t source){
 }
 uint32_t CooperativeStoryPhase(){auto run=StoryRunId();return run?(phaseRun==run?phase:1):0;}
 void AdoptCooperativeStoryPhase(uint64_t run,uint32_t next){
-    if(!run||!next||run!=StoryRunId())return;
-    if(phaseRun!=run||(int32_t)(next-phase)>0){phaseRun=run;phase=next;LOGI("Story phase received run=%llu phase=%u",(unsigned long long)run,phase);}
+    auto beforeRun=phaseRun;auto beforePhase=phase;
+    if(!run||!next||run!=StoryRunId()){RecordPhaseTransition(1,beforeRun,beforePhase,run,next);return;}
+    if(phaseRun!=run||(int32_t)(next-phase)>0){phaseRun=run;phase=next;LOGI("Story phase received run=%llu phase=%u",(unsigned long long)run,phase);RecordPhaseTransition(0,beforeRun,beforePhase,run,next);}
+    else RecordPhaseTransition(2,beforeRun,beforePhase,run,next);
 }
 void AdvanceCooperativeStoryPhase(void*script,const char*reason){
-    if(!Net().IsHost()||!StoryRunId())return;
+    auto beforeRun=phaseRun;auto beforePhase=phase;
+    if(!Net().IsHost()||!StoryRunId()){RecordPhaseTransition(3,beforeRun,beforePhase,StoryRunId(),phase);return;}
     if(phaseRun!=StoryRunId()){phaseRun=StoryRunId();phase=1;}
     if(++phase==0)++phase;
     if(host.run)CancelCooperativeStage(host.script);
     Writer w(proto::G_STORY_STAGE);w.U8(4);w.U64(phaseRun);w.U32(0);w.U32(phase);Net().Send(proto::CH_RELIABLE,w);
     LOGI("Story phase advanced run=%llu phase=%u reason=%s",(unsigned long long)phaseRun,phase,reason);
     if(script)ArmCooperativeStage(script);
+    RecordPhaseTransition(0,beforeRun,beforePhase,phaseRun,phase);
 }
 void ResetCooperativeStages(){
+    auto beforeRun=phaseRun;auto beforePhase=phase;auto beforeFlags=DiagnosticControlFlags();
     if(Net().IsHost()&&host.run)CancelCooperativeStage(host.script);
     host={};client={};clockRun=phaseRun=0;phase=0;pausedTime=gateTime=0;armed.clear();ackSent=completedRun=reportAt=hostReportAt=0;completedToken=0;transitionPending=recoveryPending=false;
+    if(beforeRun||beforePhase||beforeFlags)RecordPhaseTransition(4,beforeRun,beforePhase,0,0,beforeFlags);
 }
 bool LocalStoryTransitionPending(){return transitionPending;}
-void SetLocalStoryTransitionPending(bool pending){transitionPending=pending;}
-void SetLocalStoryRecoveryPending(bool pending){recoveryPending=pending;}
+void SetLocalStoryTransitionPending(bool pending){auto before=DiagnosticControlFlags();bool changed=transitionPending!=pending;transitionPending=pending;if(changed)RecordControlTransition(1,before,pending);}
+void SetLocalStoryRecoveryPending(bool pending){auto before=DiagnosticControlFlags();bool changed=recoveryPending!=pending;recoveryPending=pending;if(changed)RecordControlTransition(2,before,pending);}
 bool LocalStoryRecoveryReady(){return !transitionPending&&(!client.run||DependenciesReady(false));}
 
 }

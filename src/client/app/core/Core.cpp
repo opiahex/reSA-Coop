@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 
 #include "app/crash-handler/CrashHandler.h"
 #include "app/patches/Patches.h"
@@ -26,6 +27,8 @@
 #include "shared/ui/renderer/Renderer.h"
 #include "widgets/overlay/Overlay.h"
 #include "widgets/overlay/DiagnosticPanel.h"
+#include "widgets/overlay/DiagnosticNative.h"
+#include "common/lib/diagnostics/FlightRecorder.h"
 
 namespace coop::core {
 
@@ -205,6 +208,29 @@ void HandleChatSubmit(const std::string& text) {
         for (size_t i = 1; i < parts.size(); ++i)
             if (!parts[i].empty()) args.push_back(parts[i]);
         std::string cmd = parts.empty() ? "" : ToLower(parts[0]);
+        if(cmd=="trace"){
+            auto reply=[](const std::string&text){ui::TheChat().AddSystem(text);};
+            if(args.size()==1&&(args[0]=="start"||args[0]=="stop")){
+                auto result=log::SubmitDiagnostics(args[0]=="start"?log::DiagnosticCommand::Start:log::DiagnosticCommand::Stop);
+                reply(Format(TR("Диагностика: запрос записи, статус %u (результат — в меню).","Diagnostics: recording request status %u (result in menu)."),(unsigned)result));return;
+            }
+            if(args.size()==1&&args[0]=="save"){
+                auto result=flight::RequestSnapshotExport();reply(Format(TR("Диагностика: запрос экспорта, статус %u.","Diagnostics: export request status %u."),(unsigned)result));return;
+            }
+            auto status=flight::CaptureStats();
+            if(status.busy){reply(TR("Диагностика занята; повторите команду.","Diagnostics busy; retry the command."));return;}
+            auto number=[](const std::string&s,uint64_t max,uint64_t&value){
+                if(s.empty()||s.size()>20||s[0]<'0'||s[0]>'9')return false;
+                char*end=nullptr;value=std::strtoull(s.c_str(),&end,0);return end==s.c_str()+s.size()&&value<=max;
+            };
+            auto policy=status.policy;uint64_t a=0,b=0,c=0,d=0;bool valid=false;
+            if(args.size()==3&&args[0]=="sample"&&number(args[1],65536,a)&&a&&number(args[2],65536,b)&&b){policy.stateEvery=(uint32_t)a;policy.scmEvery=(uint32_t)b;valid=true;}
+            if(args.size()==2&&args[0]=="budget"&&number(args[1],65536,a)){policy.scmSpansPerSecond=(uint32_t)a;valid=true;}
+            if(args.size()==2&&args[0]=="nativebudget"&&number(args[1],65536,a)){policy.nativeObservationsPerSecond=(uint32_t)a;valid=true;}
+            if(args.size()==5&&args[0]=="filter"&&number(args[1],flight::kAllCategories,a)&&number(args[2],255,b)&&number(args[3],65535,c)&&number(args[4],255,d)){policy.categories=(uint32_t)a;policy.peer=(uint8_t)b;policy.entity=(uint16_t)c;policy.packet=(uint8_t)d;valid=true;}
+            if(valid){bool ok=flight::SetCapturePolicy(policy);reply(ok?TR("Фильтры записи обновлены; критические события сохраняются без sampling.","Capture policy updated; critical events bypass sampling."):TR("Диагностика занята; повторите команду.","Diagnostics busy; retry the command."));return;}
+            reply("/trace start | stop | save | sample <state 1..65536> <SCM 1..65536> | budget <SCM spans/s, 0 unlimited> | nativebudget <queries/s, 0 unlimited> | filter <mask> <peer/255> <entity/0> <packet/0>");return;
+        }
         if (cmd == "disconnect" || cmd == "quitcoop") {
             flow::Leave();
             return;
@@ -232,6 +258,8 @@ void CommonFrame() {
     if(!g_diagnosticGameThread.load(std::memory_order_acquire)){
         uint32_t empty=0;g_diagnosticGameThread.compare_exchange_strong(empty,GetCurrentThreadId(),std::memory_order_release,std::memory_order_relaxed);
     }
+    static const bool exporterRegistered=flight::SetSnapshotSupplement(&ui::diagnostic::ExportDiagnosticContext);
+    (void)exporterRegistered;
     log::StartDiagnostics(); // first ordinary frame, after DLL loader lock
     Heartbeat();
     if (g_lastCommonFrame == g_frameNo) return;
@@ -243,7 +271,7 @@ void CommonFrame() {
         auto slot=objectValid?mem::ReadVTableSlot(table,17):mem::SlotReadResult{};
         MEMORY_BASIC_INFORMATION target{};auto protection=slot.value&&VirtualQuery(slot.value,&target,sizeof target)?target.Protect&0xff:0;
         bool callable=target.State==MEM_COMMIT&&!(target.Protect&PAGE_GUARD)&&(protection==PAGE_EXECUTE||protection==PAGE_EXECUTE_READ||protection==PAGE_EXECUTE_READWRITE||protection==PAGE_EXECUTE_WRITECOPY);
-        if(slot.ok&&callable&&slot.value!=(void*)&HookPresent){g_origPresent.store((PresentFn)slot.value,std::memory_order_release);auto result=mem::TrySwapVTable(table,17,(void*)&HookPresent,slot.value,true);g_presentVerified.store(result.state==mem::PatchState::Installed,std::memory_order_release);}
+        if(slot.ok&&callable&&slot.value!=(void*)&HookPresent){g_origPresent.store((PresentFn)slot.value,std::memory_order_release);auto result=mem::TrySwapNamedVTable(table,17,(void*)&HookPresent,slot.value,true,"core.d3d9.present","Core D3D9 Present fallback");g_presentVerified.store(result.state==mem::PatchState::Installed,std::memory_order_release);}
         if(!g_presentVerified.load(std::memory_order_acquire))LOGE("Present fallback disabled: vtable installation was not confirmed");
     }
     if (!ui::In().Installed()) {
@@ -289,6 +317,7 @@ void CommonFrame() {
     ui::TheChat().ProcessInput();
     ui::ProcessConnectMenu();
     ui::UpdateDiagnosticSnapshot(NowMs());
+    ui::diagnostic::UpdateAutomaticNativeContext(DiagnosticGameThreadId(),g_gameStarted&&!g_restarting);
 }
 
 std::wstring CoopDirFromModule(void* hModule) {

@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <array>
 
 #include "common/lib/buffer/Buffer.h"
 #include "shared/game/Game.h"
@@ -9,7 +10,16 @@
 
 namespace coop {
 
+// Explicit, generation-bound native NPC occupancy, never inferred from engine state.
+struct VehicleCrewMember {uint16_t ped=0;uint64_t generation=0;int8_t seat=-1;};
+struct VehicleCrew {
+    std::array<VehicleCrewMember,9> members{};uint8_t count=0;
+    void Write(Writer& w)const;
+    bool Read(Reader& r);
+};
+
 struct VehicleState {
+    VehicleCrew crew;
     uint32_t time = 0;
     game::CVector pos;
     Quat rot;
@@ -59,6 +69,7 @@ struct VehicleState {
 
 // Static description used to create the vehicle on the other side.
 struct VehicleSpawn {
+    VehicleCrew crew;
     uint16_t netId = 0;
     uint16_t model = 0;
     uint8_t owner = 0;

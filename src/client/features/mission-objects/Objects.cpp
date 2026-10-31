@@ -4,6 +4,7 @@
 // are frozen, and nothing in the partner's game damages them: a hit by its player goes to the host as
 // CObject::ObjectDamage, and a copy breaks when the host's object did.
 #include <cmath>
+#include "common/lib/diagnostics/FlightRecorder.h"
 #include "shared/lib/sync/IdAllocator.h"
 #include <map>
 #include <set>
@@ -54,6 +55,13 @@ struct NetObject {
     bool adopted = false;  // partner: its world had this object already (the host's world brought it)
     bool trainParentHeld = false;
     bool remotePhysics = false;  // host copy stays a replica through remote release/cleanup
+    // Copied diagnostic provenance only; never changes replication or lifetime.
+    flight::Context diagnosticBirth{},diagnosticState{},diagnosticRemove{},diagnosticAttachment{};
+    uint64_t diagnosticGeneration=0,diagnosticParentGeneration=0,diagnosticAttachmentRetryAt=0;
+    uint32_t diagnosticWorld=0,diagnosticLocalIncarnation=0,diagnosticAttachmentRevision=0;
+    uint16_t diagnosticWait=0,diagnosticAttachmentReason=65535,diagnosticParentId=0;
+    uint8_t diagnosticOwner=255,diagnosticLocalPeer=255,diagnosticParentKind=0;
+    bool diagnosticBirthPending=false,diagnosticStatePending=false,diagnosticAttachmentPending=false,diagnosticRecovery=false,diagnosticAttachmentKnown=false,diagnosticBirthLocal=false;
     uint64_t sentMs = 0;
     ObjectMotion motion;
     uint64_t lease=0,claimSent=0,claimBegan=0,claimDeniedUntil=0,cargoTouch=0,cargoAsk=0;
@@ -88,6 +96,7 @@ bool Broken(CObject* o) {
     return (damageFlags&0x460u)!=0||(!o->RwObject()&&Field<float>(o,0x154)<=0);
 }
 uint8_t ObjectFlags(CObject*o){return (o->IsVisible()?1:0)|((o->Flags()&1u)?2:0);}
+#include "features/mission-objects/ObjectDiagnostics.inc"
 void ApplyFlags(CObject*o,uint8_t f){o->Flags()=(o->Flags()&~129u)|((f&1)?128u:0)|((f&2)?1u:0);}
 Quat RotationOf(CObject* o) { return o->Matrix() ? Quat::FromMatrix(*o->Matrix()) : Quat{}; }
 ObjectPhysics PhysicsOf(CObject*o){
@@ -193,6 +202,7 @@ void TrackObject(int handle){
     CaptureMotion(no);
     no.sentMs = NowMs();
     Net().BeginEntity(ENTITY_OBJECT,no.netId);g_owned[no.netId] = no;
+    RecordTrackedObjectBirth(g_owned[no.netId]);
     SendCreate(no);
     LOGI("Mission object %04X (model %d) announced", no.netId, no.model);
 }
@@ -277,14 +287,17 @@ void ApplyMotion(NetObject&n,bool simulator=false){
             // Keep the relationship while the native consist streams. Solid
             // cargo must not remain floating at an outdated world position.
             if(n.motion.parentKind==5){ApplyFlags(o,0);n.trainParentHeld=true;}
+            ObjectDiagnosticWait(n,OD_DEPENDENCY);RecordObjectAttachment(n,nullptr);RecordObjectState(n);
             return;
         }
         if(n.trainParentHeld){if(!n.broken)ApplyFlags(o,n.flags);n.trainParentHeld=false;}
         if(o->AttachedTo()!=parent){DetachForMotion(n);CallMethod<0x54D690>(o,parent,&n.motion.offset,&n.motion.rotation);}
         Field<CVector>(o,0x100)=n.motion.offset;Field<CVector>(o,0x10C)=n.motion.euler;Field<Quat>(o,0x118)=n.motion.rotation;AttachedPosition(o,nullptr);
+        RecordObjectAttachment(n,parent);
     }else{
         DetachForMotion(n);
         if(n.trainParentHeld){if(!n.broken)ApplyFlags(o,n.flags);n.trainParentHeld=false;}
+        RecordObjectAttachment(n,nullptr);
     }
     // A frozen replica still needs the simulator's native velocity: SCM
     // GET_OBJECT_SPEED reads CPhysical::MoveSpeed, not the replicated pose.
@@ -297,6 +310,7 @@ void ApplyMotion(NetObject&n,bool simulator=false){
         Cmd(0x0550).I(n.handle).I(0).Run();o->PhysicalFlags()=(o->PhysicalFlags()&~ObjectPhysics::FreezeMask)|n.motion.physics.freezeFlags;
         Cmd(0x0392).I(n.handle).I(n.motion.dynamic?1:0).Run();n.remotePhysics=false;
     }
+    RecordObjectState(n);
 }
 enum:uint8_t{CLAIM=1,GRANT=2,CARRY_POSE=3,RELEASE=4,DENY=5,PUSH=6,CARGO_CLAIM=7,CARGO_POSE=8,CARGO_RELEASE=9};
 void Decision(NetObject&n,uint8_t op=GRANT){
@@ -494,7 +508,9 @@ void HostScan() {
     }
     for (auto it = g_owned.begin(); it != g_owned.end();) {
         NetObject& no = it->second;
+        RecordObjectBirth(no);
         if (!Alive(no) || no.obj->ModelIndex() != no.model) {
+            ObjectRemovalDiagnostic removal(no,ObjectCleanupDiagnostic(no,proto::G_OBJ_REMOVE));removal.Complete(false);RetireObjectDiagnostics(no,OD_CANCELLED);
             RetireOrigin(no);
             SendRemove(no.netId, REMOVE_GONE, 0);g_storyObjects.erase(no.handle);
             g_ids.Retire(it->first,NowMs());it = g_owned.erase(it);
@@ -549,11 +565,15 @@ void BreakCopy(NetObject& no, uint8_t weapon) {
 }
 
 void DeleteCopy(NetObject& no) {
-    if(!Alive(no))return;
+    auto diagnostic=no.diagnosticRemove.msg?no.diagnosticRemove:ObjectCleanupDiagnostic(no,proto::G_OBJ_REMOVE);
+    ObjectRemovalDiagnostic removal(no,diagnostic);
+    RetireObjectDiagnostics(no,OD_CANCELLED);
+    if(!Alive(no)){removal.Complete(false);return;}
     if(!no.adopted)Cmd(0x0108).I(no.handle).Run();
     else { // Preserve a local script's handle, but the host removed this barrier.
         Cmd(0x0750).I(no.handle).I(0).Run();Cmd(0x0382).I(no.handle).I(0).Run();
     }
+    removal.Complete(true);
 }
 
 // the same object in the same place, not a copy yet: the host's world, loaded here, brought it along
@@ -589,6 +609,7 @@ void ApplyRemovedOrigins(){
 void ClearCopies() {
     for (auto& [id, no] : g_mirrors) DeleteCopy(no);
     g_mirrors.clear();
+    for(auto&[id,no]:g_pending)RetireObjectDiagnostics(no,OD_CANCELLED);
     g_pending.clear();
     for(auto&hidden:g_hiddenOriginals)if(hidden.object&&IsObjectValid(hidden.object)&&GetObjectRef(hidden.object)==hidden.handle&&hidden.object->ModelIndex()==hidden.model)ApplyFlags(hidden.object,hidden.flags);
     g_hiddenOriginals.clear();if(!Net().IsHost())g_origins.clear();
@@ -601,10 +622,11 @@ void CreatePending() {
         NetObject no = it->second;
         if (!IsModelLoaded(no.model)) {
             RequestModel(no.model,0);
+            ObjectDiagnosticWait(it->second,OD_MODEL_WAIT);
             ++it;
             continue;
         }
-        if(!HasRoom(ObjectPool(),kKeepObjects,"object"))break;
+        if(!HasRoom(ObjectPool(),kKeepObjects,"object")){ObjectDiagnosticWait(it->second,OD_POOL_WAIT);break;}
         --budget;
         int h = -1;
         CObject* o = FindTwin(no);
@@ -612,7 +634,7 @@ void CreatePending() {
         if (o) h = GetObjectRef(o);
         else Cmd(0x029B).I(no.model).F(no.pos.x).F(no.pos.y).F(no.pos.z).Out(&h).Run();  // CREATE_OBJECT_NO_OFFSET
         if (!o) {o = h >= 0 ? GetObject(h) : nullptr;if(o)Field<uint8_t>(o,0x13C)=6;}
-        if (!o) {++it;continue;} // pool/model exhaustion is retried, not silently lost
+        if (!o) {ObjectDiagnosticWait(it->second,OD_NATIVE_FAILED);++it;continue;} // pool/model exhaustion is retried, not silently lost
         it=g_pending.erase(it);
         Cmd(0x0550).I(h).I(1).Run();  // FREEZE_OBJECT_POSITION
         o->AreaCode() = no.area;
@@ -624,7 +646,9 @@ void CreatePending() {
         bool broken = no.broken;
         no.broken = false;
         NetObject& copy = g_mirrors[no.netId] = no;
+        RecordObjectBirth(copy);
         if (broken) BreakCopy(copy, 0);else ApplyMotion(copy);
+        RecordObjectState(copy);
         LOGI("Mission object %04X (model %d) %s", no.netId, no.model, no.adopted ? "found here" : "copied");
     }
 }
@@ -694,7 +718,7 @@ public:
 
     void OnEntityReplaced(uint8_t kind,uint8_t,uint16_t id)override{
         if(kind!=ENTITY_OBJECT)return;
-        for(auto*map:{&g_owned,&g_mirrors,&g_pending})if(auto i=map->find(id);i!=map->end()){if(Alive(i->second))Cmd(0x0108).I(i->second.handle).Run();map->erase(i);}
+        for(auto*map:{&g_owned,&g_mirrors,&g_pending})if(auto i=map->find(id);i!=map->end()){ObjectRemovalDiagnostic removal(i->second,ObjectCleanupDiagnostic(i->second,proto::G_OBJ_REMOVE));RetireObjectDiagnostics(i->second,OD_REPLACED);if(Alive(i->second))Cmd(0x0108).I(i->second.handle).Run();removal.Complete(true);map->erase(i);}
     }
     void OnInstallHooks() override {
         mem::HookFn(0x546FF0,&AttachedPosition,&originalAttachedPosition,"CPhysical::PositionAttachedEntity");
@@ -705,6 +729,7 @@ public:
         Net().SetHandler(proto::G_OBJ_CREATE, [](uint8_t from, Reader& r) {
             NetObject no;
             no.netId = r.U16();
+            auto diagnostic=IncomingObjectDiagnostic(no.netId,proto::G_OBJ_CREATE);
             no.model = r.U16();
             auto origin=r.Vec();no.origin={origin.x,origin.y,origin.z};no.originArea=r.I8();no.originRevision=r.U32();
             Vec3 p = r.Vec();
@@ -712,68 +737,79 @@ public:
             no.rot.Read(r);
             no.area = r.I8();
             uint8_t flags=r.U8();no.broken=(flags&4)!=0;no.flags=flags&3;
-            if(!no.motion.Read(r))return;
+            if(!no.motion.Read(r)){RecordObjectDiagnostic(diagnostic,664,OD_MALFORMED);return;}
             // not in the game yet (a partner waits in the menu): the host announces them again once it is (resync)
-            if (!r.Ok() || from != Net().HostId() || Net().IsHost() || !core::IsPlayerReady() || !IsObjectModel(no.model)||!ValidOrigin(OriginOf(no))) return;
+            bool diagnosticModelValid=true;
+            if (!r.Ok() || from != Net().HostId() || Net().IsHost() || !core::IsPlayerReady() || !(diagnosticModelValid=IsObjectModel(no.model))||!ValidOrigin(OriginOf(no))) {RecordObjectDiagnostic(diagnostic,664,!r.Ok()?OD_MALFORMED:from!=Net().HostId()||Net().IsHost()?OD_SENDER:!core::IsPlayerReady()?OD_NOT_READY:!diagnosticModelValid?OD_MODEL:OD_ORIGIN);return;}
             if(auto existing=g_mirrors.find(no.netId);existing!=g_mirrors.end()&&Alive(existing->second)&&existing->second.model==no.model&&
-               (existing->second.originRevision!=no.originRevision||!SameOrigin(OriginOf(existing->second),OriginOf(no))))return;
-            if(!RememberOrigin(OriginOf(no)))return;
+               (existing->second.originRevision!=no.originRevision||!SameOrigin(OriginOf(existing->second),OriginOf(no)))){RecordObjectDiagnostic(diagnostic,664,OD_CONFLICT,&existing->second);return;}
+            if(!RememberOrigin(OriginOf(no))){RecordObjectDiagnostic(diagnostic,664,OD_ORIGIN);return;}
             if (auto it = g_mirrors.find(no.netId); it != g_mirrors.end()) {
                 // A repair/resync is an update of the same object. Recreating
                 // a valid support drops standing peds and breaks attachments.
                 auto& copy=it->second;
                 if(Alive(copy)&&copy.model==no.model){
-                    if((int32_t)(no.motion.revision-copy.motion.revision)<0)return;
+                    if((int32_t)(no.motion.revision-copy.motion.revision)<0){RecordObjectDiagnostic(diagnostic,664,OD_OLD_REVISION,&copy);return;}
                     copy.pos=no.pos;copy.rot=no.rot;copy.area=no.area;copy.flags=no.flags;copy.motion=no.motion;ApplyPhysics(copy.obj,copy.motion.physics);
+                    AcceptObjectDiagnostic(copy,diagnostic,false);RecordObjectDiagnostic(diagnostic,661,OD_RETAINED,&copy);
                     copy.obj->AreaCode()=no.area;if(copy.motion.holder!=Net().MyId()&&copy.motion.simulator!=Net().MyId())Place(copy.obj,no.pos,no.rot);
                     if(no.broken)BreakCopy(copy,0);else ApplyFlags(copy.obj,no.flags);
-                    copy.broken=no.broken;ApplyMotion(copy);return;
+                    copy.broken=no.broken;ApplyMotion(copy);RecordObjectState(copy);return;
                 }
                 DeleteCopy(it->second);
                 g_mirrors.erase(it);
             }
-            g_pending[no.netId] = no;
+            if(auto pending=g_pending.find(no.netId);pending!=g_pending.end())RetireObjectDiagnostics(pending->second,OD_REPLACED);
+            AcceptObjectDiagnostic(no,diagnostic,true);g_pending[no.netId] = no;
             RequestModel(no.model,0);
         });
         Net().SetHandler(proto::G_OBJ_SYNC, [](uint8_t from, Reader& r) {
             uint16_t id = r.U16();
+            auto diagnostic=IncomingObjectDiagnostic(id,proto::G_OBJ_SYNC);
             Vec3 p = r.Vec();
             Quat q;
-            q.Read(r);int8_t area=r.I8();uint8_t flags=r.U8()&3;ObjectMotion motion;if(!motion.Read(r))return;
-            if (!r.Ok() || from != Net().HostId() || !core::IsPlayerReady()) return;
+            q.Read(r);int8_t area=r.I8();uint8_t flags=r.U8()&3;ObjectMotion motion;if(!motion.Read(r)){RecordObjectDiagnostic(diagnostic,664,OD_MALFORMED);return;}
+            if (!r.Ok() || from != Net().HostId() || !core::IsPlayerReady()) {RecordObjectDiagnostic(diagnostic,664,!r.Ok()?OD_MALFORMED:from!=Net().HostId()?OD_SENDER:OD_NOT_READY);return;}
             if (auto it = g_pending.find(id); it != g_pending.end()) {
-                if((int32_t)(motion.revision-it->second.motion.revision)<0)return;
+                if((int32_t)(motion.revision-it->second.motion.revision)<0){RecordObjectDiagnostic(diagnostic,664,OD_OLD_REVISION,&it->second);return;}
                 it->second.pos = {p.x, p.y, p.z};
                 it->second.rot = q;it->second.area=area;it->second.flags=flags;it->second.motion=motion;
+                AcceptObjectDiagnostic(it->second,diagnostic,false);
             } else if (auto m = g_mirrors.find(id); m != g_mirrors.end() && Alive(m->second)) {
-                auto&copy=m->second;if((int32_t)(motion.revision-copy.motion.revision)<0)return;
+                auto&copy=m->second;if((int32_t)(motion.revision-copy.motion.revision)<0){RecordObjectDiagnostic(diagnostic,664,OD_OLD_REVISION,&copy);return;}
                 copy.pos={p.x,p.y,p.z};copy.rot=q;copy.area=area;copy.flags=flags;copy.motion=motion;ApplyPhysics(copy.obj,copy.motion.physics);
+                AcceptObjectDiagnostic(copy,diagnostic,false);
                 copy.obj->AreaCode()=area;
                 if(copy.motion.holder!=Net().MyId()&&copy.motion.simulator!=Net().MyId()){Place(copy.obj,copy.pos,q);ApplyFlags(copy.obj,flags);}
                 ApplyMotion(copy);
-            }
+                RecordObjectState(copy);
+            }else RecordObjectDiagnostic(diagnostic,664,OD_MISSING);
         });
         Net().SetHandler(proto::G_OBJ_REMOVE, [](uint8_t from, Reader& r) {
             uint16_t id = r.U16();
+            auto diagnostic=IncomingObjectDiagnostic(id,proto::G_OBJ_REMOVE);
             uint8_t kind = r.U8(), weapon = r.U8();
-            if (!r.Ok() || from != Net().HostId() || Net().IsHost()||!core::IsPlayerReady()) return;
+            if (!r.Ok() || from != Net().HostId() || Net().IsHost()||!core::IsPlayerReady()) {RecordObjectDiagnostic(diagnostic,664,!r.Ok()?OD_MALFORMED:from!=Net().HostId()||Net().IsHost()?OD_SENDER:OD_NOT_READY);return;}
             if(kind==REMOVE_ORIGIN){ObjectOrigin origin;if(id||!ReadOrigin(r,origin))return;origin.removed=true;if(RememberOrigin(origin)){g_originScan=0;ApplyRemovedOrigins();}return;}
-            if(kind!=REMOVE_GONE&&kind!=REMOVE_BROKE)return;
+            if(kind!=REMOVE_GONE&&kind!=REMOVE_BROKE){RecordObjectDiagnostic(diagnostic,664,OD_UNKNOWN_REMOVE);return;}
             if (kind == REMOVE_BROKE) {
-                if (auto it = g_pending.find(id); it != g_pending.end()) it->second.broken = true;
-                if (auto it = g_mirrors.find(id); it != g_mirrors.end()) {BreakCopy(it->second, weapon);it->second.broken=true;}
+                if (auto it = g_pending.find(id); it != g_pending.end()) {it->second.broken = true;RecordObjectDiagnostic(diagnostic,663,OD_BROKEN,&it->second);}
+                if (auto it = g_mirrors.find(id); it != g_mirrors.end()) {BreakCopy(it->second, weapon);it->second.broken=true;RecordObjectDiagnostic(diagnostic,663,OD_BROKEN,&it->second);}
                 return;
             }
             // CREATE and REMOVE can arrive in one batch before Copy runs. The
             // local level may already have the barrier even without our mirror.
             if(auto it=g_pending.find(id);it!=g_pending.end()){
+                RetireObjectDiagnostics(it->second,OD_CANCELLED);
                 if(auto*original=FindTwin(it->second)){
                     auto removed=it->second;removed.obj=original;removed.handle=GetObjectRef(original);removed.adopted=true;
+                    removed.diagnosticRemove=diagnostic;
                     DeleteCopy(removed);
                 }
                 g_pending.erase(it);
             }
             if (auto it = g_mirrors.find(id); it != g_mirrors.end()) {
+                it->second.diagnosticRemove=diagnostic;
                 DeleteCopy(it->second);
                 g_mirrors.erase(it);
             }
@@ -801,6 +837,7 @@ public:
 
     void OnSessionEnd() override {
         ClearCopies();
+        for(auto&[id,no]:g_owned)RetireObjectDiagnostics(no,OD_CANCELLED);
         g_owned.clear();g_storyObjects.clear();g_origins.clear();g_originRevision=0;
     }
     void OnPeerLeave(uint8_t id) override {
@@ -822,6 +859,7 @@ public:
         for(auto&origin:g_origins)if(origin.removed)SendOriginRemoval(origin);
     }
     void OnGameStarted() override {  // a new world: the objects of the old one are gone
+        for(auto*map:{&g_owned,&g_mirrors,&g_pending})for(auto&[id,no]:*map)RetireObjectDiagnostics(no,OD_CANCELLED);
         for(auto&w:g_hitsSeen)w={};for(auto&w:g_pushSeen)w={};g_pushes.clear();g_nativeCargo.clear();
         g_owned.clear();g_storyObjects.clear();
         g_mirrors.clear();
@@ -840,8 +878,8 @@ public:
             }
         } else {
             for(auto it=g_mirrors.begin();it!=g_mirrors.end();){
-                if(!Alive(it->second)){auto copy=it->second;copy.obj=nullptr;copy.handle=-1;g_pending[it->first]=copy;it=g_mirrors.erase(it);}
-                else ++it;
+                if(!Alive(it->second)){auto copy=it->second;RecordObjectDiagnostic(copy.diagnosticBirth,664,OD_NATIVE_MISSING,&copy);copy.obj=nullptr;copy.handle=-1;copy.diagnosticBirthPending=copy.diagnosticBirth.msg!=0;copy.diagnosticRecovery=true;g_pending[it->first]=copy;it=g_mirrors.erase(it);}
+                else {RecordObjectBirth(it->second);++it;}
             }
             if(!g_pending.empty())CreatePending();
             ApplyRemovedOrigins();

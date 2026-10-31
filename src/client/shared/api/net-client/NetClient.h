@@ -45,6 +45,8 @@ public:
     uint64_t QueuedInBytes()const{return m_inBytes.load();}
     uint64_t QueuedOutBytes()const{return m_outBytes.load()+m_reliableBytes.load();}
     uint64_t ExpiredReceivePackets() const { return m_expiredReceivePackets.load(); }
+    // Cumulative object-lifetime count, including packets queued before tracing.
+    uint64_t CancelledQueuedPackets() const { return m_cancelledQueuedPackets.load(); }
     Failure LastFailure() const { return m_failure.load(); }
 
 private:
@@ -59,6 +61,7 @@ private:
     std::atomic<uint64_t> m_bytesIn{0}, m_bytesOut{0};
     std::atomic<uint64_t> m_inBytes{0},m_outBytes{0},m_reliableBytes{0};
     std::atomic<uint64_t> m_expiredReceivePackets{0}, m_lastPoll{0};
+    std::atomic<uint64_t> m_cancelledQueuedPackets{0};
     std::atomic<Failure> m_failure{Failure::None};
 
     std::mutex m_outMutex;

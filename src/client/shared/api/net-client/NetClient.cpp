@@ -130,18 +130,25 @@ void NetClient::Stop() {
     }
     m_state = State::Idle;
     std::lock_guard<std::mutex> a(m_outMutex);
-    for(const auto&p:m_out)passenger_trace::Emit(p.diagnostic,passenger_trace::OutQueued,passenger_trace::NotConnected,p.diagnostic.source);
+    m_cancelledQueuedPackets.fetch_add(m_out.size(),std::memory_order_relaxed);
+    for(const auto&p:m_out)passenger_trace::Emit(p.diagnostic,passenger_trace::OutQueued,passenger_trace::SessionEnded,p.diagnostic.source);
     m_out.clear();
     m_outBytes=0;
     // what came after the last poll (a refusal's reason, a world chunk) belonged to that connection: it was handled
     // in the next one ("the world arrived damaged")
     std::lock_guard<std::mutex> b(m_inMutex);
-    for(const auto&p:m_in)passenger_trace::Emit(p.diagnostic,passenger_trace::TransportReceive,passenger_trace::NotConnected);
+    m_cancelledQueuedPackets.fetch_add(m_in.size(),std::memory_order_relaxed);
+    for(const auto&p:m_in)passenger_trace::Emit(p.diagnostic,passenger_trace::TransportReceive,passenger_trace::SessionEnded);
     m_in.clear();
     m_inBytes=0;
 }
 
-void NetClient::Send(uint8_t channel, const Writer& w) { Send(channel, w.Data(), w.Size()); }
+void NetClient::Send(uint8_t channel, const Writer& w) {
+    auto diagnostic=passenger_trace::Packet(w.Data(),w.Size(),channel,false);
+    passenger_trace::Emit(diagnostic,passenger_trace::Producer);
+    passenger_trace::Describe(diagnostic,w.Data(),w.Size(),channel,false);
+    Send(channel,w.Data(),w.Size(),diagnostic);
+}
 
 void NetClient::Send(uint8_t channel, const uint8_t* data, size_t size,flight::Context diagnostic) {
     if (m_state != State::Connected || size == 0){passenger_trace::Emit(diagnostic,passenger_trace::OutQueued,passenger_trace::NotConnected,diagnostic.source);return;}
@@ -307,6 +314,7 @@ void NetClient::ThreadMain(std::string host, uint16_t port) {
                     Packet p{ev.channelID, std::vector<uint8_t>(ev.packet->data, ev.packet->data + ev.packet->dataLength),NowMs()};
                     p.diagnostic=passenger_trace::Packet(p.data.data(),p.data.size(),p.channel,true);
                     passenger_trace::Emit(p.diagnostic,passenger_trace::TransportReceive);
+                    passenger_trace::Describe(p.diagnostic,p.data.data(),p.data.size(),p.channel,true);
                     enet_packet_destroy(ev.packet);
                     std::lock_guard<std::mutex> lock(m_inMutex);
                     if (m_in.size() >= 4000 || m_inBytes + p.data.size() > 32 * 1024 * 1024) {

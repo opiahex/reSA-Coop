@@ -22,8 +22,10 @@ struct Contact {
     uint16_t source=0,target=0;uint8_t owner=255;
     uint64_t sourceGeneration=0,targetGeneration=0;
     CVector move,turn,damageOffset,damageNormal;
-    float damage=0;uint8_t damagePiece=0;
+    float damage=0;uint8_t damagePiece=0;bool heldLocal=false;
 };
+struct DeferredContact {uint16_t source=0,target=0;uint64_t sourceGeneration=0,targetGeneration=0,at=0;uint32_t connection=0,world=0;int sourceRef=-1,targetRef=-1;};
+std::map<uint32_t,DeferredContact> deferredContacts;
 std::map<uint32_t,Contact> pending;
 std::map<uint64_t,uint32_t> received;
 std::map<uint32_t,uint64_t> nativeContacts;
@@ -99,6 +101,7 @@ void UpdateDamageSources(){
 CVector Limit(CVector v,float max){auto length=v.Length();return length>max?v*(max/length):v;}
 using ContactFn=bool(__fastcall*)(CPhysical*,void*,CPhysical*,void*,float*,float*);
 ContactFn originalHard=nullptr,originalSoft=nullptr;
+bool LocalContactSource(const NetVehicle*n){return n&&n->owner==Net().MyId()&&Vehicles::Alive(*n)&&!n->authorityHeld&&!n->crewStaged;}
 bool ProcessContact(ContactFn original,CPhysical*a,void*edx,CPhysical*b,void*point,float*damageA,float*damageB){
     if(!Net().Online()||!core::IsPlayerReady()||!a||!b)return original(a,edx,b,point,damageA,damageB);
     if(TrainingIgnoresContact(a,b)){
@@ -110,13 +113,17 @@ bool ProcessContact(ContactFn original,CPhysical*a,void*edx,CPhysical*b,void*poi
     if(cargo)return cargoResult;
     if(!a->IsVehicle()||!b->IsVehicle())return original(a,edx,b,point,damageA,damageB);
     auto*na=Vehicles::Instance().Find((CVehicle*)a);auto*nb=Vehicles::Instance().Find((CVehicle*)b);
-    if(!na||!nb||na->owner==nb->owner||(na->owner!=Net().MyId()&&nb->owner!=Net().MyId())||
-       (a->PhysicalFlags()&0x2000u)||(b->PhysicalFlags()&0x2000u))return original(a,edx,b,point,damageA,damageB);
+    auto*held=na&&nb&&na->owner==Net().MyId()&&nb->owner==Net().MyId()?
+        (na->authorityHeld&&LocalContactSource(nb)?na:nb->authorityHeld&&LocalContactSource(na)?nb:nullptr):nullptr;
+    if(!na||!nb||(!held&&(na->owner==nb->owner||(na->owner!=Net().MyId()&&nb->owner!=Net().MyId())))||
+       ((a->PhysicalFlags()&0x2000u)&&held!=na)||((b->PhysicalFlags()&0x2000u)&&held!=nb))return original(a,edx,b,point,damageA,damageB);
     CVector am=a->MoveSpeed(),at=a->TurnSpeed(),bm=b->MoveSpeed(),bt=b->TurnSpeed();
     bool result=original(a,edx,b,point,damageA,damageB);
     {
-        auto*remote=na->owner==Net().MyId()?nb:na;auto*source=remote==na?nb:na;
-        if(result)nativeContacts[((uint32_t)remote->netId<<16)|source->netId]=NowMs();
+        auto*remote=held?held:na->owner==Net().MyId()?nb:na;auto*source=remote==na?nb:na;
+        // A held local target deliberately defers its own native result. Its
+        // server echo must not be mistaken for an already-applied collision.
+        if(result&&!held)nativeContacts[((uint32_t)remote->netId<<16)|source->netId]=NowMs();
         auto*v=remote->veh;CVector move=(v->MoveSpeed()-(remote==na?am:bm))*50.f;
         CVector turn=(v->TurnSpeed()-(remote==na?at:bt))*50.f;
         // The caller records these exact hard-collision outputs with
@@ -129,6 +136,7 @@ bool ProcessContact(ContactFn original,CPhysical*a,void*edx,CPhysical*b,void*poi
             auto&c=pending[((uint32_t)source->netId<<16)|remote->netId];
             if(c.sourceGeneration!=sourceGeneration||c.targetGeneration!=targetGeneration||c.owner!=remote->owner)c={};
             c.source=source->netId;c.target=remote->netId;c.owner=remote->owner;
+            c.heldLocal=held!=nullptr;
             c.sourceGeneration=sourceGeneration;c.targetGeneration=targetGeneration;
             c.move=c.move+move;c.turn=c.turn+turn;
             if(damage>c.damage){
@@ -136,6 +144,13 @@ bool ProcessContact(ContactFn original,CPhysical*a,void*edx,CPhysical*b,void*poi
                 c.damageNormal=Field<CVector>(point,0x10)*(remote==na?1.f:-1.f);
                 c.damagePiece=Field<uint8_t>(point,0x21);
             }
+        }
+        if(held){
+            // 0x2000 stops ApplyMoveSpeed, not collision force calculation.
+            // Keep the real source reaction but defer the held target's exact
+            // response until the server aborts the ownership transaction.
+            v->MoveSpeed()=remote==na?am:bm;v->TurnSpeed()=remote==na?at:bt;
+            if(remote==na){if(damageA)*damageA=0;}else if(damageB)*damageB=0;
         }
     }
     return result;
@@ -162,7 +177,12 @@ public:
         auto*a=Vehicles::Instance().Find(source);auto*b=Vehicles::Instance().Find(target);
         bool sourceRef=false,targetRef=false;
         for(auto&ref:Net().EntityContext())if(ref.kind==ENTITY_VEHICLE&&ref.flags==ENTITY_USE){sourceRef|=ref.id==source;targetRef|=ref.id==target;}
-        if(!sourceRef||!targetRef||!a||!b||!Vehicles::Alive(*a)||!Vehicles::Alive(*b)||a->owner!=from||b->owner!=Net().MyId()||from==b->owner||
+        const bool self=from==Net().MyId();auto saved=deferredContacts.find(serial);
+        const bool selfWitness=self&&saved!=deferredContacts.end()&&saved->second.source==source&&saved->second.target==target&&
+            saved->second.connection==Net().MyIncarnation()&&saved->second.world==Net().WorldEpoch()&&NowMs()-saved->second.at<=1500&&
+            Net().EntityGeneration(ENTITY_VEHICLE,source)==saved->second.sourceGeneration&&Net().EntityGeneration(ENTITY_VEHICLE,target)==saved->second.targetGeneration&&
+            a&&b&&a->handle==saved->second.sourceRef&&b->handle==saved->second.targetRef;
+        if(!sourceRef||!targetRef||!a||!b||!Vehicles::Alive(*a)||!Vehicles::Alive(*b)||a->owner!=from||b->owner!=Net().MyId()||(from==b->owner&&!selfWitness)||
            a->veh->AreaCode()!=b->veh->AreaCode()||(a->veh->GetPosition()-b->veh->GetPosition()).Length()>25||
            (b->veh->PhysicalFlags()&0x2000u)||TrainingIgnoresContact(a->veh,b->veh))return;
         if(a->hasState&&(int32_t)(a->lastTime-stamp)>500)return;
@@ -171,7 +191,8 @@ public:
         // peer's collision sequence is independent of the previous driver's.
         auto&last=received[((uint64_t)from<<32)|key];
         if(last&&(int32_t)(serial-last)<=0)return;last=serial;
-        if(auto it=nativeContacts.find(key);it!=nativeContacts.end()&&NowMs()-it->second<120)return;
+        if(!selfWitness)if(auto it=nativeContacts.find(key);it!=nativeContacts.end()&&NowMs()-it->second<120)return;
+        if(selfWitness)deferredContacts.erase(saved);
         b->veh->MoveSpeed()=b->veh->MoveSpeed()+Limit({m.x,m.y,m.z},20.f)*(1.f/50.f);
         b->veh->TurnSpeed()=b->veh->TurnSpeed()+Limit({t.x,t.y,t.z},12.f)*(1.f/50.f);
         if(damage>0){
@@ -193,18 +214,23 @@ public:
     UpdateDamageSources();
     if(!Net().Online()||!core::IsPlayerReady()||NowMs()-lastSend<33)return;lastSend=NowMs();
     for(auto&[key,c]:pending){auto*a=Vehicles::Instance().Find(c.source);auto*b=Vehicles::Instance().Find(c.target);
-        if(!a||!b||a->owner!=Net().MyId()||b->owner!=c.owner||c.owner==Net().MyId()||
+        if(!a||!b||a->owner!=Net().MyId()||b->owner!=c.owner||(c.owner==Net().MyId()&&(!c.heldLocal||!b->authorityHeld||!LocalContactSource(a)))||
            Net().EntityGeneration(ENTITY_VEHICLE,c.source)!=c.sourceGeneration||Net().EntityGeneration(ENTITY_VEHICLE,c.target)!=c.targetGeneration||
            TrainingIgnoresContact(a->veh,b->veh))continue;
         auto m=Limit(c.move,20.f),t=Limit(c.turn,12.f);Writer w(proto::G_VEH_CONTACT);
         w.Entity(ENTITY_VEHICLE,c.source,ENTITY_USE,255,c.sourceGeneration);w.Entity(ENTITY_VEHICLE,c.target,ENTITY_USE,255,c.targetGeneration);
-        w.U32(++sequence);w.U32((uint32_t)NowMs());w.VecQ({m.x,m.y,m.z},30.f);w.VecQ({t.x,t.y,t.z},15.f);
+        if(++sequence==0)++sequence;
+        w.U32(sequence);w.U32((uint32_t)NowMs());w.VecQ({m.x,m.y,m.z},30.f);w.VecQ({t.x,t.y,t.z},15.f);
         w.F32(c.damage);w.Vec({c.damageOffset.x,c.damageOffset.y,c.damageOffset.z});w.Vec({c.damageNormal.x,c.damageNormal.y,c.damageNormal.z});w.U8(c.damagePiece);
+        if(c.heldLocal){
+            if(deferredContacts.size()>=128)deferredContacts.erase(deferredContacts.begin());
+            deferredContacts[sequence]={c.source,c.target,c.sourceGeneration,c.targetGeneration,NowMs(),Net().MyIncarnation(),Net().WorldEpoch(),a->handle,b->handle};
+        }
         Net().Send(proto::CH_RELIABLE,w);
     }pending.clear();
     if(NowMs()-lastPrune>5000){lastPrune=NowMs();for(auto it=received.begin();it!=received.end();)it=(!Vehicles::Instance().Find((uint16_t)(it->first>>16))||!Vehicles::Instance().Find((uint16_t)it->first))?received.erase(it):std::next(it);for(auto it=nativeContacts.begin();it!=nativeContacts.end();)it=NowMs()-it->second>10000?nativeContacts.erase(it):std::next(it);}
  }
- void OnGameShutdown()override{pending.clear();received.clear();nativeContacts.clear();damageSources.clear();damageRun=0;damagePhase=0;}
+ void OnGameShutdown()override{pending.clear();received.clear();nativeContacts.clear();deferredContacts.clear();damageSources.clear();damageRun=0;damagePhase=0;}
  void OnSessionEnd()override{OnGameShutdown();lastSend=0;}
 }feature;
 struct Reg{Reg(){core::RegisterModule(&feature);}}reg;

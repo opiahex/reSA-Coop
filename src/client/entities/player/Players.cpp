@@ -328,6 +328,10 @@ bool HasRCBody(uint8_t player) {
     return CooperativeRemoteRole(player, role);
 }
 
+bool AuthorityVehicleHeld(CPlayerPed*ped){
+    auto*v=ped?ped->VehicleIfIn():nullptr;auto*n=v?Vehicles::Instance().Find(v):nullptr;
+    return n&&n->authorityHeld&&Vehicles::Alive(*n);
+}
 // RC input belongs to the native remote vehicle, not the on-foot controller's
 // task tree. Restore it before CPlane/CAutomobile processes the actual vehicle.
 struct RCBodyPadScope {
@@ -349,7 +353,7 @@ struct RCBodyPadScope {
 void __fastcall HookPlayerProcessControl(CPlayerPed* self, void* edx) {
     RemotePlayer* rp = g_inRemoteContext ? nullptr : Players::Instance().FindByPed(self);
     if (!rp) {
-        RCBodyPadScope body(Net().Online()&&self==FindPlayerPed(0)&&HasRCBody(Net().MyId()));
+        RCBodyPadScope body(Net().Online()&&self==FindPlayerPed(0)&&(HasRCBody(Net().MyId())||AuthorityVehicleHeld(self)));
         g_origProcessControl(self, edx);
         return;
     }
@@ -358,7 +362,7 @@ void __fastcall HookPlayerProcessControl(CPlayerPed* self, void* edx) {
     {
         PlayerSlotContext remoteSlot(*PlayerInfo(kRemoteSlot), rp->info);
         ApplyRemote(*rp);
-        RCBodyPadScope body(HasRCBody(rp->id));
+        RCBodyPadScope body(HasRCBody(rp->id)||AuthorityVehicleHeld(self));
         g_inRemoteContext = true;
         g_origProcessControl(self, edx);
         DriveBy(self);  // still under its pad and camera
@@ -1038,13 +1042,16 @@ void Players::DestroyRemote(RemotePlayer& rp) {
 }
 
 void Players::HandleOnFoot(uint8_t from, Reader& r) {
-    if (from == Net().MyId()) return;
+    auto context=Net().DiagnosticContext();
+    if(context.msg!=proto::G_PLAYER_ONFOOT||context.source!=from)context={};
+    auto trace=[&](passenger_trace::Reason reason){passenger_trace::Emit(context,passenger_trace::Decode,reason,Net().MyId());};
+    if (from == Net().MyId()){trace(passenger_trace::Self);return;}
     OnFootState st;
-    if (!st.Read(r)) return;
+    if (!st.Read(r)){trace(!r.Ok()?passenger_trace::Malformed:passenger_trace::CommonDecode);return;}
     RemotePlayer& rp = Touch(from);
     // unreliable channel: ignore states older than the newest applied one
-    if(rp.hasState&&(int32_t)(st.motion.epoch-rp.state.motion.epoch)<0)return;
-    if (rp.hasState && (int32_t)(st.time - rp.lastStateTime) < 0) return;
+    if(rp.hasState&&(int32_t)(st.motion.epoch-rp.state.motion.epoch)<0){trace(passenger_trace::OldMotion);return;}
+    if (rp.hasState && (int32_t)(st.time - rp.lastStateTime) < 0){trace(passenger_trace::OldTime);return;}
     rp.lastStateTime = st.time;
     if(!rp.hasState||rp.mode!=RemotePlayer::Mode::OnFoot||rp.state.area!=st.area||
        rp.state.motion.epoch!=st.motion.epoch||(st.pos-rp.state.pos).Length()>25)rp.history.Clear();
@@ -1057,7 +1064,9 @@ void Players::HandleOnFoot(uint8_t from, Reader& r) {
         rp.seatTransition.Begin(rp.vehNetId, st.time, NowMs());
     ClearChangedSupport(rp.ped,rp.state.motion.objectSupport?0:rp.state.motion.support,st.motion.objectSupport?0:st.motion.support);
     if(rp.diagnosticApplyPending)passenger_trace::Emit(rp.diagnosticState,passenger_trace::NativeApply,passenger_trace::Replaced,Net().MyId());
-    rp.diagnosticApplyPending=false;rp.diagnosticState={};
+    rp.diagnosticState=context;rp.diagnosticApplyPending=context.msg!=0;rp.diagnosticMissingReported=false;
+    trace(passenger_trace::Ok);
+    if(context.msg){flight::Event event{};event.context=context;event.stage=passenger_trace::Accepted;event.localPeer=Net().MyId();event.health=st.health;event.maxHealth=st.maxHealth;event.armour=st.armour;event.motionEpoch=st.motion.epoch;flight::Record(event);}
     rp.state = st;
     rp.hasState = true;
     rp.stateRecvMs = NowMs();
@@ -1074,18 +1083,21 @@ RemotePlayer& Players::Touch(uint8_t from) {
 }
 
 void Players::HandleDriver(uint8_t from, Reader& r) {
-    if (from == Net().MyId()) return;
+    auto context=Net().DiagnosticContext();
+    if(context.msg!=proto::G_PLAYER_DRIVER||context.source!=from)context={};
+    auto trace=[&](passenger_trace::Reason reason){passenger_trace::Emit(context,passenger_trace::Decode,reason,Net().MyId());};
+    if (from == Net().MyId()){trace(passenger_trace::Self);return;}
     uint16_t netId = r.U16();
     VehicleState vs;
-    if (!vs.Read(r)) return;
+    if (!vs.Read(r)){trace(!r.Ok()?passenger_trace::Malformed:passenger_trace::CommonDecode);return;}
     OnFootState st;
-    if(!ReadCommon(r, st))return;
-    if (!r.Ok()) return;
+    if(!ReadCommon(r, st)){trace(passenger_trace::CommonDecode);return;}
+    if (!r.Ok()){trace(passenger_trace::Malformed);return;}
     RemotePlayer& rp = Touch(from);
-    if(rp.hasState&&(int32_t)(st.motion.epoch-rp.state.motion.epoch)<0)return;
-    if (rp.hasState && (int32_t)(vs.time - rp.lastStateTime) < 0) return;
+    if(rp.hasState&&(int32_t)(st.motion.epoch-rp.state.motion.epoch)<0){trace(passenger_trace::OldMotion);return;}
+    if (rp.hasState && (int32_t)(vs.time - rp.lastStateTime) < 0){trace(passenger_trace::OldTime);return;}
     if (rp.mode == RemotePlayer::Mode::OnFoot && rp.seatTransition.confirmed) rp.seatTransition = {};
-    if (rp.seatTransition.jacked && rp.seatTransition.HoldSeat(netId, NowMs())) return;
+    if (rp.seatTransition.jacked && rp.seatTransition.HoldSeat(netId, NowMs())){trace(passenger_trace::SeatHeld);return;}
     rp.lastStateTime = vs.time;
     st.time = vs.time;
     st.pos = vs.pos;
@@ -1094,7 +1106,9 @@ void Players::HandleDriver(uint8_t from, Reader& r) {
     st.pad.buttons &= ~PadState::B_TRIANGLE;
     ClearChangedSupport(rp.ped,rp.state.motion.objectSupport?0:rp.state.motion.support,st.motion.objectSupport?0:st.motion.support);
     if(rp.diagnosticApplyPending)passenger_trace::Emit(rp.diagnosticState,passenger_trace::NativeApply,passenger_trace::Replaced,Net().MyId());
-    rp.diagnosticApplyPending=false;rp.diagnosticState={};
+    rp.diagnosticState=context;rp.diagnosticApplyPending=context.msg!=0;rp.diagnosticMissingReported=false;
+    trace(passenger_trace::Ok);
+    if(context.msg){flight::Event event{};event.context=context;event.stage=passenger_trace::Accepted;event.localPeer=Net().MyId();event.health=st.health;event.maxHealth=st.maxHealth;event.armour=st.armour;event.motionEpoch=st.motion.epoch;flight::Record(event);}
     rp.state = st;
     rp.hasState = true;
     rp.stateRecvMs = NowMs();
@@ -1259,10 +1273,24 @@ void Players::ApplyState(RemotePlayer& rp) {
     // death is decided by the owner's game (the local ped has all proofs): play it once; after the
     // respawn a fresh ped replaces the dead one, which cannot be revived
     if (st.flags & OnFootState::F_DEAD) {
+        // The owner still publishes the corpse transform. Local gravity must not
+        // drop its copy below the world and let native rescue cancel TASK_DIE.
+        auto finite = [](const CVector& v) {
+            return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+        };
+        if (rp.hasState && rp.mode == RemotePlayer::Mode::OnFoot &&
+            !(st.flags & OnFootState::F_IN_TRAIN) && !rp.scriptAnimFull &&
+            !st.motion.support && st.motion.kind != MotionState::MOUNTED &&
+            !Ref<uint8_t>(0xB5F851) && rp.pedHandle >= 0 && IsPedValid(ped) &&
+            GetPedRef(ped) == rp.pedHandle && !ped->InVehicle() && !ped->AttachedTo() &&
+            finite(st.pos) && finite(st.vel)) {
+            SetEntityPosition(ped, st.pos);
+            ped->MoveSpeed() = st.vel * (1.0f / 50.0f);
+        }
         if (!rp.deadShown) {
             rp.deadShown = true;
             LOGI("Remote player %d died", rp.id);
-            if (!ped->InVehicle()) Cmd(0x05BE).I(rp.pedHandle).Run();  // owner sends native in-car death pose
+            Cmd(0x05BE).I(rp.pedHandle).Run();  // TASK_DIE selects GTA's seated or on-foot death task.
         }
         return;
     }
@@ -1900,6 +1928,7 @@ void Players::SendLocalState() {
     m_lastSentPad = st.pad;
     Writer wr(proto::G_PLAYER_ONFOOT);
     st.Write(wr);
+    passenger_trace::Publication diagnosticPublication(st.health,st.maxHealth,st.armour,st.motion.epoch);
     Net().Send(proto::CH_STATE, wr);
     if(transition)Net().Send(proto::CH_RELIABLE,wr);
 }

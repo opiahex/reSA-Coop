@@ -60,8 +60,21 @@ VehicleState VehicleState::Capture(game::CVehicle* v) {
     return s;
 }
 
+void VehicleCrew::Write(Writer&w)const {
+    w.U8(count);for(unsigned i=0;i<count;++i){const auto&m=members[i];
+        w.Entity(ENTITY_PED,m.ped,ENTITY_USE,255,m.generation);w.U64(m.generation);w.I8(m.seat);}
+}
+bool VehicleCrew::Read(Reader&r){
+    count=r.U8();if(count>members.size())return false;
+    for(unsigned i=0;i<count;++i){auto&m=members[i];m.ped=r.U16();m.generation=r.U64();m.seat=r.I8();
+        if(!m.ped||!m.generation||m.seat < -1||m.seat>=8)return false;
+        for(unsigned j=0;j<i;++j)if(members[j].ped==m.ped||members[j].seat==m.seat)return false;}
+    return r.Ok();
+}
+
 void VehicleState::Write(Writer& w) const {
     w.U32(time);
+    crew.Write(w);
     w.Entity(ENTITY_VEHICLE,towChild);w.Entity(ENTITY_VEHICLE,towParent);
     w.Vec(V(pos));
     rot.Write(w);
@@ -93,6 +106,7 @@ void VehicleState::Write(Writer& w) const {
 
 bool VehicleState::Read(Reader& r) {
     time = r.U32();
+    if(!crew.Read(r))return false;
     towChild=r.U16();towParent=r.U16();
     pos = G(r.Vec());
     rot.Read(r);
@@ -138,6 +152,7 @@ void VehicleSpawn::Write(Writer& w) const {
     w.U8(lockState);
     w.U8(script);
     w.Bool(playerUsed);
+    crew.Write(w);
 }
 
 bool VehicleSpawn::Read(Reader& r) {
@@ -153,6 +168,7 @@ bool VehicleSpawn::Read(Reader& r) {
     lockState = r.U8();
     script = r.U8() != 0;
     playerUsed = r.Bool();
+    if(!crew.Read(r))return false;
     return r.Ok();
 }
 

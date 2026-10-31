@@ -2,12 +2,14 @@
 #include <psapi.h>
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <string>
 #include <vector>
 #include "common/api/protocol/Protocol.h"
 #include "common/config/version/Version.h"
 #include "common/lib/log/Log.h"
+#include "common/lib/diagnostics/FlightRecorder.h"
 #include "common/lib/util/Util.h"
 #include "common/lib/profile/Profile.h"
 #include "entities/ped/Peds.h"
@@ -24,6 +26,7 @@ namespace coop {
 namespace {
 using namespace game;
 using Entry=SyncAuditEntry;
+core::DiagnosticAuditStatus diagnosticAudit{};
 uint32_t PedIdentity(CPed*p){
     if(!p)return 0;
     if(p==FindPlayerPed(0))return 0x10000u+Net().MyId()+1;
@@ -77,6 +80,12 @@ class Diagnostics:public Module {
         if(now-warnings[key]<5000)return;warnings[key]=now;
         char b[512];snprintf(b,sizeof(b),"{\"event\":\"anomaly\",\"ms\":%llu,\"peer\":%u,\"source\":%u,\"kind\":%u,\"id\":%u,\"reason\":\"%s\"}\n",(unsigned long long)now,Net().MyId(),source,e.kind,e.id,reason);Write(b);
         LOGW("Sync audit: %s kind=%u id=%04X source=%u",reason,e.kind,e.id,source);
+        static const char*reasons[]={"missing_record","owner_mismatch","waiting_native_instance","model_mismatch","driver_mismatch","appearance_mismatch","content_mismatch"};
+        uint8_t code=255;for(size_t i=0;i<std::size(reasons);++i)if(!std::strcmp(reason,reasons[i])){code=(uint8_t)(i+1);break;}
+        ++diagnosticAudit.warnings;diagnosticAudit.entity=e.id;diagnosticAudit.kind=e.kind;diagnosticAudit.source=source;diagnosticAudit.reason=code;diagnosticAudit.sampledAt=diagnosticAudit.warnedAt=NowMs();diagnosticAudit.available=true;
+        flight::Event event{};event.stage=600;event.reason=code;event.context.msg=proto::G_SYNC_AUDIT;event.context.entity=e.id;event.context.source=Net().MyId();event.context.world=Net().WorldEpoch();event.context.incarnation=Net().MyIncarnation();event.localPeer=Net().MyId();event.owner=e.owner;event.detailKnown|=flight::OwnerKnown;
+        if(e.kind<2)event.context.generation=Net().EntityGeneration(e.kind?ENTITY_PED:ENTITY_VEHICLE,e.id);
+        flight::Record(event);
     }
     void Audit(uint8_t from,Reader&r){
         auto count=r.U8();if(count>20||from==Net().MyId()||!Net().Peer(from))return;
@@ -107,7 +116,7 @@ public:
         BeginSink();last=0;seq=0;
     }
     void OnSessionEnd()override{log::EndLegacySync(sessionToken);sessionToken=0;headerQueued=false;sessionHeader.clear();path.clear();OnGameShutdown();}
-    void OnGameShutdown()override{remote.clear();warnings.clear();requests.clear();observations.clear();ownedAudit.clear();auditCursor=0;auditAt=0;last=0;}
+    void OnGameShutdown()override{remote.clear();warnings.clear();requests.clear();observations.clear();ownedAudit.clear();auditCursor=0;auditAt=0;last=0;diagnosticAudit.available=false;diagnosticAudit.sampledAt=diagnosticAudit.warnedAt=0;diagnosticAudit.entity=0;diagnosticAudit.source=255;diagnosticAudit.kind=diagnosticAudit.reason=0;}
     void OnPeerLeave(uint8_t id)override{remote.erase(id);}
     bool OnCommand(const std::string&cmd,const std::vector<std::string>&)override{if(cmd!="syncdiag")return false;last=0;core::Notify("Sync diagnostics: coop/diagnostics; /syncdiag records the current state");return true;}
     void OnPostProcess()override{
@@ -184,6 +193,7 @@ public:
         int asked=0;
         for(auto&[source,records]:remote)for(auto&[key,e]:records){
             if(last-e.received>10000)continue;
+            ++diagnosticAudit.comparisons;diagnosticAudit.sampledAt=NowMs();diagnosticAudit.available=true;
             auto it=local.find(key);bool inRange=AuditSet(e.kind)||((e.area==me->AreaCode()||e.area==13)&&(e.pos-me->GetPosition()).Length2D()<160);
             if(it==local.end()){
                 if(inRange){Warn("missing_record",e,source);Request(e,source,asked);}
@@ -213,5 +223,11 @@ public:
     static Diagnostics&Instance(){static Diagnostics d;return d;}
 };
 struct Reg{Reg(){core::RegisterModule(&Diagnostics::Instance());}}reg;
+}
+namespace core {
+DiagnosticAuditStatus GetDiagnosticAuditStatus()noexcept{
+    if(!DiagnosticGameThreadId()||DiagnosticGameThreadId()!=GetCurrentThreadId())return {};
+    return diagnosticAudit;
+}
 }
 }

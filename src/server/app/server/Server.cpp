@@ -76,6 +76,8 @@ bool Server::LoadWorld(const std::wstring& path, const std::string& label) {
 void Server::Run() {
     while (m_running) {
         Service();
+        m_authority.Tick(NowMs());
+        SendAuthorityDecisions();
         m_internet.Service();
         if (std::string code; m_internet.TakeNewCode(code)) {
             SendInvite(nullptr);
@@ -184,6 +186,7 @@ void Server::Leave(Player& p, LeaveReason why, const std::string& reason) {
     bool wasJoined = p.joined, wasHost = p.isHost;
     std::string name = p.name;
     uint8_t id = p.id;
+    if(wasJoined)m_authority.Disconnect(id);
     p = Player{};
     p.id = id;
     m_worldWaiters.erase(std::remove(m_worldWaiters.begin(), m_worldWaiters.end(), id), m_worldWaiters.end());
@@ -206,24 +209,38 @@ void Server::Leave(Player& p, LeaveReason why, const std::string& reason) {
     }
     SendChat(nullptr, kServerId, why == LEAVE_KICKED ? kColorServer : kColorInfo, msg, en);
     if (wasHost) EnsureHost();
+    SendAuthorityDecisions();
 }
 
 void Server::OnPacket(ENetPeer* peer, uint8_t channel, const uint8_t* data, size_t size, uint32_t flags) {
     Player* p = FindByPeer(peer);
     auto diagnostic=passenger_trace::Packet(data,size,channel,false,p?p->id:255,peer?peer->connectID:0);
-    passenger_trace::Emit(diagnostic,passenger_trace::ServerReceive,!p||!p->joined?passenger_trace::NotJoined:passenger_trace::Ok,proto::kServerId);
+    passenger_trace::Emit(diagnostic,passenger_trace::ServerReceive,!p||(!p->joined&&(!size||data[0]!=C_HELLO))?passenger_trace::NotJoined:passenger_trace::Ok,proto::kServerId);
+    passenger_trace::Describe(diagnostic,data,size,channel,false,proto::kServerId);
     if (!p || size == 0) return;
     uint8_t id = data[0];
     Reader r(data + 1, size - 1);
     if (!p->joined) {
-        if (id == C_HELLO) HandleHello(*p, r);
+        if (id == C_HELLO){
+            passenger_trace::Emit(diagnostic,passenger_trace::ServiceDispatchBegin,passenger_trace::Ok,proto::kServerId);
+            HandleHello(*p,r);
+            passenger_trace::Emit(diagnostic,passenger_trace::ServiceDispatchEnd,!r.Ok()?passenger_trace::ReaderMalformed:passenger_trace::HandlerReturned,proto::kServerId);
+        }
         return;
     }
     if (IsRelayed(id)) {
         Relay(*p, channel, data, size, flags);
         return;
     }
+    passenger_trace::Emit(diagnostic,passenger_trace::ServiceDispatchBegin,passenger_trace::Ok,proto::kServerId);
+    auto diagnosticOutcome=passenger_trace::HandlerReturned;
     switch (id) {
+        case C_ENTITY_AUTHORITY: {
+            authority::Command command;
+            if(command.Read(r))m_authority.Handle(p->id,p->peer->connectID,command,NowMs());
+            SendAuthorityDecisions();
+            break;
+        }
         case C_CHAT: {
             std::string text = r.Str(kMaxChatLen * 4);
             if (r.Ok()) HandleChat(*p, text);
@@ -272,9 +289,11 @@ void Server::OnPacket(ENetPeer* peer, uint8_t channel, const uint8_t* data, size
             break;
         }
         default:
+            diagnosticOutcome=passenger_trace::UnsupportedService;
             LOGW("Неизвестное сообщение %u от %s", id, p->name.c_str());
             break;
     }
+    passenger_trace::Emit(diagnostic,passenger_trace::ServiceDispatchEnd,!r.Ok()?passenger_trace::ReaderMalformed:diagnosticOutcome,proto::kServerId);
 }
 
 void Server::HandleHello(Player& p, Reader& r) {
@@ -321,6 +340,7 @@ void Server::HandleHello(Player& p, Reader& r) {
     if(p.id==kServerId)return reject("на сервере нет свободных мест", "the server is full");
     p.name = name;
     p.joined = true;
+    m_authority.Connect(p.id,p.peer->connectID);
     bool hostExists = false;
     for (auto& o : m_players)
         if (o.joined && o.isHost && &o != &p) hostExists = true;
@@ -355,6 +375,9 @@ void Server::HandleHello(Player& p, Reader& r) {
     j.Bool(p.isHost);
     j.U32(p.peer->connectID);
     Broadcast(CH_RELIABLE, j, p.id);
+
+    m_authority.Snapshot(p.id);
+    SendAuthorityDecisions();
 
     SendProfile(p);
     SendInvite(&p);
@@ -674,6 +697,11 @@ void Server::SaveProfile(Player& p, const std::vector<uint8_t>& data) {
 void Server::Relay(Player& from, uint8_t channel, const uint8_t* data, size_t size, uint32_t flags) {
     auto diagnostic=passenger_trace::Packet(data,size,channel,false,from.id,from.peer->connectID);
     if (channel >= CH_COUNT){passenger_trace::Emit(diagnostic,passenger_trace::Relay,passenger_trace::Malformed,proto::kServerId);return;}
+    authority::GameFrame frame;
+    if(!authority::ReadGameFrame(data,size,frame)){passenger_trace::Emit(diagnostic,passenger_trace::Relay,passenger_trace::Malformed,proto::kServerId);return;}
+    const auto admission=m_authority.Admit(from.id,from.peer->connectID,data[0],frame,from.isHost,NowMs());
+    SendAuthorityDecisions();
+    if(!admission.allow){passenger_trace::Emit(diagnostic,passenger_trace::Relay,passenger_trace::GenerationRejected,proto::kServerId);LOGD("Authority rejected msg=%u peer=%u reason=%u",data[0],from.id,(unsigned)admission.reason);return;}
     bool stateChannel=channel==CH_STATE;
     channel = RelayedChannel(channel, from.id);
     // [id][sender][connection incarnation][opaque payload]
@@ -683,9 +711,13 @@ void Server::Relay(Player& from, uint8_t channel, const uint8_t* data, size_t si
     pkt->data[1] = from.id;
     memcpy(pkt->data+2,&from.peer->connectID,4);
     memcpy(pkt->data+6,data+1,size-1);
-    bool sent = false;
+    // Keep the producer's world/ref/lease/body bytes intact. First birth's
+    // wire lease0 is certified by the preceding reliable canonical grant;
+    // subsequent simulation mutations already matched their granted lease.
+    bool sent = false;unsigned recipients=0;
     for (auto& o : m_players) {
-        if (!o.joined || &o == &from) continue;
+        if (!o.joined || (&o == &from&&!admission.echoSelf)) continue;
+        ++recipients;
         diagnostic.recipient=o.id;
         // states for a player still loading or in the menu piled up there and came stale all at once (voice goes on:
         // players talk while one of them loads)
@@ -693,7 +725,16 @@ void Server::Relay(Player& from, uint8_t channel, const uint8_t* data, size_t si
         int outcome=enet_peer_send(o.peer,channel,pkt);passenger_trace::Emit(diagnostic,passenger_trace::Relay,outcome?passenger_trace::SendFailed:passenger_trace::Ok,proto::kServerId);
         sent = outcome == 0 || sent;  // a peer going away takes nothing
     }
+    if(!recipients)passenger_trace::Emit(diagnostic,passenger_trace::Relay,passenger_trace::NoRecipients,proto::kServerId);
     if (!sent) enet_packet_destroy(pkt);
+}
+
+void Server::SendAuthorityDecisions(){
+    for(auto&delivery:m_authority.TakeDeliveries()){
+        Writer w(S_ENTITY_AUTHORITY);delivery.notice.Write(w);
+        if(delivery.to==authority::NoOwner)Broadcast(CH_RELIABLE,w);
+        else if(auto*p=FindById(delivery.to);p&&p->joined&&p->peer)net::Send(p->peer,CH_RELIABLE,w);
+    }
 }
 
 void Server::SendChat(Player* to, uint8_t fromId, uint32_t rgba, const std::string& text, const std::string& en) {

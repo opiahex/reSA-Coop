@@ -531,6 +531,9 @@ public:
         for (auto& [id, l] : g_looks) {
             RemotePlayer* rp = Players::Instance().Get(id);
             if (!rp || !rp->ped || (rp->pedHandle == l.appliedTo && !rp->lookStale) || rp->ped->InVehicle()) continue;
+            // Dress rebuilds the native ped state; keep a corpse's pending look for its next live body.
+            if (rp->deadShown || (rp->state.flags & OnFootState::F_DEAD) || rp->ped->Health() <= 0 ||
+                rp->ped->PedState() == 54 || rp->ped->PedState() == 55) continue;
             if(!lookBudget||now-rp->spawnedAt<500||!rp->ped->RwObject()||!rp->ped->ClothesDesc())continue;
             int model = l.model;
             if (model >= 290 && model <= 299) {  // here it is in whichever slot holds that name

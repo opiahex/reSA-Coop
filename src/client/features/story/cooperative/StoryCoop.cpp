@@ -77,7 +77,7 @@ CPed* Player(uint8_t id){if(id==Net().MyId())return core::IsPlayerReady()?FindPl
 bool Participant(uint8_t id){auto*p=Player(id);return p&&IsPedValid(p)&&p->Health()>0;}
 uint8_t PlayerId(CPed*p){if(p==FindPlayerPed(0))return Net().MyId();auto*rp=Players::Instance().FindByPed(p);return rp?rp->id:255;}
 int NativeRemoteHandle(){int handle=-1;if(Cmd(0x0241).I(0).Run())Cmd(0x0484).I(0).Out(&handle).Run();return handle;}
-bool NativeRemoteIs(const Role&r){auto*n=Vehicles::Instance().Find(r.vehicle);return n&&Vehicles::Alive(*n)&&r.generation&&Net().EntityGeneration(ENTITY_VEHICLE,r.vehicle)==r.generation&&NativeRemoteHandle()==n->handle;}
+bool NativeRemoteIs(const Role&r){auto*n=Vehicles::Instance().Find(r.vehicle);return n&&Vehicles::Alive(*n)&&r.generation&&Net().EntityGeneration(ENTITY_VEHICLE,r.vehicle)==r.generation&&Vehicles::Instance().StoryRemoteReady(*n,Net().MyId())&&NativeRemoteHandle()==n->handle;}
 bool ScenePoint(const CVector& p) {
     return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z) &&
            std::fabs(p.x) <= 20000 && std::fabs(p.y) <= 20000 && std::fabs(p.z) <= 5000;
@@ -575,6 +575,9 @@ void LocalRole(){
     }
     auto&r=roles[Net().MyId()];
     if(declinedAssignment&&declinedAssignment==r.assignment){DeclineLocalRole();return;}
+    // A temporary canonical stop is not the participant leaving native RC.
+    if(r.mode==3)if(auto*n=Vehicles::Instance().Find(r.vehicle);n&&Vehicles::Alive(*n)&&
+        r.generation&&Net().EntityGeneration(ENTITY_VEHICLE,r.vehicle)==r.generation&&!Vehicles::Instance().StoryRemoteReady(*n,Net().MyId()))return;
     if(localRoleRun==run&&localAssignment==r.assignment&&localMode){
         auto*me=FindPlayerPed(0);auto*n=Vehicles::Instance().Find(r.vehicle);
         bool left=(localMode==2||localMode==5)?(!me->InVehicle()||!n||me->Vehicle()!=n->veh):localMode==3?!NativeRemoteIs(r):localMode==4?!me->AttachedTo():false;

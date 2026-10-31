@@ -10,6 +10,7 @@
 #include "shared/game/Anim.h"
 #include "shared/game/PlayerContext.h"
 #include "shared/lib/memory/Memory.h"
+#include "shared/api/sync-diagnostics/Intelligence.h"
 #include "shared/lib/sync/PopulationShare.h"
 #include "common/lib/log/Log.h"
 #include "common/lib/util/Util.h"
@@ -136,15 +137,21 @@ void __fastcall UpdateWanted(void*w,void*edx){
 }
 using CopFn=void(__fastcall*)(CPed*,void*);CopFn originalCop=nullptr;
 void __fastcall CopControl(CPed*p,void*edx){
+    if(auto*n=p?Peds::Instance().Find(p):nullptr;n&&n->authorityHeld&&n->ped==p&&n->handle>=0&&GetPed(n->handle)==p&&GetPedRef(p)==n->handle)return;
     if(!AmbientCop(p))return originalCop(p,edx);
     Context c(SelectTarget(p));originalCop(p,edx);
 }
 using IntelFn=void(__fastcall*)(void*,void*);IntelFn originalIntel=nullptr;
 void __fastcall Intelligence(void*intel,void*edx){
+    task_lifecycle::native::ObserveIntelligenceCall(intel,edx,__builtin_return_address(0),[](void*intel,void*edx){
     auto*p=Field<CPed*>(intel,0);
+    // A stopped/preparing simulator must not regenerate a default task while
+    // the canonical owner is waiting for the native-ready commit.
+    if(auto*n=p?Peds::Instance().Find(p):nullptr;n&&n->authorityHeld&&n->ped==p&&n->handle>=0&&GetPed(n->handle)==p&&GetPedRef(p)==n->handle)return;
     ObservePoliceRopeIntelligence(p);
     if(!AmbientCop(p))return originalIntel(intel,edx);
     Context c(SelectTarget(p));originalIntel(intel,edx);
+    });
 }
 using CarFn=void(__cdecl*)(CVehicle*);CarFn originalCar=nullptr;
 void __cdecl CarAI(CVehicle*v){
@@ -224,6 +231,7 @@ void GeneratePoliceAwareTraffic(void(*generate)()){
 }
 void ProcessPoliceVehicle(game::CVehicle*v,void(*process)(game::CVehicle*)){
     auto*n=v?Vehicles::Instance().Find(v):nullptr;
+    if(n&&n->authorityHeld&&Vehicles::Alive(*n))return;
     if(!v||!(v->VehicleFlagsLo()&1)||v->CreatedBy()!=1||(n&&Vehicles::Instance().IsMirror(*n)))return process(v);
     Context c(SelectTarget(v->Driver()?static_cast<CEntity*>(v->Driver()):v));process(v);
 }

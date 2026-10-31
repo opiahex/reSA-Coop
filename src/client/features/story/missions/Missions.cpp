@@ -173,27 +173,33 @@ bool TraceReadable(const void* address,size_t size) noexcept {
     return p>=start&&p-start<m.RegionSize&&size<=m.RegionSize-(p-start);
 }
 struct ScopedScmTrace {
-    flight::Event event{};bool active=false;bool process=false;
+    flight::Event event{};bool active=false;bool process=false;bool admitted=false;
     ScopedScmTrace(void* script,bool isProcess,bool shared,int opcode) noexcept:process(isProcess){
         if(!flight::Enabled())return;
-        const uint32_t gameThread=core::DiagnosticGameThreadId();
-        if(!gameThread||gameThread!=GetCurrentThreadId()){
-            active=true;event.span=flight::NextDiagnosticSpan();event.detailKnown|=flight::SpanKnown;
-            event.stage=isProcess?flight::ScmProcessEnter:flight::ScmCommandEnter;
-            event.reason=gameThread?1:2; // 1: different thread, 2: not yet bound
-            if(!isProcess){event.opcode=(uint16_t)(opcode&0x7fff);event.detailKnown|=flight::OpcodeKnown;}
-            (void)flight::Record(event);return;
-        }
-        const auto run=StoryRunId();auto it=g_storyThreads.find(script);
-        if(!isProcess)shared=g_currentScript&&script==g_currentScript&&run&&it!=g_storyThreads.end()&&it->second.run==run;
-        if(!shared&&(isProcess||g_currentScript))return;
         active=true;event.span=flight::NextDiagnosticSpan();event.detailKnown|=flight::SpanKnown;
         event.stage=isProcess?flight::ScmProcessEnter:flight::ScmCommandEnter;
+        if(!isProcess){
+            event.opcode=(uint16_t)(opcode&0x7fff);event.detailKnown|=flight::OpcodeKnown;
+            if(((uint32_t)opcode&~0xffffu)||event.opcode>0x0A4E)event.reason=3;
+        }
+        const uint32_t gameThread=core::DiagnosticGameThreadId();
+        if(!gameThread||gameThread!=GetCurrentThreadId()){
+            event.reason=gameThread?1:2; // 1: different thread, 2: not yet bound
+            admitted=flight::AdmitScmSpan(event.span,true);
+            (void)flight::Record(event);return;
+        }
+        // Most commands are intentionally unobserved. Decide before map/native
+        // memory queries; the handler still runs and its errors remain visible.
+        admitted=flight::AdmitScmSpan(event.span,event.reason!=0);
+        if(!admitted)return;
+        const auto run=StoryRunId();auto it=g_storyThreads.find(script);
+        if(!isProcess)shared=g_currentScript&&script==g_currentScript&&run&&it!=g_storyThreads.end()&&it->second.run==run;
+        // Ordinary and guest scripts need diagnostics too. Shared ownership
+        // qualifies mission metadata; it must not suppress the trace itself.
         if(shared&&run){event.missionRun=run;event.missionPhase=CooperativeStoryPhase();event.detailKnown|=flight::MissionKnown;}
         if(Net().Online()){event.context.world=Net().WorldEpoch();event.context.incarnation=Net().MyIncarnation();event.context.source=Net().MyId();event.localPeer=Net().MyId();
             if(shared){event.owner=Net().MyId();event.detailKnown|=flight::OwnerKnown;}}
         if(shared&&it!=g_storyThreads.end()&&run&&it->second.run==run&&it->second.birth){event.scriptBirth=it->second.birth;event.detailKnown|=flight::ScriptBirthKnown;}
-        if(!isProcess){event.opcode=(uint16_t)(opcode&0x7fff);event.detailKnown|=flight::OpcodeKnown;}
         if(script){
             uintptr_t p=(uintptr_t)script;void* base=nullptr;void* ip=nullptr;SIZE_T got=0;
             if(p<=UINTPTR_MAX-0x14-sizeof(void*)&&TraceReadable((void*)(p+0x10),sizeof(void*)*2)&&
@@ -210,7 +216,23 @@ struct ScopedScmTrace {
         }
         (void)flight::Record(event);
     }
-    ~ScopedScmTrace() noexcept {if(active){event.stage=process?flight::ScmProcessLeave:flight::ScmCommandLeave;(void)flight::Record(event);}}
+    int8_t Returned(int8_t result,bool forwarded=true) noexcept {
+        // A dispatcher return controls the interpreter; it is not mission or
+        // condition success. Keep foreign-thread/unbound reasons unchanged.
+        if(active&&!event.reason)event.reason=(forwarded?0x100u:0x200u)|(uint8_t)result;
+        return result;
+    }
+    ~ScopedScmTrace() noexcept {if(active){
+        event.stage=process?flight::ScmProcessLeave:flight::ScmCommandLeave;
+        if(!process&&!event.reason)event.reason=0x300; // return not observed
+        if(!admitted){
+            if(process||(!event.reason)||(event.reason<0x300&&(event.reason&0xff)<2))return;
+            // Entry deliberately omitted; only span/opcode are known. Do not
+            // read a script that may already have been destroyed by the handler.
+            event.reason|=0x400;
+        }
+        (void)flight::Record(event);
+    }}
 };
 void BindStoryThread(void* script) {
     auto i = g_storyThreads.find(script);
@@ -822,7 +844,7 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
             if (HandleAirportGateCommand(script, chainOp, parameters, value)) {
                 Field<uint8_t*>(script, 0x14) = next;
                 if (chainOp == 0x0018 || chainOp == 0x0038 || chainOp == 0x034E || chainOp == 0x0471) CallMethod<0x4859D0>(script, value);
-                return 0;
+                return trace.Returned(0,false);
             }
         }
     }
@@ -842,12 +864,12 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
         // atomic entry finish; the next fade/control gate waits at its result.
         if(relocated&&(chainOp==0x05EB||chainOp==0x0705||chainOp==0x085E))gate=false;
         if(gate&&relocated)SendStoryWarp(g_processStoryPed);
-        if(gate&&!AwaitCooperativeStage(script,chainOp,source)){Field<uint8_t*>(script,0x14)-=2;Field<uint32_t>(script,0xCC)=Ref<uint32_t>(addr::TimeInMs)+1;return 1;}
+        if(gate&&!AwaitCooperativeStage(script,chainOp,source)){Field<uint8_t*>(script,0x14)-=2;Field<uint32_t>(script,0xCC)=Ref<uint32_t>(addr::TimeInMs)+1;return trace.Returned(1,false);}
     }
     if(Net().Online()&&script==g_currentScript&&chainOp==0x01B4){
         alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);uint32_t saved[32];memcpy(saved,(void*)0xA43C78,sizeof saved);
         CallMethod<0x464080>(copy,2);int player=Ref<int32_t>(0xA43C78),enabled=Ref<int32_t>(0xA43C7C);memcpy((void*)0xA43C78,saved,sizeof saved);
-        if(player==0&&!enabled&&!BeginNativeInteraction(script)){Field<uint8_t*>(script,0x14)-=2;Field<uint32_t>(script,0xCC)=Ref<uint32_t>(addr::TimeInMs)+1;return 1;}
+        if(player==0&&!enabled&&!BeginNativeInteraction(script)){Field<uint8_t*>(script,0x14)-=2;Field<uint32_t>(script,0xCC)=Ref<uint32_t>(addr::TimeInMs)+1;return trace.Returned(1,false);}
         if(player==0&&enabled)EndNativeInteraction(script);
     }
     if (story && chainOp == 0x0672) { // TASK_DESTROY_CAR: retain the car which caused the story condition.
@@ -865,7 +887,7 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
             Field<uint8_t*>(script, 0x14) = args;
             auto result = g_objectCommands[Group](script, edx, opcode);
             Field<uint8_t*>(script, 0x14) = next;
-            return result;
+            return trace.Returned(result);
         }
     }
     int follow=chainOp==0x05BF?3:(chainOp==0x0639||chainOp==0x0859)?2:(chainOp==0x0677||chainOp==0x0823)?4:0;
@@ -876,7 +898,7 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
         if(actor>=0&&n&&n->owner==Net().MyId()&&npc->CreatedBy()==PED_MISSION&&npc->Health()>0){
             parameters[1]=actor;uint8_t args[20]{};for(int i=0;i<follow;++i){args[i*5]=1;memcpy(args+i*5+1,parameters+i,4);}
             Field<uint8_t*>(script,0x14)=args;auto result=g_objectCommands[Group](script,edx,opcode);Field<uint8_t*>(script,0x14)=next;
-            LOGD("Story follow-up opcode=%04X npc=%d participant=%d",chainOp,parameters[0],actor);return result;
+            LOGD("Story follow-up opcode=%04X npc=%d participant=%d",chainOp,parameters[0],actor);return trace.Returned(result);
         }
     }
     int participantCheck = chainOp == 0x0448 ? 2 : (chainOp == 0x044B || chainOp == 0x047A) ? 1 : 0;
@@ -898,7 +920,7 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
             Field<uint8_t*>(script, 0x14) = args;
             auto result = g_objectCommands[Group](script, edx, opcode);
             Field<uint8_t*>(script, 0x14) = next;
-            return result;
+            return trace.Returned(result);
         }
     }
     if (story && chainOp == 0x0605) {
@@ -918,7 +940,7 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
         if (CooperativeStoryAnimation(script, actor, name, block, blend,
                                       parameters[1], parameters[2], parameters[3], parameters[4], parameters[5])) {
             Field<uint8_t*>(script, 0x14) = next;
-            return 0;
+            return trace.Returned(0,false);
         }
     }
     auto query=StoryContinuationQuery(chainOp);
@@ -929,13 +951,13 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
         int actor=CooperativeStoryActor(script,chainOp,cj);
         if(actor>=0&&descriptors){
             auto*ped=GetPed(actor);bool carQuery=query.vehicle;auto*vehicle=CooperativeStoryVehicle(script);
-            if(!ped||(carQuery&&!vehicle))return g_objectCommands[Group](script,edx,opcode);
+            if(!ped||(carQuery&&!vehicle))return trace.Returned(g_objectCommands[Group](script,edx,opcode));
             auto*previous=ped->Vehicle();bool wasInside=ped->InVehicle();
             struct RestoreVehicleQuery{CPed*ped;CVehicle*previous;bool inside,apply;~RestoreVehicleQuery(){if(!apply)return;Field<CVehicle*>(ped,0x58C)=previous;auto&flags=Field<uint32_t>(ped,0x46C);flags=(flags&~0x100u)|(inside?0x100u:0);}} restore{ped,previous,wasInside,carQuery};
             if(carQuery){Field<CVehicle*>(ped,0x58C)=vehicle;Field<uint32_t>(ped,0x46C)|=0x100u;}
             uint8_t args[32]{};params[0]=actor;for(int i=0;i<query.inputs;++i){args[i*5]=1;memcpy(args+i*5+1,params+i,4);}memcpy(args+query.inputs*5,out,outputs*3);
             Field<uint8_t*>(script,0x14)=args;auto result=g_objectCommands[Group](script,edx,opcode);Field<uint8_t*>(script,0x14)=out+outputs*3;
-            LOGD("Story chain opcode=%04X actor=%d originalCJ=%d",chainOp,actor,cj);return result;
+            LOGD("Story chain opcode=%04X actor=%d originalCJ=%d",chainOp,actor,cj);return trace.Returned(result);
         }
     }
     if(story&&chainOp==0x02E3){
@@ -948,7 +970,7 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
             if(out&&(uint8_t*)out>=copy&&(uint8_t*)out<copy+sizeof copy)out=(int32_t*)((uint8_t*)script+((uint8_t*)out-copy));}
         auto result=g_objectCommands[Group](script,edx,opcode);
         float speed;if(out&&CooperativeStoryContactSpeed(script,car,speed))memcpy(out,&speed,4);
-        return result;
+        return trace.Returned(result);
     }
     if(story&&(chainOp==0x01BD||chainOp==0x0801)){
         alignas(16)uint8_t copy[0xE0];memcpy(copy,script,sizeof copy);
@@ -956,7 +978,7 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
         if(*ip==2||*ip==3){out=CallMethod<0x464790,int32_t*>(copy,0);if(out&&(uint8_t*)out>=copy&&(uint8_t*)out<copy+sizeof copy)out=(int32_t*)((uint8_t*)script+((uint8_t*)out-copy));}
         auto result=g_objectCommands[Group](script,edx,opcode);
         if(out){if(chainOp==0x01BD)*out=(int32_t)CooperativeStoryClock();else{float fov;if(CooperativePhotoFov(fov))memcpy(out,&fov,4);}}
-        return result;
+        return trace.Returned(result);
     }
     if(story&&(chainOp==0x004E||chainOp==0x00D8)){CancelCooperativeStage(script);ClearCooperativeStoryScript(script);}
     if(story&&(chainOp==0x016A||chainOp==0x03CB||chainOp==0x04BB||chainOp==0x01B4)){
@@ -1060,10 +1082,28 @@ template<int Group>int8_t __fastcall HookStoryObjects(void*script,void*edx,int o
     if(killOutput)*killOutput=std::clamp<int64_t>((int64_t)*killOutput+CooperativeGuestKills(killModel),0,1000000);
     if(rcOverride||coop){Field<uint8_t>(script,0xC5)=before;Field<int16_t>(script,0xD0)=logic;CallMethod<0x4859D0>(script,rcOverride?rcValue:true);}
     if(object.create){int h=Ref<int32_t>(0xA43C78);auto*o=GetObject(h);if(o&&(object.model<0||o->ModelIndex()==object.model)){ShareMissionObject(h);if(story)ArmCooperativeStage(script);}}
-    return result;
+    return trace.Returned(result);
 }
 int8_t __fastcall HookCommands100(void*,void*,int);
 int8_t __fastcall HookCommands200(void*,void*,int);
+template<int Group>bool InstallDiagnosticCommandGroup(uintptr_t native){
+    constexpr uintptr_t slot=0x8A6168+Group*4;
+    auto current=mem::ReadVTableSlot((void**)0x8A6168,Group);
+    if(!current.ok||!mem::ExecutableAddress(current.value)){
+        (void)mem::TrySwapScmSlot(slot,(void*)&HookStoryObjects<Group>,(void*)native,nullptr,nullptr);
+        return false;
+    }
+    // Preserve an executable third-party dispatcher as the previous chain.
+    // The registry labels that chain unverified rather than claiming its ABI.
+    const auto prior=g_objectCommands[Group];
+    const auto result=mem::TrySwapScmSlot(slot,(void*)&HookStoryObjects<Group>,(void*)native,current.value,
+                                        (void**)&g_objectCommands[Group]);
+    // Memory publishes the previous chain before changing the slot so a
+    // concurrently entered hook can forward safely. An unchanged failure can
+    // restore the old cache; an indeterminate slot must keep that safe chain.
+    if(result.state==mem::PatchState::Unchanged)g_objectCommands[Group]=prior;
+    return result.state==mem::PatchState::Installed;
+}
 bool InstallStoryObjectCommands(){
     // Slots 1 and 2 already contain our lower-level special wrappers. Compare
     // those exact pointers before installing the outer story wrapper.
@@ -1073,29 +1113,31 @@ bool InstallStoryObjectCommands(){
     }
     if(mem::TrySwapScmSlot(0x8A616C,(void*)&HookStoryObjects<1>,(void*)0x466DE0,a.value,(void**)&g_objectCommands[1],true).state!=mem::PatchState::Installed||
        mem::TrySwapScmSlot(0x8A6170,(void*)&HookStoryObjects<2>,(void*)0x469390,b.value,(void**)&g_objectCommands[2],true).state!=mem::PatchState::Installed)return false;
-    g_objectCommands[0]=Ref<CommandsFn>(0x8A6168+0*4);mem::Put(0x8A6168+0*4,&HookStoryObjects<0>);
-    g_objectCommands[3]=Ref<CommandsFn>(0x8A6168+3*4);mem::Put(0x8A6168+3*4,&HookStoryObjects<3>);
-    g_objectCommands[4]=Ref<CommandsFn>(0x8A6168+4*4);mem::Put(0x8A6168+4*4,&HookStoryObjects<4>);
-    g_objectCommands[6]=Ref<CommandsFn>(0x8A6168+6*4);mem::Put(0x8A6168+6*4,&HookStoryObjects<6>);
-    g_objectCommands[7]=Ref<CommandsFn>(0x8A6168+7*4);mem::Put(0x8A6168+7*4,&HookStoryObjects<7>);
-    g_objectCommands[8]=Ref<CommandsFn>(0x8A6168+8*4);mem::Put(0x8A6168+8*4,&HookStoryObjects<8>);
-    g_objectCommands[9]=Ref<CommandsFn>(0x8A6168+9*4);mem::Put(0x8A6168+9*4,&HookStoryObjects<9>);
-    g_objectCommands[10]=Ref<CommandsFn>(0x8A6168+10*4);mem::Put(0x8A6168+10*4,&HookStoryObjects<10>);
-    g_objectCommands[11]=Ref<CommandsFn>(0x8A6168+11*4);mem::Put(0x8A6168+11*4,&HookStoryObjects<11>);
+    if(!InstallDiagnosticCommandGroup<0>(0X465E60))return false;
+    if(!InstallDiagnosticCommandGroup<3>(0X47C100))return false;
+    if(!InstallDiagnosticCommandGroup<4>(0X47D210))return false;
+    if(!InstallDiagnosticCommandGroup<6>(0X47F370))return false;
+    if(!InstallDiagnosticCommandGroup<7>(0X47FA30))return false;
+    if(!InstallDiagnosticCommandGroup<8>(0X481300))return false;
+    if(!InstallDiagnosticCommandGroup<9>(0X483BD0))return false;
+    if(!InstallDiagnosticCommandGroup<10>(0X489500))return false;
+    if(!InstallDiagnosticCommandGroup<11>(0X48A320))return false;
 
-    g_objectCommands[12]=Ref<CommandsFn>(0x8A6168+12*4);mem::Put(0x8A6168+12*4,&HookStoryObjects<12>);
-    g_objectCommands[13]=Ref<CommandsFn>(0x8A6168+13*4);mem::Put(0x8A6168+13*4,&HookStoryObjects<13>);
-    g_objectCommands[14]=Ref<CommandsFn>(0x8A6168+14*4);mem::Put(0x8A6168+14*4,&HookStoryObjects<14>);
-    g_objectCommands[15]=Ref<CommandsFn>(0x8A6168+15*4);mem::Put(0x8A6168+15*4,&HookStoryObjects<15>);
-    g_objectCommands[16]=Ref<CommandsFn>(0x8A6168+16*4);mem::Put(0x8A6168+16*4,&HookStoryObjects<16>);
-    g_objectCommands[18]=Ref<CommandsFn>(0x8A6168+18*4);mem::Put(0x8A6168+18*4,&HookStoryObjects<18>);
-    g_objectCommands[19]=Ref<CommandsFn>(0x8A6168+19*4);mem::Put(0x8A6168+19*4,&HookStoryObjects<19>);
-    g_objectCommands[20]=Ref<CommandsFn>(0x8A6168+20*4);mem::Put(0x8A6168+20*4,&HookStoryObjects<20>);
-    g_objectCommands[21]=Ref<CommandsFn>(0x8A6168+21*4);mem::Put(0x8A6168+21*4,&HookStoryObjects<21>);
-    g_objectCommands[22]=Ref<CommandsFn>(0x8A6168+22*4);mem::Put(0x8A6168+22*4,&HookStoryObjects<22>);
-    g_objectCommands[23]=Ref<CommandsFn>(0x8A6168+23*4);mem::Put(0x8A6168+23*4,&HookStoryObjects<23>);
-    g_objectCommands[24]=Ref<CommandsFn>(0x8A6168+24*4);mem::Put(0x8A6168+24*4,&HookStoryObjects<24>);
-    g_objectCommands[25]=Ref<CommandsFn>(0x8A6168+25*4);mem::Put(0x8A6168+25*4,&HookStoryObjects<25>);
+    if(!InstallDiagnosticCommandGroup<12>(0X48B590))return false;
+    if(!InstallDiagnosticCommandGroup<13>(0X48CDD0))return false;
+    if(!InstallDiagnosticCommandGroup<14>(0X48EAA0))return false;
+    if(!InstallDiagnosticCommandGroup<15>(0X490DB0))return false;
+    if(!InstallDiagnosticCommandGroup<16>(0X493FE0))return false;
+    if(!InstallDiagnosticCommandGroup<17>(0x496E00))return false;
+    if(!InstallDiagnosticCommandGroup<18>(0X46D050))return false;
+    if(!InstallDiagnosticCommandGroup<19>(0X46B460))return false;
+    if(!InstallDiagnosticCommandGroup<20>(0X472310))return false;
+    if(!InstallDiagnosticCommandGroup<21>(0X470A90))return false;
+    if(!InstallDiagnosticCommandGroup<22>(0X474900))return false;
+    if(!InstallDiagnosticCommandGroup<23>(0X4762D0))return false;
+    if(!InstallDiagnosticCommandGroup<24>(0X478000))return false;
+    if(!InstallDiagnosticCommandGroup<25>(0X47A760))return false;
+    if(!InstallDiagnosticCommandGroup<26>(0x479DA0))return false;
     return true;
 }
 
@@ -1121,7 +1163,7 @@ int8_t __fastcall HookCommands500(void*script,void*edx,int opcode){
     auto result=g_origCommands500(script,edx,opcode);
     if(opcode==0x020A)LOGD("Story lock opcode: script=%p current=%p handle=%d",script,g_currentScript,handle);
     if(handle>=0)if(auto*v=GetVehicle(handle))Vehicles::Instance().ShareScriptLock(v);
-    return result;
+    return trace.Returned(result);
 }
 CommandsFn g_origCommands200 = nullptr;
 int8_t __fastcall HookCommands200(void* script, void* edx, int opcode) {

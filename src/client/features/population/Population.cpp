@@ -11,6 +11,7 @@
 #include "features/population/Population.h"
 #include "shared/api/police/Police.h"
 #include "common/lib/log/Log.h"
+#include "common/lib/diagnostics/FlightRecorder.h"
 #include "common/lib/util/Util.h"
 #include "entities/ped/Peds.h"
 #include "entities/activity/Activities.h"
@@ -36,12 +37,58 @@ CVector g_populationCentre;
 int8_t g_populationArea=0;
 uint64_t g_cullAt=0;
 
+enum PopulationDiagnosticReason:uint16_t { PG_OK=0,PG_NATIVE_RETURNED,PG_SUPPRESSED,PG_POOL_UNAVAILABLE,PG_OBSERVATION_BUSY,PG_OBSERVATION_BUDGET,PG_CANCELLED,PG_CONTEXT };
+flight::Context PopulationDiagnosticContext(){flight::Context c{};c.source=Net().MyId();c.incarnation=Net().MyIncarnation();c.world=Net().WorldEpoch();return c;}
+void RecordPopulationDecision(uint16_t stage,uint16_t reason,unsigned operation,uint8_t viewer,uint8_t previous,uint8_t leader,int area,bool requested=false,bool forwarded=false,const flight::Context*origin=nullptr){
+    if(!flight::Enabled())return;flight::Event e{};e.context=origin?*origin:PopulationDiagnosticContext();e.stage=stage;e.reason=reason;e.localPeer=Net().MyId();e.context.recipient=viewer;
+    flight::AddUnsigned(e,flight::Metric::Operation,operation);
+    flight::AddUnsigned(e,flight::Metric::PreviousLeader,previous);flight::AddUnsigned(e,flight::Metric::ZoneLeader,leader);
+    if(stage!=782&&area>=0&&area<=18)flight::AddSigned(e,flight::Metric::ObservedArea,area);
+    flight::AddUnsigned(e,flight::Metric::RequestedDecision,requested);flight::AddUnsigned(e,flight::Metric::ObservedDecision,forwarded);
+    (void)flight::Record(e);
+}
+struct PopulationGeneratorDiagnosticState {uint64_t last=0;bool known=false,forwarded=false;};
+std::array<PopulationGeneratorDiagnosticState,6>populationGeneratorDiagnostics{};
+int DiagnosticPopulationCount(uint8_t kind){
+    auto*p=kind==ENTITY_PED?PedPool():VehiclePool();if(!p||!p->byteMap||p->size<0||p->size>4096)return -1;
+    int count=0;for(int i=0;i<p->size;++i)if(p->byteMap[i]>=0)++count;return count;
+}
+struct PopulationGeneratorObservation {
+    flight::Context context{};unsigned operation=0;uint8_t kind=0;int before=-1;bool active=false,forwarded=false,requested=false,changed=false;
+    PopulationGeneratorObservation(unsigned op,uint8_t type,bool requested,bool passed):operation(op),kind(type),forwarded(passed),requested(requested){
+        if(!flight::Enabled()||op<1||op>populationGeneratorDiagnostics.size())return;
+        context=PopulationDiagnosticContext();auto&d=populationGeneratorDiagnostics[op-1];changed=!d.known||d.forwarded!=passed;
+        d.known=true;d.forwarded=passed;
+        if(changed)RecordPopulationDecision(782,PG_OK,op,Net().MyId(),255,PopulationSources()[Net().MyId()<3?Net().MyId():0],g_populationArea,requested,passed);
+        if(!passed||(!changed&&NowMs()-d.last<1000))return;d.last=NowMs();
+        auto admission=flight::AdmitNativeObservation(context,783,Net().MyId(),false);
+        if(admission!=flight::NativeAdmission::Admitted)return;
+        before=DiagnosticPopulationCount(type);active=before>=0;
+        if(!active)RecordPopulationDecision(782,PG_POOL_UNAVAILABLE,op,Net().MyId(),255,255,g_populationArea,requested,passed);
+    }
+    ~PopulationGeneratorObservation(){
+        if(!flight::Enabled())return;
+        if(changed)RecordPopulationDecision(782,forwarded?PG_NATIVE_RETURNED:PG_SUPPRESSED,operation,Net().MyId(),255,255,g_populationArea,requested,forwarded,&context);
+        if(!active)return;
+        if(context.source!=Net().MyId()||context.incarnation!=Net().MyIncarnation()||context.world!=Net().WorldEpoch()){
+            RecordPopulationDecision(782,PG_CONTEXT,operation,Net().MyId(),255,255,g_populationArea,requested,forwarded,&context);return;
+        }
+        auto admission=flight::AdmitNativeObservation(context,783,Net().MyId(),false);if(admission!=flight::NativeAdmission::Admitted)return;
+        int after=DiagnosticPopulationCount(kind);if(after<0){RecordPopulationDecision(782,PG_POOL_UNAVAILABLE,operation,Net().MyId(),255,255,g_populationArea);return;}
+        flight::Event e{};e.context=context;e.stage=783;e.localPeer=Net().MyId();
+        flight::AddUnsigned(e,flight::Metric::Operation,operation);flight::AddUnsigned(e,flight::Metric::EntityKind,kind);
+        flight::AddUnsigned(e,flight::Metric::BeforeCount,(uint32_t)before);flight::AddUnsigned(e,flight::Metric::AfterCount,(uint32_t)after);
+        flight::AddUnsigned(e,flight::Metric::RequestedDecision,requested);flight::AddUnsigned(e,flight::Metric::ObservedDecision,forwarded);(void)flight::Record(e);
+    }
+};
+
 int LocalWantedLevel() {
     void* wanted=Call<0x56E230,void*>(-1);
     return wanted?Field<int32_t>(wanted,0x2C):0;
 }
 
 void UpdateSuppression() {
+    const auto previousSources=PopulationSources();const auto previousViewers=PopulationViewers();
     bool want = false;
     uint8_t source=255;
     PopulationViewers()={};PopulationHost()=Net().HostId();
@@ -64,6 +111,14 @@ void UpdateSuppression() {
         Ref<uint8_t>(0xC0EC23) = 2;  // CPopulation::m_CountDownToPedsAtStart
         Ref<uint8_t>(0x9690C0) = 2;  // CCarCtrl::CountDownToCarsAtStart
     }
+    if(flight::Enabled()){
+        for(size_t i=0;i<3;++i){const auto&v=PopulationViewers()[i];const auto&before=previousViewers[i];
+            if(previousSources[i]!=PopulationSources()[i]||v.active!=before.active||v.area!=before.area)
+                RecordPopulationDecision(780,PG_OK,1,(uint8_t)i,previousSources[i],PopulationSources()[i],v.active?v.area:-1,v.active,v.active&&v.canGenerate);
+        }
+        const auto localArea=Net().MyId()<3&&PopulationViewers()[Net().MyId()].active?PopulationViewers()[Net().MyId()].area:-1;
+        if(want!=g_suppress||(want&&source!=NearbyPopulationShare().source))RecordPopulationDecision(781,PG_OK,2,Net().MyId(),NearbyPopulationShare().source,source,localArea,g_suppress,want);
+    }
     g_suppress = want;
     NearbyPopulationShare()={want,g_populationCentre,g_populationArea,source};
 }
@@ -71,6 +126,7 @@ void UpdateSuppression() {
 using UpdatePopFn = void(__cdecl*)(bool);
 UpdatePopFn g_origPopUpdate = nullptr;
 void __cdecl HookPopulationUpdate(bool generate) {
+    PopulationGeneratorObservation diagnostic(1,ENTITY_PED,generate,generate&&!g_suppress);
     // Update(false) still runs GeneratePedsAtStartOfGame if the countdown is
     // nonzero. Do not create a local population burst behind the shared one.
     if(g_suppress)Ref<uint8_t>(0xC0EC23)=0;
@@ -80,6 +136,7 @@ void __cdecl HookPopulationUpdate(bool generate) {
 using VoidFn = void(__cdecl*)();
 VoidFn g_origGenerateRandomCars = nullptr;
 void __cdecl HookGenerateRandomCars() {
+    PopulationGeneratorObservation diagnostic(2,ENTITY_VEHICLE,true,!g_suppress);
     if (g_suppress) {PopulationBudgetExcluded()=0;return;}
     // GenerateOneRandomCar (0x4300D3..0x430132) includes NumMissionCars
     // in its global density limit. Network proxies use that classification
@@ -101,7 +158,7 @@ void __cdecl HookGenerateRandomCars() {
 }
 
 VoidFn g_origPlaneGeneration=nullptr;
-void __cdecl HookPlaneGeneration(){if(!g_suppress)g_origPlaneGeneration();}
+void __cdecl HookPlaneGeneration(){PopulationGeneratorObservation diagnostic(3,ENTITY_VEHICLE,true,!g_suppress);if(!g_suppress)g_origPlaneGeneration();}
 VoidFn g_origCarGenerators = nullptr;
 VoidFn g_origRemoveAllPeds = nullptr;
 void __cdecl HookRemoveAllRandomPeds(){
@@ -116,6 +173,7 @@ void __cdecl HookRemoveAllRandomPeds(){
     }
 }
 void __cdecl HookCarGeneratorsProcess() {
+    PopulationGeneratorObservation diagnostic(4,ENTITY_VEHICLE,true,!g_suppress);
     if (g_suppress) return;
     g_origCarGenerators();
 }
@@ -214,13 +272,15 @@ bool OtherAuthorityInside(const CVector& at) {
 using PopulateInteriorFn=void(__cdecl*)(int,CVector);
 PopulateInteriorFn g_origPopulateInterior=nullptr;
 void __cdecl HookPopulateInterior(int count,CVector at) {
-    if(!OtherAuthorityInside(at))g_origPopulateInterior(count,at);
+    const bool generate=!OtherAuthorityInside(at);PopulationGeneratorObservation diagnostic(5,ENTITY_PED,true,generate);
+    if(generate)g_origPopulateInterior(count,at);
 }
 using SetupPedsFn=void(__fastcall*)(void*,void*);
 SetupPedsFn g_origSetupInteriorPeds=nullptr;
 void __fastcall HookSetupInteriorPeds(void* group,void* edx) {
     auto* me=FindPlayerPed(0);
-    if(!me||!OtherAuthorityInside(me->GetPosition()))g_origSetupInteriorPeds(group,edx);
+    const bool generate=!me||!OtherAuthorityInside(me->GetPosition());PopulationGeneratorObservation diagnostic(6,ENTITY_PED,true,generate);
+    if(generate)g_origSetupInteriorPeds(group,edx);
 }
 
 class Population : public Module {
@@ -254,7 +314,7 @@ public:
             Vehicles::Instance().RemoveSharedAmbient(g_populationCentre,g_populationArea);
         }
     }
-    void OnSessionEnd() override { g_suppress = false; NearbyPopulationShare()={};PopulationViewers()={};PopulationSources()={255,255,255};PopulationBudgetExcluded()=0; }
+    void OnSessionEnd() override { if(flight::Enabled())RecordPopulationDecision(781,PG_CANCELLED,3,Net().MyId(),NearbyPopulationShare().source,255,-1);populationGeneratorDiagnostics={};g_suppress = false; NearbyPopulationShare()={};PopulationViewers()={};PopulationSources()={255,255,255};PopulationBudgetExcluded()=0; }
 };
 
 Population g_pop;

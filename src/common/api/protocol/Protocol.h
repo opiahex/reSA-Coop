@@ -4,7 +4,8 @@
 // Every ENet packet starts with a one-byte message id.
 //  * ids < 64  — service messages, handled by the server itself;
 //  * ids >= 64 — game messages: the client sends [id][payload], the server relays them to the other
-//    players as [id][u8 senderId][u32 connection token][payload]. The server never parses game payloads.
+//    players as [id][u8 senderId][u32 connection token][payload]. Entity lifecycle and simulation ownership
+//    are checked by the server; native AI/physics remain on the elected client.
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -19,6 +20,8 @@ constexpr uint8_t kServerId = 255;
 constexpr size_t kMaxChatLen = 160;
 constexpr size_t kRelayHeader = 6;
 constexpr size_t kWorldChunk = 16 * 1024;
+// After world/ref envelope and before game payload; source ownership lease.
+constexpr size_t kEntityAuthorityBytes = 4;
 
 // Stable partner number (0 or 1) even when another partner disconnects or is still loading.
 constexpr int PartnerIndex(uint8_t player, uint8_t host) { return player > host ? player - 1 : player; }
@@ -53,6 +56,8 @@ enum MsgId : uint8_t {
     C_WORLD_NEWGAME = 10,    // host: it plays a new game's prologue (no save of it can exist yet)
     C_WORLD_FOLLOW = 11,     // host: the prologue is over but cannot be saved yet: partners follow in a new game
 
+    C_ENTITY_AUTHORITY = 12, // canonical lifecycle/control request and native-ready acknowledgements
+
     // ---- server -> client ----
     S_WELCOME = 20,          // see Welcome
     S_REJECT = 21,           // str reason, str reasonEn (the same in English; empty when there is nothing to translate)
@@ -72,6 +77,8 @@ enum MsgId : uint8_t {
     S_WORLD_NEWGAME = 35,    // to a partner: start a new game and join the host where the prologue left it
     S_PROFILE_SAVED = 37,    // u32 CRC: profile persisted successfully
     S_WORLD_WAIT = 36,       // to a partner: the host plays a new game's prologue, keep waiting
+
+    S_ENTITY_AUTHORITY = 38, // server authority decisions; see EntityAuthority.h
 
     // ---- relayed game messages (client <-> client) ----
     G_FIRST = 64,

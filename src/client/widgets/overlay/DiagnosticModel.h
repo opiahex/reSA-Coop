@@ -9,6 +9,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <string_view>
 
@@ -70,9 +71,22 @@ inline std::string HookCollectorSummary(const hookreg::Counters&c){
 }
 inline std::string EventText(const flight::Event&e){
     char text[384];
-    std::snprintf(text,sizeof(text),"seq %llu stage %u reason %u peer %u src %u dst %u entity %u gen %llu world %u msg %u ch %u fp %016llX hp %.2f/%.2f arm %.2f",
-        (unsigned long long)e.localSeq,e.stage,e.reason,e.localPeer,e.context.source,e.context.recipient,e.context.entity,(unsigned long long)e.context.generation,e.context.world,e.context.msg,e.context.channel,(unsigned long long)e.context.fingerprint,e.health,e.maxHealth,e.armour);
+    std::snprintf(text,sizeof(text),"%s seq %llu stage %u reason %u peer %u src %u dst %u entity %u gen %llu world %u msg %u ch %u fp %016llX",
+        flight::CategoryName(flight::EventCategory(e)),(unsigned long long)e.localSeq,e.stage,e.reason,e.localPeer,e.context.source,e.context.recipient,e.context.entity,(unsigned long long)e.context.generation,e.context.world,e.context.msg,e.context.channel,(unsigned long long)e.context.fingerprint);
     std::string out=text;
+    if((e.context.msg==64||e.context.msg==65||e.context.msg==66)&&(e.stage==1||e.stage==11||(e.stage==12&&!e.reason))){char values[160];if(e.stage==12)std::snprintf(values,sizeof values," hp target %.2f before %.2f after %.2f max %.2f arm %.2f",e.health,e.beforeHealth,e.afterHealth,e.maxHealth,e.armour);else std::snprintf(values,sizeof values," hp %.2f/%.2f arm %.2f",e.health,e.maxHealth,e.armour);out+=values;}
+    if(e.stage==620&&!e.reason){char values[128];std::snprintf(values,sizeof values," vehicle health target %.2f before %.2f after %.2f",e.health,e.beforeHealth,e.afterHealth);out+=values;}
+    else if(e.stage==621&&!e.reason){char values[64];std::snprintf(values,sizeof values," spawned vehicle health %.2f",e.afterHealth);out+=values;}
+      if(e.stage==640&&!e.reason){char values[160];std::snprintf(values,sizeof values," NPC health target %.2f before %.2f after %.2f armour %.2f state clock %u",e.health,e.beforeHealth,e.afterHealth,e.armour,e.context.wireTime);out+=values;}
+      if(e.stage==803&&(e.reason==16||e.reason==17||e.reason==20)){char values[160];std::snprintf(values,sizeof values," damage HP before %.2f after %.2f armour %.2f",e.beforeHealth,e.afterHealth,e.armour);out+=values;}
+      if(e.numberFlags)out+=" native metadata INCOMPLETE flags "+std::to_string(e.numberFlags);
+      for(size_t i=0;i<std::min<size_t>(e.numberCount,flight::kNumbers);++i){const auto&n=e.numbers[i];char value[64]{};
+          if(!flight::ValidNumber(n)||n.type==flight::NumberType::Unavailable)std::snprintf(value,sizeof value,"UNAVAILABLE");
+          else if(n.type==flight::NumberType::Unsigned)std::snprintf(value,sizeof value,"%llu",(unsigned long long)n.bits);
+          else if(n.type==flight::NumberType::Signed){int64_t v=0;std::memcpy(&v,&n.bits,sizeof v);std::snprintf(value,sizeof value,"%lld",(long long)v);}
+          else{uint32_t bits=(uint32_t)n.bits;float v=0;std::memcpy(&v,&bits,sizeof v);std::snprintf(value,sizeof value,"%.6g",v);}
+          out+=" ";out+=flight::MetricName(n.key);out+="=";out+=value;
+      }
     if(e.detailKnown){
         auto value=[](uint64_t n,bool known){return known?std::to_string(n):std::string("UNKNOWN");};
         out+=" span "+value(e.span,(e.detailKnown&flight::SpanKnown)!=0)+" mission "+value(e.missionRun,(e.detailKnown&flight::MissionKnown)!=0);

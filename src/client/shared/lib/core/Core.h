@@ -40,6 +40,14 @@ namespace core {
 void Init(void* hModule);
 // First ordinary frame's thread ID, or 0 until it has been observed.
 uint32_t DiagnosticGameThreadId() noexcept;
+struct DiagnosticAuditStatus {
+    uint64_t comparisons=0,warnings=0,sampledAt=0,warnedAt=0;
+    uint16_t entity=0;
+    uint8_t kind=0,source=255,reason=0;
+    bool available=false;
+};
+// Copied on the diagnostic owning game thread; no remote-thread entity reads.
+DiagnosticAuditStatus GetDiagnosticAuditStatus() noexcept;
 void RegisterModule(Module* m);
 void PeerResynced(uint8_t id);  // dispatches Module::OnPeerResync
 void CollectSyncAudit(std::vector<SyncAuditEntry>& out);

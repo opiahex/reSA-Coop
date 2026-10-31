@@ -57,6 +57,36 @@ bool HoldsMovement(const AnimationState&s){
     return s.Present()&&(!(s.flags&anim::F_PARTIAL)||(s.group==87&&s.id>=348&&s.id<=350));
 }
 
+// A scripted go-to moves the local player while its pad is disabled. That
+// locomotion is not an action task and cannot be reproduced by a neutral pad.
+AnimationState ScriptedLocomotion(CPlayerPed* player) {
+    auto* pad = GetPad(0);
+    if (!pad || !pad->DisablePlayerControls || !player || !IsPedValid(player) ||
+        !player->RwObject() || !std::isfinite(player->Health()) || player->Health() <= 0 ||
+        player->PedState() == 54 || player->PedState() == 55 || player->InVehicle() ||
+        player->AttachedTo() || player->IsDucking() || player->IsInTheAir()) return {};
+    const int move = player->MoveState();
+    if (move < PEDMOVE_WALK || move > PEDMOVE_SPRINT || !anim::FindTask(player, 900)) return {};
+    if (anim::FindTask(player, 1303) || anim::FindTask(player, 1304) || anim::FindTask(player, 254)) return {};
+    void* best = nullptr;
+    void* association = anim::First(player->RwObject());
+    unsigned scanned = 0;
+    for (; association && scanned < 64; association = anim::Next(association), ++scanned) {
+        const auto flags = anim::Flags(association);
+        const float amount = anim::BlendAmount(association), delta = anim::BlendDelta(association);
+        const int id = anim::Id(association);
+        if (id < 0 || id > 2 || !(flags & 1) || !(flags & anim::F_LOOPED) ||
+            (flags & (anim::F_PARTIAL | anim::F_INDESTRUCTIBLE)) ||
+            !std::isfinite(amount) || amount < 0.05f || !std::isfinite(delta) || delta < 0) continue;
+        if (!best || amount > anim::BlendAmount(best)) best = association;
+    }
+    if (association || !best) return {};  // An incomplete scan cannot select a reliable locomotion clip.
+    auto captured = anim::Capture(best);
+    if (!captured.Present() || !std::isfinite(captured.time) || captured.time < 0 || captured.time > 600 ||
+        !std::isfinite(captured.speed) || captured.speed <= 0 || captured.speed > 4) return {};
+    return captured;
+}
+
 using PlayIdleFn = void(__fastcall*)(void*, void*, CPlayerPed*);
 PlayIdleFn g_origPlayIdle = nullptr;
 void __fastcall HookPlayIdleAnimations(void* task, void* edx, CPlayerPed* player) {
@@ -79,6 +109,7 @@ public:
         CPlayerPed* me = FindPlayerPed(0);
         const uint64_t now = NowMs();
         AnimationState scripted = anim::Capture(anim::ActionAssociation(me));
+        if (!scripted.Present()) scripted = ScriptedLocomotion(me);
         bool changed = !scripted.Same(m_scripted) ||
             (scripted.Present() && scripted.time + 0.25f < m_scripted.time && !(scripted.flags & anim::F_LOOPED));
         if (changed || (scripted.Present() && now - m_scriptSent >= 100)) {

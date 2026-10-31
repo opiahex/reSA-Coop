@@ -6,6 +6,7 @@
 
 #include "widgets/overlay/DiagnosticPanel.h"
 #include "widgets/overlay/DiagnosticModel.h"
+#include "widgets/overlay/DiagnosticTaskBridge.h"
 #include <windows.h>
 #include <atomic>
 #include <cstring>
@@ -24,6 +25,7 @@ Snapshot g_snapshot;
 Tab g_tab=Tab::Network;
 std::wstring g_peer,g_entity,g_mission,g_fingerprint,g_search,g_hook;
 size_t g_page=0;
+bool g_interactiveDiagnosticFrame=false;
 std::string g_copyStatus;
 flight::SnapshotExportResult g_exportRequest=flight::SnapshotExportResult::None;
 const char* g_controlRequest="none";
@@ -67,6 +69,10 @@ bool CopyText(const std::string&utf8){
 
 void UpdateDiagnosticSnapshot(uint64_t nowMs){
     if(GetCurrentThreadId()!=core::DiagnosticGameThreadId())return;
+    const bool open=Cfg().debugOverlay&&core::ConnectMenuVisible()&&g_interactiveDiagnosticFrame;
+    g_interactiveDiagnosticFrame=false;
+    auto peer=Number::Parse(g_peer),entity=Number::Parse(g_entity);
+    task_bridge::Update({open,peer.valid&&entity.valid,peer.active,entity.active,peer.value,entity.value},GetCurrentThreadId(),nowMs);
     if(!Cfg().debugOverlay)return;
     DWORD self=GetCurrentThreadId(),unbound=0;
     g_thread.compare_exchange_strong(unbound,self,std::memory_order_release,std::memory_order_relaxed);
@@ -74,7 +80,8 @@ void UpdateDiagnosticSnapshot(uint64_t nowMs){
     if(g_snapshot.sequence&&nowMs>=g_snapshot.sampledAtMs&&nowMs-g_snapshot.sampledAtMs<250)return;
     auto start=Qpc();g_snapshot.Capture(nowMs);auto selected=Number::Parse(g_entity);
     CaptureNativeSnapshot(g_snapshot.native,self,selected.valid&&selected.active&&selected.value<=65535?uint16_t(selected.value):0);
-    g_snapshot.CaptureInspection(g_tab==Tab::HooksScm?Narrow(g_hook):std::string{});g_snapshot.snapshotUs=Micros(start);
+    g_snapshot.CaptureInspection(g_tab==Tab::HooksScm?Narrow(g_hook):std::string{});
+    CacheDiagnosticInspection(g_snapshot.inspection,g_snapshot.inspectionRequested);g_snapshot.snapshotUs=Micros(start);
     if(flight::TickFrequency()&&start.QuadPart>0&&g_snapshot.snapshotUs>=0){++g_timings.samples;g_timings.snapshotTotalUs+=g_snapshot.snapshotUs;g_timings.snapshotMaxUs=std::max(g_timings.snapshotMaxUs,g_snapshot.snapshotUs);}
 }
 
@@ -88,6 +95,7 @@ void RenderDiagnosticPanel(bool interactive){
     // A diagnostic warning itself would issue D3D work on the rejected thread.
     if(g_thread.load(std::memory_order_acquire)!=GetCurrentThreadId())return;
     if(!Cfg().debugOverlay)return;
+    if(interactive)g_interactiveDiagnosticFrame=true;
     auto&g=Gfx();float s=g.Scale();
     // This panel never calls SetMouseCapture, SetKeyboardCapture, DrawCursor,
     // or dereferences a native entity. Widget frame ownership stays with caller.
@@ -128,6 +136,12 @@ void RenderDiagnosticPanel(bool interactive){
         rows.Add(Format("Recorder %s | sampled events %u / cap %u | snapshot %s",g_snapshot.recorderEnabled?"ON":"OFF",unsigned(g_snapshot.eventCount),unsigned(kEvents),g_snapshot.eventsBusy?"BUSY / no sample":"copied"));
         rows.Add(Format("accepted %u busyDrops %u lifecycleDrops %u historyOverwrites %u drainDrops %u IO errors %u",c.accepted,c.busyDrops,c.lifecycleDrops,c.historyOverwrites,c.drainDrops,c.ioErrors));
         rows.Add(Format("segmentsEvicted %u eventsEvicted %u rotationFailures %u exportFailed %u",c.segmentsEvicted,c.eventsEvicted,c.rotationFailures,c.exportFailed));
+        auto sampling=flight::CaptureStats();
+        rows.Add(sampling.busy?"Capture policy BUSY / unavailable":Format("Capture attempted %u | filtered %u sampled out %u critical drops %u | state 1/%u SCM 1/%u mask %X",sampling.attempted,sampling.filtered,sampling.sampledOut,sampling.criticalDrops,sampling.policy.stateEvery,sampling.policy.scmEvery,sampling.policy.categories));
+        if(!sampling.busy)rows.Add(Format("SCM pre-gate spans %u | sampled %u filtered %u rate limited %u busy %u | budget %u/s (0 unlimited)",sampling.scmPreAttempted,sampling.scmPreSampled,sampling.scmPreFiltered,sampling.scmPreRateLimited,sampling.scmPreBusy,sampling.policy.scmSpansPerSecond));
+        rows.Add(Format("Critical reserve buffered %u | pending %u | full losses %u",sampling.criticalBuffered,sampling.criticalPending,sampling.criticalReserveFull));
+        rows.Add(Format("Native observations %u | sampled %u filtered %u busy %u budget rejects %u | incomplete metadata %u",sampling.nativePreAttempted,sampling.nativePreSampled,sampling.nativePreFiltered,sampling.nativePreBusy,sampling.nativePreBudget,sampling.incompleteMetadata));
+        if(!sampling.busy)rows.Add(Format("Native query budget %u/s (0 unlimited)",sampling.policy.nativeObservationsPerSecond));
         rows.Add("Queue/reject counters are cumulative; packet loss percentage is not measured");
         rows.Add("Peer, entity and fingerprint filters apply to Events / Entities; hook ID applies to Hooks");
     }else if(g_tab==Tab::Performance){

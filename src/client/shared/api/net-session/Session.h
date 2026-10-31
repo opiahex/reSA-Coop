@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "common/api/protocol/Protocol.h"
+#include "common/lib/sync/EntityAuthority.h"
 #include "common/lib/buffer/Buffer.h"
 #include "common/lib/diagnostics/FlightRecorder.h"
 #include "shared/api/net-client/NetClient.h"
@@ -50,6 +51,18 @@ public:
     NetClient& Net() { return m_net; }
 
     void Send(uint8_t channel, const Writer& w);
+    using AuthorityHandler=bool(*)(authority::Notice&);
+    void SetAuthorityHandler(uint8_t kind,AuthorityHandler handler){if(kind<8)m_authorityHandlers[kind]=handler;}
+    uint32_t AuthorityLease(uint8_t kind,uint16_t id,uint64_t generation=0)const;
+    uint8_t AuthorityOwner(uint8_t kind,uint16_t id,uint64_t generation=0)const;
+    bool RequestAuthority(std::vector<authority::Member> members,uint8_t target,bool voluntary);
+    bool AuthorityStopped(uint8_t kind,uint16_t id)const;
+    void PollAuthority();
+    void LookupAuthority(const EntityRef& saved);
+    bool BindAuthorityEntity(const EntityRef& ref);
+    struct AuthorityLookup{EntityRef saved;uint32_t world=0,connection=0,request=0;bool sent=false;};
+    std::map<uint32_t,AuthorityLookup> m_authorityLookups;
+    bool m_authorityResynced=false;
     uint64_t BeginEntity(uint8_t kind,uint16_t id,uint8_t scope=255){return m_entities.Begin(kind,id,kind>ENTITY_OBJECT&&scope==255?m_myId:scope);}
     bool EntityLive(uint8_t kind,uint16_t id,uint8_t scope=255)const{return m_entities.Live(kind,id,scope);}
     // Authority-dependent removal (for example a handed-over train) is retired
@@ -67,7 +80,7 @@ public:
     bool EntityContextValid(const std::vector<EntityRef>&refs)const{return m_entities.Match(refs);}
     uint64_t EntityPacketsDiscarded()const{return m_entities.discarded;}
     size_t EntityPacketsWaiting()const{return m_entityWaiting.size();}
-    void AdvanceWorldEpoch(){if(++m_worldEpoch==0)++m_worldEpoch;}
+    void AdvanceWorldEpoch(){if(++m_worldEpoch==0)++m_worldEpoch;m_authorityPending.clear();m_authorityOutgoing.clear();m_authorityLookups.clear();m_authorityResynced=false;}
     uint32_t WorldEpoch()const{return m_worldEpoch;}
     flight::Context DiagnosticContext()const{return m_diagnosticContext;}
     uint32_t PeerWorldEpoch(uint8_t peer)const{return peer<m_epochs.peers.size()?m_epochs.peers[peer]:0;}
@@ -98,8 +111,22 @@ public:
 
 private:
     void HandleService(uint8_t id, Reader& r);
-    bool DispatchGame(uint8_t from,uint8_t id,uint8_t channel,uint32_t epoch,uint32_t connection,const std::vector<EntityRef>&refs,const uint8_t*data,size_t size,uint64_t received,bool queue);
-    struct DeferredEntityPacket{uint8_t from=0,id=0,channel=0;uint32_t epoch=0,connection=0;uint64_t received=0;std::vector<EntityRef> refs;std::vector<uint8_t> data;flight::Context diagnostic{};};
+    void HandleAuthority(Reader& r);
+    bool CheckPrimaryAuthority(uint8_t id,uint8_t from,const std::vector<EntityRef>&refs,uint32_t&lease);
+    bool SourceContextCurrent(uint8_t id,uint8_t from,uint32_t connection,uint32_t epoch);
+    bool NotifyAuthority(authority::Notice& notice);
+    void SendAuthority( authority::Notice& notice,authority::ClientOp op);
+    struct CanonicalAuthority {uint64_t generation=0;uint32_t lease=0;uint8_t owner=255;};
+    std::map<uint32_t,CanonicalAuthority> m_authority;
+    struct AuthorityPending {authority::Notice notice;bool ready=false;};
+    std::map<uint64_t,AuthorityPending> m_authorityPending;
+    struct AuthorityOutgoing {uint8_t channel=0;Writer packet;EntityRef primary;uint32_t world=0;uint64_t queued=0;};
+    std::vector<AuthorityOutgoing> m_authorityOutgoing;
+    AuthorityHandler m_authorityHandlers[8]{};
+    uint32_t m_authorityRequest=0;
+    bool m_authorityFinalSnapshot=false;
+    bool DispatchGame(uint8_t from,uint8_t id,uint8_t channel,uint32_t epoch,uint32_t connection,uint32_t lease,const std::vector<EntityRef>&refs,const uint8_t*data,size_t size,uint64_t received,bool queue);
+    struct DeferredEntityPacket{uint8_t from=0,id=0,channel=0;uint32_t epoch=0,connection=0,lease=0;uint64_t received=0;std::vector<EntityRef> refs;std::vector<uint8_t> data;flight::Context diagnostic{};};
     EntityGenerations m_entities;
     flight::Context m_diagnosticContext{};
     std::vector<EntityRef> m_entityContext;

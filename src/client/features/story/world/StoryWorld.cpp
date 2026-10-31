@@ -20,12 +20,49 @@
 #include "shared/lib/core/Core.h"
 #include "shared/lib/memory/Memory.h"
 #include "common/lib/log/Log.h"
+#include "common/lib/diagnostics/PassengerTrace.h"
 #include "common/lib/util/Util.h"
 namespace coop {namespace {
 using namespace game;using game::script::Cmd;
 enum:uint8_t{MAP=1,IPL=2,PROGRESS=3,SNAPSHOT_BEGIN=4,SNAPSHOT_END=5,REQUEST=6,DARKNESS=7};
-struct MapEdit{int op=0;CVector at;float radius=0;int model=0,value=0;};
-struct IplState{uint8_t op=0;uint32_t incarnation=0;};
+struct WorldDiagnostic {flight::Context context{};uint32_t localWorld=0,revision=0;uint16_t outcome=65535,stage=0;bool pending=false,revisionKnown=false;};
+struct MapEdit{int op=0;CVector at;float radius=0;int model=0,value=0;WorldDiagnostic diagnostic{};};
+struct IplState{uint8_t op=0;uint32_t incarnation=0;WorldDiagnostic diagnostic{};};
+enum WorldDiagnosticReason:uint16_t { WD_OK=0,WD_CALL_RETURNED,WD_PENDING,WD_MALFORMED,WD_INVALID_MODEL,WD_MODEL_WAIT,WD_IPL_MISSING,WD_CONTEXT,WD_REPLACED,WD_CANCELLED,WD_SENDER,WD_SNAPSHOT,WD_NOT_READY,WD_OBSERVATION_BUSY,WD_OBSERVATION_BUDGET,WD_INVALID_STREAMING,WD_UNSUPPORTED_SLOT };
+flight::Context LocalWorldDiagnostic(){flight::Context c{};c.source=Net().MyId();c.incarnation=Net().MyIncarnation();c.world=Net().WorldEpoch();return c;}
+flight::Context IncomingWorldDiagnostic(uint8_t from){if(!flight::Enabled())return {};auto c=Net().DiagnosticContext();if(c.msg!=proto::G_STORY_WORLD||c.source!=from){c={};c.msg=proto::G_STORY_WORLD;c.source=from;}return c;}
+WorldDiagnostic BeginWorldDiagnostic(flight::Context c,uint32_t rev,bool revisionKnown=true){WorldDiagnostic d;if(flight::Enabled()){d.context=c;d.localWorld=Net().WorldEpoch();d.revision=rev;d.revisionKnown=revisionKnown;d.pending=true;}return d;}
+bool WorldDiagnosticCurrent(const WorldDiagnostic&d){
+    if(d.localWorld!=Net().WorldEpoch())return false;
+    if(d.context.source==Net().MyId())return d.context.incarnation==Net().MyIncarnation()&&d.context.world==Net().WorldEpoch();
+    auto*p=Net().Peer(d.context.source);return p&&p->incarnation==d.context.incarnation&&Net().PeerWorldEpoch(d.context.source)==d.context.world;
+}
+void RecordWorldDiagnostic(WorldDiagnostic&d,uint16_t stage,uint16_t reason,unsigned operation,int model=-1,int slot=-1,int loaded=-1,int nativeState=-1){
+    if(!flight::Enabled()||!d.pending||(d.outcome==reason&&d.stage==stage))return;
+    flight::Event e{};e.context=d.context;e.stage=stage;e.reason=reason;e.localPeer=Net().MyId();
+    flight::AddUnsigned(e,flight::Metric::Operation,operation);if(d.revisionKnown)flight::AddUnsigned(e,flight::Metric::Revision,d.revision);
+    if(model>=0)flight::AddSigned(e,flight::Metric::RequestedModel,model);
+    if(slot>=0)flight::AddSigned(e,flight::Metric::IplId,slot);
+    if(loaded>=0)flight::AddUnsigned(e,flight::Metric::ObservedLoaded,(uint32_t)loaded);
+    if(nativeState>=0)flight::AddUnsigned(e,flight::Metric::ObservedStreamingState,(uint32_t)nativeState);
+    (void)flight::Record(e);d.outcome=reason;d.stage=stage;
+}
+void RetireWorldDiagnostic(WorldDiagnostic&d,unsigned op,uint16_t reason){RecordWorldDiagnostic(d,688,reason,op);d.pending=false;}
+void IplDiagnosticOutcome(IplState&state,int slot){
+    auto&d=state.diagnostic;if(!d.pending||!flight::Enabled())return;
+    if(!WorldDiagnosticCurrent(d)){RetireWorldDiagnostic(d,state.op,WD_CONTEXT);return;}
+    auto admission=flight::AdmitNativeObservation(d.context,686,Net().MyId(),true);
+    if(admission!=flight::NativeAdmission::Admitted){if(admission==flight::NativeAdmission::Busy||admission==flight::NativeAdmission::Budget)RecordWorldDiagnostic(d,687,admission==flight::NativeAdmission::Busy?WD_OBSERVATION_BUSY:WD_OBSERVATION_BUDGET,state.op,-1,slot);return;}
+    if(slot<0||slot>=1061){RecordWorldDiagnostic(d,687,WD_UNSUPPORTED_SLOT,state.op,-1,slot);return;}
+    auto*pool=Ref<CPoolHeader*>(0x8E3FB0);
+    if(!pool||!pool->objects||!pool->byteMap||slot<0||slot>=pool->size||pool->byteMap[slot]<0){RecordWorldDiagnostic(d,687,WD_IPL_MISSING,state.op,-1,slot);return;}
+    auto*def=pool->objects+(size_t)slot*0x34;bool loaded=Field<uint8_t>(def,0x2D)!=0;
+    auto nativeState=Ref<uint8_t>(addr::StreamingInfo+(uintptr_t)(25255+slot)*0x14+0x10);
+    const auto reason=nativeState>4?WD_INVALID_STREAMING:state.op==2?WD_CALL_RETURNED:(state.op==0?loaded:!loaded)?WD_OK:WD_PENDING;
+    RecordWorldDiagnostic(d,686,reason,state.op,-1,slot,loaded,nativeState);
+    if(reason!=WD_PENDING&&reason!=WD_INVALID_STREAMING)d.pending=false;
+}
+
 std::vector<MapEdit> edits;std::map<std::string,IplState> ipls;
 std::set<std::string> appliedFarIpls;
 std::map<std::string,uint32_t> appliedIplIncarnations;
@@ -38,11 +75,11 @@ uint64_t sentAt=0,appliedAt=0,campaignCheckedAt=0;uint32_t revision=0,receivedRe
 bool Valid(const MapEdit&e){return(e.op==0x0363||e.op==0x088D||e.op==0x03B6)&&std::isfinite(e.at.x)&&std::isfinite(e.at.y)&&std::isfinite(e.at.z)&&e.at.Length()<25000&&std::isfinite(e.radius)&&e.radius>0&&e.radius<=200&&e.model>0&&e.model<20000&&(e.op!=0x03B6||(e.value>0&&e.value<20000));}
 int ResolveModel(int m){return m<0&&m>-395?Ref<int32_t>(0xA44B70+(uintptr_t)(-m)*0x1C+0x18):m;}
 void Remember(const MapEdit&e){
-    for(auto i=edits.begin();i!=edits.end();)i=(i->op==e.op&&i->model==e.model&&(i->at-e.at).Length()<.25f)?edits.erase(i):std::next(i);
+    for(auto i=edits.begin();i!=edits.end();)if(i->op==e.op&&i->model==e.model&&(i->at-e.at).Length()<.25f){RetireWorldDiagnostic(i->diagnostic,i->op,WD_REPLACED);i=edits.erase(i);}else ++i;
     edits.push_back(e);
 }
-void Send(const MapEdit&e){Writer w(proto::G_STORY_WORLD);w.U8(MAP);w.U32(mapRevision);w.U16(e.op);w.Vec({e.at.x,e.at.y,e.at.z});w.F32(e.radius);w.I32(e.model);w.I32(e.value);Net().Send(proto::CH_RELIABLE,w);}
-void SendIpl(const std::string&name,const IplState&state){Writer w(proto::G_STORY_WORLD);w.U8(IPL);w.U32(mapRevision);w.U8(state.op);w.Str(name,32);w.U32(state.incarnation);Net().Send(proto::CH_RELIABLE,w);}
+void Send(const MapEdit&e){passenger_trace::Publication publication(0,0,0,0);if(flight::Enabled()){flight::AddUnsigned(passenger_trace::publication,flight::Metric::Operation,MAP);flight::AddUnsigned(passenger_trace::publication,flight::Metric::Revision,mapRevision);flight::AddSigned(passenger_trace::publication,flight::Metric::RequestedModel,e.model);}Writer w(proto::G_STORY_WORLD);w.U8(MAP);w.U32(mapRevision);w.U16(e.op);w.Vec({e.at.x,e.at.y,e.at.z});w.F32(e.radius);w.I32(e.model);w.I32(e.value);Net().Send(proto::CH_RELIABLE,w);}
+void SendIpl(const std::string&name,const IplState&state){passenger_trace::Publication publication(0,0,0,0);if(flight::Enabled()){flight::AddUnsigned(passenger_trace::publication,flight::Metric::Operation,IPL);flight::AddUnsigned(passenger_trace::publication,flight::Metric::Revision,mapRevision);}Writer w(proto::G_STORY_WORLD);w.U8(IPL);w.U32(mapRevision);w.U8(state.op);w.Str(name,32);w.U32(state.incarnation);Net().Send(proto::CH_RELIABLE,w);}
 void CaptureCampaignIpls(bool publish){
     // These two explicit campaign IPLs can have been removed before joining
     // co-op. GTA's save only stores loaded+disabled, not an unloaded IPL's
@@ -176,20 +213,21 @@ template<int Op>void __cdecl ScriptIpl(int slot){
 }
 void Snapshot();
 void Receive(uint8_t from,Reader&r){
-    auto op=r.U8();
+    auto op=r.U8();auto diagnostic=BeginWorldDiagnostic(IncomingWorldDiagnostic(from),0,false);
     if(op==REQUEST){if(Net().IsHost()&&from<3&&Net().Peer(from))Snapshot();return;}
-    if(from!=Net().HostId()||Net().IsHost())return;
+    if(from!=Net().HostId()||Net().IsHost()){RecordWorldDiagnostic(diagnostic,687,WD_SENDER,op);return;}
     if(op==DARKNESS){ReceiveDarkness(r);return;}
-    if(op==SNAPSHOT_BEGIN){auto rev=r.U32();auto count=r.U32();if(!r.Ok())return;edits.clear();ipls.clear();snapshotOpen=true;haveSnapshot=false;snapshotRevision=rev;snapshotExpected=count;snapshotCount=0;return;}
-    if(op==SNAPSHOT_END){auto rev=r.U32();if(r.Ok()&&snapshotOpen&&rev==snapshotRevision&&snapshotCount==snapshotExpected){receivedMapRevision=rev;haveSnapshot=true;snapshotOpen=false;LOGI("Story map snapshot ready revision=%u records=%u",rev,snapshotCount);}return;}
-    if(op==MAP){auto rev=r.U32();MapEdit e;e.op=r.U16();auto p=r.Vec();e.at={p.x,p.y,p.z};e.radius=r.F32();e.model=r.I32();e.value=r.I32();if(!r.Ok()||!Valid(e))return;Remember(e);receivedMapRevision=rev;if(snapshotOpen)++snapshotCount;appliedAt=0;LOGI("Story map edit received op=%04X model=%d",e.op,e.model);}
-    else if(op==IPL){auto rev=r.U32();auto action=r.U8();auto name=r.Str(32);auto incarnation=r.U32();if(!r.Ok()||action>2||name.empty()||(incarnation&&(int32_t)(rev-incarnation)<0)||!std::all_of(name.begin(),name.end(),[](unsigned char c){return(c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_';}))return;
+    if(op==SNAPSHOT_BEGIN){auto rev=r.U32();diagnostic.revision=rev;diagnostic.revisionKnown=r.Ok();auto count=r.U32();if(!r.Ok()){RecordWorldDiagnostic(diagnostic,687,WD_MALFORMED,op);return;}for(auto&e:edits)RetireWorldDiagnostic(e.diagnostic,e.op,WD_REPLACED);for(auto&[name,state]:ipls)RetireWorldDiagnostic(state.diagnostic,state.op,WD_REPLACED);edits.clear();ipls.clear();snapshotOpen=true;haveSnapshot=false;snapshotRevision=rev;snapshotExpected=count;snapshotCount=0;diagnostic.revision=rev;RecordWorldDiagnostic(diagnostic,685,WD_PENDING,op);return;}
+    if(op==SNAPSHOT_END){auto rev=r.U32();diagnostic.revision=rev;diagnostic.revisionKnown=r.Ok();diagnostic.revision=rev;if(r.Ok()&&snapshotOpen&&rev==snapshotRevision&&snapshotCount==snapshotExpected){receivedMapRevision=rev;haveSnapshot=true;snapshotOpen=false;LOGI("Story map snapshot ready revision=%u records=%u",rev,snapshotCount);RecordWorldDiagnostic(diagnostic,685,WD_OK,op);}else RecordWorldDiagnostic(diagnostic,687,r.Ok()?WD_SNAPSHOT:WD_MALFORMED,op);return;}
+    if(op==MAP){auto rev=r.U32();diagnostic.revision=rev;diagnostic.revisionKnown=r.Ok();MapEdit e;e.op=r.U16();auto p=r.Vec();e.at={p.x,p.y,p.z};e.radius=r.F32();e.model=r.I32();e.value=r.I32();if(!r.Ok()||!Valid(e)){diagnostic.revision=rev;RecordWorldDiagnostic(diagnostic,687,WD_MALFORMED,op);return;}e.diagnostic=BeginWorldDiagnostic(diagnostic.context,rev);RecordWorldDiagnostic(e.diagnostic,685,WD_OK,e.op,e.model);Remember(e);receivedMapRevision=rev;if(snapshotOpen)++snapshotCount;appliedAt=0;LOGI("Story map edit received op=%04X model=%d",e.op,e.model);}
+    else if(op==IPL){auto rev=r.U32();diagnostic.revision=rev;diagnostic.revisionKnown=r.Ok();auto action=r.U8();auto name=r.Str(32);auto incarnation=r.U32();if(!r.Ok()||action>2||name.empty()||(incarnation&&(int32_t)(rev-incarnation)<0)||!std::all_of(name.begin(),name.end(),[](unsigned char c){return(c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_';})){diagnostic.revision=rev;RecordWorldDiagnostic(diagnostic,687,WD_MALFORMED,op);return;}
         name=IplName(name);
-        if(auto i=ipls.find(name);i!=ipls.end()&&i->second.incarnation&&(!incarnation||(int32_t)(incarnation-i->second.incarnation)<0))return;
+        if(auto i=ipls.find(name);i!=ipls.end()&&i->second.incarnation&&(!incarnation||(int32_t)(incarnation-i->second.incarnation)<0)){diagnostic.revision=rev;RecordWorldDiagnostic(diagnostic,687,WD_REPLACED,op);return;}
         if(action!=2||!snapshotOpen)appliedFarIpls.erase(name);
-        ipls[name]={action,incarnation};ResetWorldObjectIpl(name.c_str(),incarnation);receivedMapRevision=rev;if(snapshotOpen)++snapshotCount;appliedAt=0;}
+        if(auto i=ipls.find(name);i!=ipls.end())RetireWorldDiagnostic(i->second.diagnostic,i->second.op,WD_REPLACED);
+        ipls[name]={action,incarnation,BeginWorldDiagnostic(diagnostic.context,rev)};RecordWorldDiagnostic(ipls[name].diagnostic,685,WD_OK,action);ResetWorldObjectIpl(name.c_str(),incarnation);receivedMapRevision=rev;if(snapshotOpen)++snapshotCount;appliedAt=0;}
 
-    else if(op==PROGRESS){auto rev=r.U32();std::array<uint32_t,5> values;for(auto&v:values)v=r.U32();float f[2];memcpy(f,values.data()+3,8);
+    else if(op==PROGRESS){auto rev=r.U32();diagnostic.revision=rev;diagnostic.revisionKnown=r.Ok();std::array<uint32_t,5> values;for(auto&v:values)v=r.U32();float f[2];memcpy(f,values.data()+3,8);
         if(!r.Ok()||(receivedRevision&&(int32_t)(rev-receivedRevision)<=0)||values[0]>1000000||values[1]>1000000||values[2]>1000000||!std::isfinite(f[0])||!std::isfinite(f[1])||f[0]<0||f[1]<0||f[0]>1e6f||f[1]>1e6f)return;
         progress=values;receivedRevision=rev;haveProgress=true;}
 }
@@ -203,8 +241,8 @@ void Snapshot(){
 bool ApplyIpls(){
     bool ready=true;
     for(auto&[name,state]:ipls){
-        int slot=Call<0x404AC0,int>(name.c_str());if(slot<0){ready=false;continue;}
-        auto*pool=Ref<CPoolHeader*>(0x8E3FB0);if(!pool||slot>=pool->size||pool->byteMap[slot]<0){ready=false;continue;}
+        int slot=Call<0x404AC0,int>(name.c_str());if(slot<0){RecordWorldDiagnostic(state.diagnostic,687,WD_IPL_MISSING,state.op);ready=false;continue;}
+        auto*pool=Ref<CPoolHeader*>(0x8E3FB0);if(!pool||slot>=pool->size||pool->byteMap[slot]<0){RecordWorldDiagnostic(state.diagnostic,687,WD_IPL_MISSING,state.op,-1,slot);ready=false;continue;}
         // REMOVE followed by REQUEST in the same SCM frame still destroys the
         // old native IPL. Preserve that transition in a late/current snapshot.
         auto&applied=appliedIplIncarnations[name];
@@ -222,15 +260,17 @@ bool ApplyIpls(){
             if(!loaded||!Field<uint8_t>(def,0x2F)||Field<uint8_t>(def,0x30))Call<0x405850>(slot);
             if(!loaded)ready=false;
         }
+        IplDiagnosticOutcome(state,slot);
     }
     return ready;
 }
 bool ApplyEdits(const CVector&point){
     bool ready=true;
     for(auto&e:edits)if((point-e.at).Length()<200||(cam::Source()-e.at).Length()<160){
-        if(!IsValidModel(e.model)||(e.op==0x03B6&&!IsValidModel(e.value))){ready=false;continue;}
-        if(e.op==0x03B6&&!IsModelLoaded(e.value)){RequestSharedModel(e.value,true);ready=false;continue;}
+        if(!IsValidModel(e.model)||(e.op==0x03B6&&!IsValidModel(e.value))){RecordWorldDiagnostic(e.diagnostic,687,WD_INVALID_MODEL,e.op,e.model);ready=false;continue;}
+        if(e.op==0x03B6&&!IsModelLoaded(e.value)){auto diagnosticOrigin=e.diagnostic.pending&&WorldDiagnosticCurrent(e.diagnostic)?e.diagnostic.context:LocalWorldDiagnostic();RequestSharedModel(e.value,true,false,&diagnosticOrigin);RecordWorldDiagnostic(e.diagnostic,687,WD_MODEL_WAIT,e.op,e.value);ready=false;continue;}
         Cmd(e.op).F(e.at.x).F(e.at.y).F(e.at.z).F(e.radius).I(e.model).I(e.value).Run();
+        if(e.diagnostic.pending){if(WorldDiagnosticCurrent(e.diagnostic))RecordWorldDiagnostic(e.diagnostic,686,WD_CALL_RETURNED,e.op,e.op==0x03B6?e.value:e.model);else RecordWorldDiagnostic(e.diagnostic,688,WD_CONTEXT,e.op);e.diagnostic.pending=false;}
     }
     return ready;
 }
@@ -257,22 +297,29 @@ class StoryWorld:public Module{
     void OnPeerResync(uint8_t)override{if(Net().IsHost()){Snapshot();progressSent=false;}}
 
     void OnPeerJoin(uint8_t)override{progressSent=false;}
-    void OnGameShutdown()override{ClearDarkness();mapRevision=receivedMapRevision=0;snapshotOpen=haveSnapshot=false;requestedAt=0;edits.clear();ipls.clear();appliedFarIpls.clear();appliedIplIncarnations.clear();haveProgress=progressSent=false;receivedRevision=0;sentAt=appliedAt=campaignCheckedAt=0;}
+    void OnGameShutdown()override{for(auto&e:edits)RetireWorldDiagnostic(e.diagnostic,e.op,WD_CANCELLED);for(auto&[name,state]:ipls)RetireWorldDiagnostic(state.diagnostic,state.op,WD_CANCELLED);ClearDarkness();mapRevision=receivedMapRevision=0;snapshotOpen=haveSnapshot=false;requestedAt=0;edits.clear();ipls.clear();appliedFarIpls.clear();appliedIplIncarnations.clear();haveProgress=progressSent=false;receivedRevision=0;sentAt=appliedAt=campaignCheckedAt=0;}
     void OnHostChanged(uint8_t)override{ClearDarkness();if(Net().IsHost()&&receivedMapRevision&&(!mapRevision||(int32_t)(receivedMapRevision-mapRevision)>0))mapRevision=receivedMapRevision;}
     void OnSessionEnd()override{OnGameShutdown();revision=0;}
 }feature;struct Reg{Reg(){core::RegisterModule(&feature);}}reg;
 }
 uint32_t StoryWorldRevision(){return Net().IsHost()?mapRevision:receivedMapRevision;}
+void RecordWorldReadiness(uint32_t requestedRevision,uint16_t reason,int nativeReady=-1){
+    static uint32_t lastRevision=0,lastWorld=0;static uint16_t lastReason=65535;static int lastNative=-2;
+    if(!flight::Enabled()){lastReason=65535;return;}
+    auto world=Net().WorldEpoch();if(lastWorld==world&&lastRevision==requestedRevision&&lastReason==reason&&lastNative==nativeReady)return;
+    auto d=BeginWorldDiagnostic(LocalWorldDiagnostic(),requestedRevision);RecordWorldDiagnostic(d,687,reason,8,-1,-1,nativeReady);
+    lastWorld=world;lastRevision=requestedRevision;lastReason=reason;lastNative=nativeReady;
+}
 bool StoryWorldReady(uint32_t revision,const game::CVector&point){
     if(Net().IsHost())return true;
     if(!haveSnapshot||snapshotOpen||(int32_t)(receivedMapRevision-revision)<0){
-        if(NowMs()-requestedAt>2000){Writer w(proto::G_STORY_WORLD);w.U8(REQUEST);Net().Send(proto::CH_RELIABLE,w);requestedAt=NowMs();}return false;
+        if(NowMs()-requestedAt>2000){Writer w(proto::G_STORY_WORLD);w.U8(REQUEST);Net().Send(proto::CH_RELIABLE,w);requestedAt=NowMs();}RecordWorldReadiness(revision,WD_SNAPSHOT);return false;
     }
-    if(!core::IsPlayerReady()||!flow::InHostWorld())return false;
+    if(!core::IsPlayerReady()||!flow::InHostWorld()){RecordWorldReadiness(revision,WD_NOT_READY);return false;}
     bool ready=ApplyIpls();ready=ApplyEdits(point)&&ready;
     using Check=bool(__cdecl*)(const CVector&,int);using Request=void(__cdecl*)(const CVector&,int);
     auto*pool=Ref<CPoolHeader*>(0x8E3FB0);
-    if(!pool)return false;
+    if(!pool){RecordWorldReadiness(revision,WD_IPL_MISSING);return false;}
     auto markRequired=(Request)0x404700;
     markRequired(point,-1);
     // RequestIpls consumes loadRequested without excluding disabled IPLs.
@@ -286,8 +333,8 @@ bool StoryWorldReady(uint32_t revision,const game::CVector&point){
     // Both RequestIpls and HaveIplsLoaded clear the per-IPL request marker.
     // Mark again so the check observes the requested point, not an empty set.
     markRequired(point,-1);
-    ready=((Check)0x405600)(point,-1)&&ready;
-    return ready;
+    const bool nativeReady=((Check)0x405600)(point,-1);ready=nativeReady&&ready;
+    RecordWorldReadiness(revision,ready?WD_OK:WD_NOT_READY,nativeReady);return ready;
 }
 bool ResolveStoryMapTarget(int opcode,int*p){
     if(!p)return false;float f[4];memcpy(f,p,16);int model=ResolveModel(p[4]);

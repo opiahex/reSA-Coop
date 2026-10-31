@@ -5,6 +5,9 @@ Original diagnostic system source: https://github.com/opiahex/reSA-Coop
 
 The original diagnostic components listed in [DIAGNOSTICS-COMPONENTS.md](DIAGNOSTICS-COMPONENTS.md)
 use the [reSA-Coop Diagnostic System Attribution License 1.0](DIAGNOSTICS-LICENSE.txt).
+The current inventory includes the original fourteen files and ten additional
+original task-observation files. Functional shared API declarations and inherited
+MIT integration code remain outside this separate scope.
 They may be used and modified in other forks, mods and programs. Distribution
 must preserve the required opiahex attribution and original-source link.
 

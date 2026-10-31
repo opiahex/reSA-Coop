@@ -1,11 +1,15 @@
 #pragma once
 #include <cstdint>
+#include <array>
 #include "shared/lib/sync/SpawnWait.h"
 #include "shared/lib/sync/IdAllocator.h"
 #include <map>
 #include <string>
 
 #include "common/lib/buffer/Buffer.h"
+#include "entities/vehicle/VehicleState.h"
+#include "common/lib/sync/EntityAuthority.h"
+#include "common/lib/diagnostics/FlightRecorder.h"
 #include "shared/game/Game.h"
 #include "shared/lib/core/Core.h"
 #include "shared/lib/sync/AnimationState.h"
@@ -53,6 +57,31 @@ struct PedSyncState {
 
 // NPC known to both players. owner == my id: simulated here and announced; otherwise a mirror.
 struct NetPed {
+    struct DiagnosticTask {
+        flight::Context context{};
+        uint64_t issued=0,lastPoll=0;
+        uint32_t clock=0,revision=0;
+        int handle=-1,type=-1,result=-1,admission=-1;
+        bool pending=false;
+    };
+    struct DiagnosticAnimation {
+        flight::Context context{};
+        uint64_t serial=0,issued=0,lastPoll=0;
+        uint32_t clock=0,revision=0;
+        int handle=-1,result=-1,admission=-1;
+        uint16_t block=0xFFFF,index=0,observedBlock=0xFFFF,observedIndex=0;
+        float time=0;
+        bool pending=false,actionSource=false;
+    };
+    struct DiagnosticState {
+        flight::Context state{},action{};
+        PedSyncState requested{};
+        uint64_t span=0,issued=0,lastPoll=0,stateSerial=0,actionSerial=0;
+        int handle=-1,result=-1,admission=-1;
+        game::CPed* body=nullptr;
+        uint8_t episode=0,branch=0;
+        bool known=false,pending=false,critical=false,scalarDone=false,layersDone=false,scalarRead=false,gaitDone=false,actionLayersDone=false,taskDone=false;
+    };
     struct Pose {uint32_t time=0;game::CVector pos,vel;float heading=0;};
     SnapshotBuffer<Pose> poses;
     uint16_t netId = 0;
@@ -70,8 +99,14 @@ struct NetPed {
     uint8_t lastWeapon = 0;
     uint64_t lastShotMs = 0;
     // mirror side
+    bool authorityHeld=false,crewHidden=false,crewWasVisible=false,awaitingLookup=false,lookupAwaitingState=false;
+    uint32_t orphanAttemptLease=0;
+    // Local old-owner resume only; never sent or restored on new-owner Commit.
+    bool ownerProofsKnown=false;uint32_t ownerProofs=0,ownerProofsWorld=0,ownerProofsConnection=0;
+    uint64_t ownerProofsGeneration=0;int ownerProofsHandle=-1;game::CPed*ownerProofsBody=nullptr;
     bool hasState = false;
     bool pendingAdoption=false;
+    bool adoptionWarm=false;
     bool adoptionSpawned=false;
     uint64_t adoptionGeneration=0,adoptionVehicleGeneration=0,adoptionUntil=0;
     uint32_t adoptionWorld=0;
@@ -109,14 +144,42 @@ struct NetPed {
     uint32_t actionRevision=0,actionSignature=0,actionSentRevision=0;
     uintptr_t actionLeaf=0;float actionTime=0;
     uint16_t actionBlock=0xFFFF,actionIndex=0;
+    // Local numeric provenance only; no wire fields or native pointers.
+    flight::Context diagnosticBirth{},diagnosticState{},diagnosticAction{},diagnosticOwner{},diagnosticRemove{};
+    uint32_t diagnosticWorld=0;
+    uint64_t diagnosticGeneration=0;
+    uint16_t diagnosticWait=0;
+    bool diagnosticBirthPending=false,diagnosticStatePending=false,diagnosticActionPending=false;
+    uint64_t diagnosticStateSerial=0,diagnosticActionSerial=0;
+    bool diagnosticActionOwnsPose=false;
+    std::array<DiagnosticTask,3> diagnosticTasks{};
+    DiagnosticAnimation diagnosticAnimation{};
+    DiagnosticState diagnosticNativeState{};
+    uint64_t diagnosticNativeLastPoll=0,diagnosticLayerLastPoll=0;
+    uint64_t diagnosticNativeStateSerial=0,diagnosticNativeActionSerial=0;
+    uint8_t diagnosticNativeEpisode=0;
+    uint32_t diagnosticNativeRecording=0;
+    bool diagnosticNativeEpisodeKnown=false;
+    int diagnosticNativeHandle=-1;game::CPed*diagnosticNativeBody=nullptr;
+    std::array<int,7> diagnosticLayerResult{{-1,-1,-1,-1,-1,-1,-1}};
+    std::array<uint16_t,7> diagnosticLayerBlock{},diagnosticLayerIndex{};
 };
 
 class Peds : public Module {
 public:
     NetPed* EnsureNetworked(game::CPed* ped);
+    bool CaptureCrewMember(game::CPed* ped,game::CVehicle* car,int8_t seat,VehicleCrewMember& out);
+    bool CrewMemberReady(const VehicleCrewMember& member,game::CVehicle* car,uint8_t expectedOwner=authority::NoOwner)const;
+    void SetCrewVisibility(const VehicleCrew& crew,bool hidden);
+    void PublishCrew(const VehicleCrew& crew);
+    bool HasUnresolvedCrew(game::CVehicle* car)const;
+    void RetainUsedCrew();
+    VehicleCrew RetainedVehicleCrew(uint16_t vehicle,uint64_t generation)const;
+    bool HandleAuthority(authority::Notice& notice);
     const char* Name() const override { return "Peds"; }
     void OnEntityReplaced(uint8_t kind,uint8_t scope,uint16_t id) override;
     void OnInstallHooks() override;
+    void OnSessionStart() override;
     void OnSessionEnd() override;
     void OnPeerLeave(uint8_t id) override;
     void OnGameStarted() override;
@@ -126,6 +189,7 @@ public:
 
     static Peds& Instance();
     const std::map<uint16_t,NetPed>& All() const { return m_byId; }
+    NetPed* DiagnosticRecord(uint16_t id){auto i=m_byId.find(id);return i==m_byId.end()?nullptr:&i->second;}
     NetPed* Find(game::CPed* ped);
     game::CPed* FindOwned(uint16_t netId);  // our live ped announced under netId
     bool Known(uint16_t id)const{return m_byId.count(id)!=0;}
@@ -159,7 +223,11 @@ private:
     game::CPed* SpawnMirror(NetPed& np);
     void Forget(uint16_t netId, bool deletePed);
     void Adopt(NetPed& np);
+    bool PrepareAdoptionBody(NetPed& np);
+    void CaptureOwnerProofs(NetPed& np);
+    void RestoreOwnerProofs(NetPed& np,bool ending=false);
     void QueueAdoption(NetPed& np);
+    bool QueueWarmDriverAdoption(NetPed& np);
     bool AdoptionCurrent(const NetPed& np) const;
     bool AdoptionVehicleCurrent(const NetPed& np) const;
     bool AdoptionRelevant(const NetPed& np) const;
@@ -167,6 +235,12 @@ private:
     void DropMirrorsOf(uint8_t id, bool keep);  // keep: this game's own people now (it left), else deleted (it restarted)
     PedSyncState Capture(NetPed& np);
 
+    struct RetainedCrew {
+        PedSyncState state;std::string special;uint16_t model=0;uint8_t pedType=0;
+        uint64_t generation=0,vehicleGeneration=0;uint16_t vehicle=0;int handle=-1;
+    };
+    void RebindRetainedCrew();
+    std::map<uint16_t,RetainedCrew> m_retainedCrew;
     std::map<uint16_t, NetPed> m_byId;
     std::map<game::CPed*, uint16_t> m_byPtr;
     IdAllocator<4096> m_ids;

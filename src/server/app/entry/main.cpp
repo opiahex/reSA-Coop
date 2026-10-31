@@ -5,6 +5,8 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cstdlib>
+#include <cerrno>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -13,11 +15,39 @@
 #include "common/config/version/Version.h"
 #include "common/lib/ini/Ini.h"
 #include "common/lib/log/Log.h"
+#include "common/lib/diagnostics/FlightRecorder.h"
 #include "common/lib/util/Util.h"
 
 using namespace coop;
 
 static server::Server g_server;
+
+// Optional recorder-only settings. Read once during startup, before accepting
+// clients; never from packet callbacks. Invalid settings leave policy unchanged.
+static bool ConfigureDiagnosticCapture(const Ini& ini) {
+    const auto state=ini.Get("diagnostics","state_sample_every","");
+    const auto packet=ini.Get("diagnostics","packet_filter","");
+    if(state.empty()&&packet.empty())return true;
+    auto current=flight::CaptureStats();
+    if(current.busy){LOGW("Diagnostic capture configuration unavailable: recorder busy");return false;}
+    auto policy=current.policy;
+    auto number=[](const std::string&text,uint32_t min,uint32_t max,uint32_t&out){
+        if(text.empty())return true;
+        if(text.size()>10)return false;
+        for(char c:text)if(c<'0'||c>'9')return false;
+        errno=0;char*end=nullptr;const auto n=std::strtoull(text.c_str(),&end,10);
+        if(errno==ERANGE||end!=text.c_str()+text.size()||n<min||n>max)return false;
+        out=(uint32_t)n;return true;
+    };
+    uint32_t selectedPacket=policy.packet;
+    if(!number(state,1,65536,policy.stateEvery)||!number(packet,0,255,selectedPacket)){
+        LOGW("Diagnostic capture configuration rejected: invalid bounded value");return false;
+    }
+    policy.packet=(uint8_t)selectedPacket;
+    if(!flight::SetCapturePolicy(policy)){LOGW("Diagnostic capture configuration unavailable: recorder busy");return false;}
+    LOGI("Diagnostic capture configured: state_sample_every=%u packet_filter=%u",policy.stateEvery,policy.packet);
+    return true;
+}
 
 static BOOL WINAPI CtrlHandler(DWORD type) {
     if (type == CTRL_C_EVENT || type == CTRL_CLOSE_EVENT || type == CTRL_BREAK_EVENT) {
@@ -69,11 +99,12 @@ int wmain(int argc, wchar_t** argv) {
     }
     EnsureDirectory(dataDir);
     log::Open(dataDir + L"server.log", true);
-    log::StartDiagnostics();
 
     if (!FileExists(configPath)) WriteDefaultConfig(configPath);
     Ini ini;
     ini.Load(configPath);
+    (void)ConfigureDiagnosticCapture(ini);
+    log::StartDiagnostics();
     server::Config cfg;
     cfg.name = ini.Get("server", "name", cfg.name);
     cfg.port = (uint16_t)ini.GetInt("server", "port", kDefaultPort);

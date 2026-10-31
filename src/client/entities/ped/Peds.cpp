@@ -10,18 +10,24 @@
 #include "entities/ped/Peds.h"
 
 #include <algorithm>
+#include <cstring>
+#include <windows.h>
+#undef near
 #include <cmath>
 #include <vector>
 
 #include "common/api/protocol/Protocol.h"
 #include "common/lib/log/Log.h"
+#include "common/lib/diagnostics/PassengerTrace.h"
 #include "common/lib/profile/Profile.h"
 #include "common/lib/util/Util.h"
 #include "entities/player/Players.h"
+#include "entities/session/Flow.h"
 #include "entities/mission/Mission.h"
 #include "shared/api/story-coop/StoryCoop.h"
 #include "entities/vehicle/Vehicles.h"
 #include "shared/lib/sync/PopulationShare.h"
+#include "shared/lib/sync/SchoolPolicy.h"
 #include "shared/api/net-session/Session.h"
 #include "shared/game/Anim.h"
 #include "shared/game/Script.h"
@@ -46,8 +52,36 @@ struct Reg {
 
 // owned peds closer than "in" to the other player are announced and removed there beyond "out";
 // vehicle occupants use the vehicle ranges so traffic is never seen without its driver
-bool StoryPed(CPed*p){return Net().IsHost()&&p&&p->CreatedBy()==PED_MISSION&&HostReplicating();}
-bool PrivateInteriorPed(CPed*p){return p&&p->CreatedBy()==PED_MISSION&&AreaOf(p)!=0&&AreaOf(p)!=13&&!StoryPed(p);}
+// IMPND runs each CJ's native station service, including wanted reactions and
+// cleanup. Its initial exterior guards stay local, like a local activity's clerk.
+bool PrivateImpoundPed(CPed* p) {
+    if(!p||!IsPedValid(p)||p->CreatedBy()!=PED_MISSION)return false;
+    const auto mainSize=Ref<uint32_t>(0xA444C4); // CTheScripts::MainScriptSize
+    constexpr uint32_t endOfGlobalsUsed=42920;
+    if(mainSize<endOfGlobalsUsed||mainSize>200000)return false;
+    // The loaded main SCM opens with GOTO over its global-variable segment.
+    if(Ref<uint16_t>(addr::ScriptSpace)!=0x0002||Ref<uint8_t>(addr::ScriptSpace+2)!=1)return false;
+    const auto globalsEnd=Ref<uint32_t>(addr::ScriptSpace+3);
+    if(globalsEnd<endOfGlobalsUsed||globalsEnd>mainSize)return false;
+    bool created=false;
+    for(void* script=Ref<void*>(0xA8B42C);script;script=Field<void*>(script,0)) {
+        // IMPND sets 0@=2 after creating/setup, and clears it before cleanup.
+        if(Field<uint8_t>(script,0xC4)&&Field<int32_t>(script,0x3C)==2&&
+           NativeActivityNameMatches(Field<char[8]>(script,8),"impnd")){created=true;break;}
+    }
+    if(!created)return false;
+    const int city=Ref<int32_t>(addr::ScriptSpace+7460);
+    if(city<1||city>3)return false;
+    const int handle=GetPedRef(p);
+    if(handle<0||GetPed(handle)!=p)return false; // full pool generation; handle 0 is valid
+    for(int slot=0;slot<8;++slot) {
+        const bool exterior=slot==0||slot==2||(city==2&&slot==1);
+        if(exterior&&Ref<int32_t>(addr::ScriptSpace+42064+slot*4)==handle)return true;
+    }
+    return false;
+}
+bool StoryPed(CPed*p){return Net().IsHost()&&p&&p->CreatedBy()==PED_MISSION&&!PrivateImpoundPed(p)&&HostReplicating();}
+bool PrivateLocalPed(CPed*p){return PrivateImpoundPed(p)||(p&&p->CreatedBy()==PED_MISSION&&AreaOf(p)!=0&&AreaOf(p)!=13&&!StoryPed(p));}
 float SyncIn(CPed* p) { return p->InVehicle() ? 170.0f : 120.0f; }
 float SyncOut(CPed* p) { return p->InVehicle() ? 220.0f : 150.0f; }
 constexpr int kSpecialFirst = 290, kSpecialLast = 299;
@@ -140,6 +174,105 @@ bool IsPedDead(CPed* p) {
 
 bool IsAlive(const NetPed& np) { return np.ped && IsPedValid(np.ped) && GetPedRef(np.ped) == np.handle; }
 
+enum PedDiagnosticReason:uint16_t {
+    PD_OK=0,PD_MALFORMED,PD_SENDER,PD_NOT_READY,PD_MISSING,PD_CONFLICT,PD_OLD_TIME,PD_OLD_ACTION,
+    PD_PENDING,PD_BUDGET,PD_SPECIAL_NAME,PD_SPECIAL_SLOT,PD_MODEL,PD_MODEL_WAIT,PD_PED_POOL,PD_TASK_POOL,
+    PD_VEHICLE,PD_DRIVER_SEAT,PD_PASSENGER_SEAT,PD_NATIVE_FAILED,PD_NATIVE_MISSING,PD_RETAINED,
+    PD_DELETE_FAILED,PD_CONTEXT,PD_INTEREST,PD_WEAPON_WAIT,PD_STATE_REPLACED,PD_ACTION_REPLACED,
+    PD_BIRTH_REPLACED,PD_STATE_CANCELLED,PD_ACTION_CANCELLED,PD_BIRTH_CANCELLED,PD_PARTIAL_ACTION,
+    PD_ADOPTION_CONTEXT,PD_ADOPTION_VEHICLE,PD_ADOPTION_TIMEOUT,PD_ADOPTION_INTEREST
+};
+flight::Context IncomingPedDiagnostic(uint16_t id,uint8_t msg){
+    if(!flight::Enabled())return {};
+    auto c=Net().DiagnosticContext();if(c.msg!=msg)return {};
+    c.entity=id;c.generation=Net().ExpectedEntityGeneration(ENTITY_PED,id);return c;
+}
+flight::Context LocalPedDiagnostic(uint16_t id,uint8_t msg){
+    if(!flight::Enabled())return {};
+    flight::Context c{};c.entity=id;c.generation=Net().EntityGeneration(ENTITY_PED,id);c.msg=msg;
+    c.source=Net().MyId();c.incarnation=Net().MyIncarnation();c.world=Net().WorldEpoch();return c;
+}
+bool PedDiagnosticCurrent(const NetPed&np,const flight::Context&c){
+    if(np.diagnosticWorld!=Net().WorldEpoch()||!c.generation||np.diagnosticGeneration!=c.generation||Net().EntityGeneration(ENTITY_PED,np.netId)!=c.generation)return false;
+    if(c.source==Net().MyId())return c.incarnation==Net().MyIncarnation()&&c.world==Net().WorldEpoch();
+    auto*p=Net().Peer(c.source);return p&&p->incarnation==c.incarnation&&Net().PeerWorldEpoch(c.source)==c.world;
+}
+void RecordPedDiagnostic(flight::Context c,uint16_t stage,uint16_t reason,const NetPed*np=nullptr){
+    if(!c.msg||!flight::Enabled())return;
+    flight::Event e{};e.context=c;e.stage=stage;e.reason=reason;e.localPeer=Net().MyId();
+    if(np){e.owner=np->owner;e.detailKnown|=flight::OwnerKnown;e.nativeHandle=(uint32_t)np->handle;}
+    (void)flight::Record(e);
+}
+void RetirePedStateDiagnostic(NetPed&np,uint16_t reason){
+    if(np.diagnosticStatePending)RecordPedDiagnostic(np.diagnosticState,644,reason,&np);
+    np.diagnosticStatePending=false;
+}
+void RetirePedActionDiagnostic(NetPed&np,uint16_t reason){
+    if(np.diagnosticActionPending)RecordPedDiagnostic(np.diagnosticAction,648,reason,&np);
+    np.diagnosticActionPending=false;
+}
+void RetirePedBirthDiagnostic(NetPed&np,uint16_t reason){
+    if(np.diagnosticBirthPending)RecordPedDiagnostic(np.diagnosticBirth,644,reason,&np);
+    np.diagnosticBirthPending=false;
+}
+void RetirePedNativeDiagnostics(NetPed&np);
+void RetirePedDiagnostics(NetPed&np){
+    RetirePedNativeDiagnostics(np);
+    RetirePedStateDiagnostic(np,PD_STATE_CANCELLED);RetirePedActionDiagnostic(np,PD_ACTION_CANCELLED);
+    RetirePedBirthDiagnostic(np,PD_BIRTH_CANCELLED);
+}
+void AcceptPedStateDiagnostic(NetPed&np,flight::Context c){
+    ++np.diagnosticStateSerial;np.diagnosticActionOwnsPose=false;
+    RetirePedStateDiagnostic(np,PD_STATE_REPLACED);np.diagnosticState=c;np.diagnosticStatePending=c.msg!=0;
+    if(!np.diagnosticWorld)np.diagnosticWorld=Net().WorldEpoch();
+}
+void AcceptPedActionDiagnostic(NetPed&np,flight::Context c){
+    ++np.diagnosticActionSerial;np.diagnosticActionOwnsPose=true;
+    RetirePedActionDiagnostic(np,PD_ACTION_REPLACED);np.diagnosticAction=c;np.diagnosticActionPending=c.msg!=0;
+    if(!np.diagnosticWorld)np.diagnosticWorld=Net().WorldEpoch();
+    RecordPedDiagnostic(c,648,PD_PARTIAL_ACTION,&np); // task/animation identity needs a future typed schema
+}
+void PedDiagnosticWait(NetPed&np,uint16_t reason){
+    if(np.diagnosticWait==reason)return;
+    np.diagnosticWait=reason;
+    auto c=np.diagnosticBirthPending?np.diagnosticBirth:np.diagnosticState.msg?np.diagnosticState:np.diagnosticOwner;
+    RecordPedDiagnostic(c,644,reason,&np);
+}
+void RecordPedSpawn(NetPed&np){
+    auto c=np.diagnosticBirthPending?np.diagnosticBirth:np.pendingAdoption&&np.diagnosticOwner.msg?np.diagnosticOwner:LocalPedDiagnostic(np.netId,proto::G_PED_CREATE);
+    if(!c.msg||!flight::Enabled())return;
+    if(!PedDiagnosticCurrent(np,c)){RecordPedDiagnostic(c,644,PD_CONTEXT,&np);np.diagnosticBirthPending=false;return;}
+    if(!IsAlive(np)){RecordPedDiagnostic(c,644,PD_NATIVE_MISSING,&np);return;}
+    RecordPedDiagnostic(c,641,PD_OK,&np);np.diagnosticBirthPending=false;np.diagnosticWait=0;
+}
+void RecordPedHealth(NetPed&np,float before){
+    if(!np.diagnosticStatePending)return;
+    auto c=np.diagnosticState;
+    if(c.msg&&flight::Enabled()){
+        if(!PedDiagnosticCurrent(np,c))RecordPedDiagnostic(c,644,PD_CONTEXT,&np);
+        else if(!IsAlive(np))RecordPedDiagnostic(c,644,PD_NATIVE_MISSING,&np);
+        else{flight::Event e{};e.context=c;e.stage=640;e.localPeer=Net().MyId();e.owner=np.owner;e.detailKnown|=flight::OwnerKnown;
+            e.nativeHandle=(uint32_t)np.handle;e.health=np.state.health;e.beforeHealth=before;e.afterHealth=np.ped->Health();e.armour=np.ped->Armour();(void)flight::Record(e);}
+    }
+    np.diagnosticStatePending=false;
+}
+struct PedRemovalDiagnostic {
+    flight::Context context{};uint8_t owner=255;int handle=-1;CPed*expected=nullptr;bool alive=false;float before=0;
+    PedRemovalDiagnostic(const NetPed&np,flight::Context c):context(c),owner(np.owner),handle(np.handle),expected(np.ped){
+        if(c.msg&&flight::Enabled()&&IsAlive(np)){alive=true;before=np.ped->Health();}
+    }
+    void Complete(bool requested)const{
+        if(!context.msg||!flight::Enabled())return;
+        flight::Event e{};e.context=context;e.stage=642;e.localPeer=Net().MyId();e.owner=owner;e.detailKnown|=flight::OwnerKnown;
+        e.nativeHandle=(uint32_t)handle;e.beforeHealth=before;
+        if(!alive){e.reason=PD_NATIVE_MISSING;(void)flight::Record(e);return;}
+        auto*after=GetPed(handle);const bool present=after&&after==expected&&IsPedValid(after)&&GetPedRef(after)==handle;
+        e.reason=!requested?(present?PD_RETAINED:PD_NATIVE_MISSING):present?PD_DELETE_FAILED:PD_OK;
+        if(present)e.afterHealth=after->Health();
+        (void)flight::Record(e);
+    }
+};
+
 void HoldCorpseOutside(NetPed&np,bool hold){
     if(!IsAlive(np))return;auto*p=np.ped;
     if(hold){
@@ -152,6 +285,271 @@ void HoldCorpseOutside(NetPed&np,bool hold){
 void* FindTask(CPed* ped, int type) {
     void* intel = ped->Intelligence();
     return intel ? CallMethod<0x681740, void*>((uint8_t*)intel + 4, type) : nullptr;
+}
+
+enum PedNativeResult:uint16_t {
+    PN_OBSERVED=0,PN_ISSUED,PN_NOT_OBSERVED,PN_CONTEXT,PN_BODY_CHANGED,PN_EXPIRED,
+    PN_CANCELLED,PN_REPLACED,PN_NO_INTELLIGENCE,PN_NO_CLUMP,PN_ASSOC_NOT_LIVE,
+    PN_ASSOC_LIMIT,PN_ADMISSION_WAIT,PN_ASSOC_MISMATCH,PN_INVALID_METRICS,PN_ADMISSION_BUSY,PN_ADMISSION_BUDGET
+};
+flight::Event PedNativeEvent(const NetPed&np,flight::Context c,uint16_t stage,uint16_t reason,uint32_t clock,uint32_t revision,int handle){
+    flight::Event e{};e.context=c;e.stage=stage;e.reason=reason;e.localPeer=Net().MyId();e.nativeHandle=(uint32_t)handle;
+    e.owner=np.owner;e.detailKnown|=flight::OwnerKnown;
+    flight::AddUnsigned(e,flight::Metric::EntityKind,ENTITY_PED);
+    flight::AddUnsigned(e,flight::Metric::StateClock,clock);
+    flight::AddUnsigned(e,flight::Metric::ActionRevision,revision);
+    flight::AddSigned(e,flight::Metric::NativeResult,reason);return e;
+}
+void EmitPedTaskDiagnostic(const NetPed&np,const NetPed::DiagnosticTask&d,uint16_t result,int observed=-2,int pedState=-1){
+    if(!flight::Enabled()||!d.context.msg)return;
+    auto e=PedNativeEvent(np,d.context,650,result,d.clock,d.revision,d.handle);
+    flight::AddSigned(e,flight::Metric::RequestedTask,d.type);
+    if(observed!=-2)flight::AddSigned(e,flight::Metric::ObservedTask,observed);
+    if(pedState>=0)flight::AddUnsigned(e,flight::Metric::ObservedPedState,(uint32_t)pedState);
+    (void)flight::Record(e);
+}
+int PedTaskDiagnosticSlot(int type){return type==TASK_ENTER_CAR_AS_PASSENGER?0:type==TASK_ENTER_CAR_AS_DRIVER?1:type==TASK_LEAVE_CAR?2:-1;}
+void PedTaskIssued(NetPed&np,int type){
+    if(!flight::Enabled()||!np.diagnosticState.msg)return;
+    const auto slot=PedTaskDiagnosticSlot(type);if(slot<0)return;
+    auto&d=np.diagnosticTasks[(size_t)slot];
+    if(d.pending)EmitPedTaskDiagnostic(np,d,PN_REPLACED);
+    d={};d.context=np.diagnosticState;d.clock=np.state.time;d.revision=np.state.interaction.revision;
+    d.handle=np.handle;d.type=type;d.issued=d.lastPoll=NowMs();d.pending=true;d.result=PN_ISSUED;
+    EmitPedTaskDiagnostic(np,d,PN_ISSUED);
+}
+void PollPedTaskDiagnostics(NetPed&np,uint64_t now){
+    if(!flight::Enabled())return;
+    for(auto&d:np.diagnosticTasks){
+        if(!d.pending)continue;
+        if(!PedDiagnosticCurrent(np,d.context)){EmitPedTaskDiagnostic(np,d,PN_CONTEXT);d.pending=false;continue;}
+        if(np.handle!=d.handle){EmitPedTaskDiagnostic(np,d,PN_BODY_CHANGED);d.pending=false;continue;}
+        if(now-d.issued>=12000){EmitPedTaskDiagnostic(np,d,PN_EXPIRED);d.pending=false;continue;}
+        if(now-d.lastPoll<100)continue;d.lastPoll=now;
+        auto admission=flight::AdmitNativeObservation(d.context,650,Net().MyId(),true);
+        if(admission!=flight::NativeAdmission::Admitted){
+            if((admission==flight::NativeAdmission::Busy||admission==flight::NativeAdmission::Budget)&&d.admission!=(int)admission){
+                EmitPedTaskDiagnostic(np,d,admission==flight::NativeAdmission::Busy?PN_ADMISSION_BUSY:PN_ADMISSION_BUDGET);
+            }
+            d.admission=(int)admission;continue;
+        }
+        d.admission=(int)admission;
+        if(!IsAlive(np)){EmitPedTaskDiagnostic(np,d,PN_BODY_CHANGED);d.pending=false;continue;}
+        if(!np.ped->Intelligence()){
+            if(d.result!=PN_NO_INTELLIGENCE)EmitPedTaskDiagnostic(np,d,PN_NO_INTELLIGENCE);
+            d.result=PN_NO_INTELLIGENCE;continue;
+        }
+        const bool found=FindTask(np.ped,d.type)!=nullptr;
+        const auto result=found?PN_OBSERVED:PN_NOT_OBSERVED;
+        if(d.result!=result)EmitPedTaskDiagnostic(np,d,result,found?d.type:-1,np.ped->PedState());
+        d.result=result;if(found)d.pending=false; // observed matching type, never task completion
+    }
+}
+void EmitPedAnimationDiagnostic(const NetPed&np,const NetPed::DiagnosticAnimation&d,uint16_t result,const AnimationState*observed=nullptr,float blend=0,uint16_t flags=0){
+    if(!flight::Enabled()||!d.context.msg)return;
+    const auto span=flight::NextDiagnosticSpan();
+    auto e=PedNativeEvent(np,d.context,651,result,d.clock,d.revision,d.handle);e.span=span;e.detailKnown|=flight::SpanKnown;
+    flight::AddUnsigned(e,flight::Metric::RequestedAnimBlock,d.block);
+    flight::AddUnsigned(e,flight::Metric::RequestedAnimIndex,d.index);
+    flight::AddFloat(e,flight::Metric::RequestedAnimTime,d.time);
+    if(observed)flight::AddUnsigned(e,flight::Metric::NativeFlags,flags);
+    (void)flight::Record(e);
+    if(observed){
+        auto after=PedNativeEvent(np,d.context,651,result,d.clock,d.revision,d.handle);after.span=span;after.detailKnown|=flight::SpanKnown;
+        flight::AddUnsigned(after,flight::Metric::ObservedAnimBlock,observed->block);
+        flight::AddUnsigned(after,flight::Metric::ObservedAnimIndex,observed->index);
+        flight::AddFloat(after,flight::Metric::ObservedAnimTime,observed->time);
+        flight::AddFloat(after,flight::Metric::ObservedBlend,blend);(void)flight::Record(after);
+    }
+}
+void RetirePedAnimationDiagnostic(NetPed&np,uint16_t result){
+    auto&d=np.diagnosticAnimation;if(d.pending)EmitPedAnimationDiagnostic(np,d,result);d.pending=false;
+}
+void RetirePedStateObservation(NetPed&np,int result);
+void ExpirePedNativeDiagnostics(NetPed&np,uint64_t now){
+    if(!flight::Enabled())return;
+    for(auto&d:np.diagnosticTasks)if(d.pending&&now-d.issued>=12000){EmitPedTaskDiagnostic(np,d,PN_EXPIRED);d.result=PN_EXPIRED;d.pending=false;}
+    auto&a=np.diagnosticAnimation;if(a.pending&&now-a.issued>=12000){EmitPedAnimationDiagnostic(np,a,PN_EXPIRED);a.result=PN_EXPIRED;a.pending=false;}
+    auto&state=np.diagnosticNativeState;if(state.pending&&now-state.issued>=12000)RetirePedStateObservation(np,PN_EXPIRED);
+}
+void ObservePedAnimation(NetPed&np,const AnimationState&requested,float age,void*association,bool interactionClock=false){
+    if(!flight::Enabled()||!requested.Present())return;
+    const auto c=np.diagnosticActionOwnsPose?np.diagnosticAction:np.diagnosticState;if(!c.msg)return;
+    const auto serial=np.diagnosticActionOwnsPose?np.diagnosticActionSerial:np.diagnosticStateSerial;
+    auto&d=np.diagnosticAnimation;
+    const bool same=d.block==requested.block&&d.index==requested.index&&d.revision==np.state.interaction.revision&&d.actionSource==np.diagnosticActionOwnsPose;
+    if(d.pending&&!same){EmitPedAnimationDiagnostic(np,d,PN_REPLACED);d.pending=false;}
+    if(!d.pending){
+        if(same&&d.serial==serial&&((d.result==PN_OBSERVED&&association)||d.result==PN_EXPIRED))return;
+        const bool continuing=same&&d.result==PN_OBSERVED;
+        const auto priorPoll=continuing?d.lastPoll:0;
+        d={};d.context=c;d.serial=serial;d.issued=NowMs();d.clock=np.state.time;d.revision=np.state.interaction.revision;d.handle=np.handle;
+        if(continuing){d.result=PN_OBSERVED;d.lastPoll=priorPoll;}
+        d.block=requested.block;d.index=requested.index;d.time=interactionClock?std::max(0.f,requested.time+age*requested.speed*((requested.flags&1)?1.f:0.f)):requested.time;
+        d.actionSource=np.diagnosticActionOwnsPose;d.pending=true;
+    }
+    if(!PedDiagnosticCurrent(np,d.context)){EmitPedAnimationDiagnostic(np,d,PN_CONTEXT);d.pending=false;return;}
+    if(np.handle!=d.handle){EmitPedAnimationDiagnostic(np,d,PN_BODY_CHANGED);d.pending=false;return;}
+    if(NowMs()-d.issued>=12000){EmitPedAnimationDiagnostic(np,d,PN_EXPIRED);d.result=PN_EXPIRED;d.pending=false;return;}
+    if(!association){if(d.result!=PN_NOT_OBSERVED)EmitPedAnimationDiagnostic(np,d,PN_NOT_OBSERVED);d.result=PN_NOT_OBSERVED;return;}
+    if(d.lastPoll&&NowMs()-d.lastPoll<100)return;d.lastPoll=NowMs();
+    const bool critical=d.result!=PN_OBSERVED;
+    auto admission=flight::AdmitNativeObservation(d.context,651,Net().MyId(),critical);
+    if(admission!=flight::NativeAdmission::Admitted){
+        if(critical&&(admission==flight::NativeAdmission::Busy||admission==flight::NativeAdmission::Budget)&&d.admission!=(int)admission){
+            EmitPedAnimationDiagnostic(np,d,admission==flight::NativeAdmission::Busy?PN_ADMISSION_BUSY:PN_ADMISSION_BUDGET);
+        }
+        d.admission=(int)admission;if(!critical)d.pending=false;return;
+    }
+    d.admission=(int)admission;
+    if(!IsAlive(np)){EmitPedAnimationDiagnostic(np,d,PN_BODY_CHANGED);d.pending=false;return;}
+    auto*clump=np.ped->RwObject();if(!clump){if(d.result!=PN_NO_CLUMP)EmitPedAnimationDiagnostic(np,d,PN_NO_CLUMP);d.result=PN_NO_CLUMP;return;}
+    bool member=false;unsigned count=0;void*a=anim::First(clump);
+    for(;a&&count<64;++count,a=anim::Next(a))if(a==association){member=true;break;}
+    if(!member){const auto result=a?PN_ASSOC_LIMIT:PN_ASSOC_NOT_LIVE;if(d.result!=result)EmitPedAnimationDiagnostic(np,d,result);d.result=result;return;}
+    auto observed=anim::Capture(association);
+    if(!observed.Present()){if(d.result!=PN_ASSOC_NOT_LIVE)EmitPedAnimationDiagnostic(np,d,PN_ASSOC_NOT_LIVE);d.result=PN_ASSOC_NOT_LIVE;return;}
+    const float blend=anim::BlendAmount(association);
+    const auto result=!std::isfinite(observed.time)||!std::isfinite(blend)?PN_INVALID_METRICS:
+        observed.block!=d.block||observed.index!=d.index?PN_ASSOC_MISMATCH:PN_OBSERVED;
+    if(d.result!=result||d.observedBlock!=observed.block||d.observedIndex!=observed.index)
+        EmitPedAnimationDiagnostic(np,d,result,&observed,blend,anim::Flags(association));
+    d.result=result;d.observedBlock=observed.block;d.observedIndex=observed.index;d.pending=result!=PN_OBSERVED;
+}
+
+// Numeric observations only: no native task/physics/animation is created here.
+enum PedStateBranch:uint8_t { PS_GENERAL=0,PS_DEATH=1,PS_FALL=2,PS_MOVE=3,PS_STAND=4,PS_NO_BODY=5 };
+constexpr int PS_ASSOC_AMBIGUOUS=48;
+uint8_t PedRequestedEpisode(const PedSyncState&s){return(s.flags&PedSyncState::F_DEAD)?1:!(s.flags&PedSyncState::F_IN_VEHICLE)&&!s.interaction.parentKind&&s.interaction.FallingOrGettingUp()?2:0;}
+flight::Event PedStateNativeEvent(const NetPed&np,const NetPed::DiagnosticState&d,uint16_t stage,int result,bool bound=false,bool action=false){
+    flight::Event e{};e.context=action?d.action:d.state;e.stage=stage;e.reason=(d.critical?0x100:0)|(result?result:0);e.localPeer=Net().MyId();e.span=d.span;e.detailKnown=flight::SpanKnown;
+    if(bound){e.nativeHandle=(uint32_t)np.handle;e.owner=np.owner;e.detailKnown|=flight::OwnerKnown;}
+    return e;
+}
+void EmitPedStateDecision(const NetPed&np,const NetPed::DiagnosticState&d,int result,uint8_t branch=PS_GENERAL){
+    if(!flight::Enabled()||!d.state.msg)return;
+    auto e=PedStateNativeEvent(np,d,654,result);if(!d.critical&&(result==PN_REPLACED||result==PN_CANCELLED))e.reason=0;
+    flight::AddSigned(e,flight::Metric::NativeResult,result);flight::AddUnsigned(e,flight::Metric::Operation,branch);flight::AddUnsigned(e,flight::Metric::ReferenceKind,d.episode);
+    flight::AddUnsigned(e,flight::Metric::StateClock,d.requested.time);flight::AddUnsigned(e,flight::Metric::RequestedPedFlags,d.requested.flags);flight::AddUnsigned(e,flight::Metric::RequestedMoveState,d.requested.moveState);flight::AddUnsigned(e,flight::Metric::RequestedDecision,(d.scalarDone?0u:1u)|(d.gaitDone?0u:2u)|(d.actionLayersDone?0u:4u)|(d.taskDone?0u:8u));(void)flight::Record(e);
+    if(d.action.msg&&(d.action.fingerprint!=d.state.fingerprint||d.action.wireTime!=d.state.wireTime||d.action.msg!=d.state.msg)){
+        auto a=PedStateNativeEvent(np,d,654,result,false,true);a.reason=e.reason;flight::AddSigned(a,flight::Metric::NativeResult,result);flight::AddUnsigned(a,flight::Metric::ReferenceKind,2);flight::AddUnsigned(a,flight::Metric::ActionRevision,d.requested.interaction.revision);(void)flight::Record(a);
+    }
+}
+void RetirePedStateObservation(NetPed&np,int result){
+    auto&d=np.diagnosticNativeState;if(d.pending)EmitPedStateDecision(np,d,result,d.branch);
+    if(result==PN_EXPIRED){d.result=result;d.pending=false;return;} // same-source terminal identity survives metadata lease expiry
+    d={};
+    if(result==PN_CANCELLED||result==PN_BODY_CHANGED){np.diagnosticNativeEpisodeKnown=false;np.diagnosticNativeStateSerial=np.diagnosticNativeActionSerial=0;np.diagnosticNativeHandle=-1;np.diagnosticNativeBody=nullptr;np.diagnosticLayerResult.fill(-1);}
+}
+uint64_t BeginPedStateObservation(NetPed&np){
+    if(!flight::Enabled()||!np.diagnosticState.msg)return 0;
+    const auto recording=flight::ActiveRecordingToken();
+    if(np.diagnosticNativeRecording!=recording){
+        np.diagnosticNativeState={};np.diagnosticNativeEpisodeKnown=false;np.diagnosticNativeStateSerial=np.diagnosticNativeActionSerial=0;
+        np.diagnosticNativeLastPoll=np.diagnosticLayerLastPoll=0;np.diagnosticNativeBody=nullptr;np.diagnosticNativeHandle=-1;np.diagnosticLayerResult.fill(-1);np.diagnosticNativeRecording=recording;
+    }
+    const auto now=NowMs();const auto episode=PedRequestedEpisode(np.state);auto&d=np.diagnosticNativeState;
+    const bool bodyChanged=np.diagnosticNativeEpisodeKnown&&np.ped&&(np.diagnosticNativeBody!=np.ped||np.diagnosticNativeHandle!=np.handle);
+    const bool critical=(!np.diagnosticNativeEpisodeKnown?episode!=0:np.diagnosticNativeEpisode!=episode)||(bodyChanged&&(episode||np.diagnosticNativeEpisode))||(d.pending&&d.critical&&d.episode!=episode);
+    if(d.pending&&d.critical&&d.episode==episode){return d.span;} // retain first critical source while resource observation waits
+    const bool same=d.known&&d.stateSerial==np.diagnosticStateSerial&&d.actionSerial==np.diagnosticActionSerial;
+    if(same&&!d.pending&&(d.result==PN_CONTEXT||d.result==PN_EXPIRED))return 0;
+    if(d.pending&&!same)RetirePedStateObservation(np,PN_REPLACED);
+    if(same&&d.pending)return d.span;
+    if(!critical&&!bodyChanged&&np.diagnosticNativeStateSerial==np.diagnosticStateSerial&&np.diagnosticNativeActionSerial==np.diagnosticActionSerial)return 0;
+    if(!critical&&np.diagnosticNativeLastPoll&&now-np.diagnosticNativeLastPoll<100)return 0;
+    d={};d.state=np.diagnosticState;d.action=np.diagnosticActionOwnsPose?np.diagnosticAction:np.diagnosticState;d.requested=np.state;
+    d.span=flight::NextDiagnosticSpan();d.issued=now;d.stateSerial=np.diagnosticStateSerial;d.actionSerial=np.diagnosticActionSerial;d.episode=episode;d.critical=critical;d.known=d.pending=true;
+    d.gaitDone=!d.requested.motion.Present();bool layers=false;for(auto&layer:d.requested.interaction.layers)layers|=layer.Present();d.actionLayersDone=!layers;d.layersDone=d.gaitDone&&d.actionLayersDone;d.taskDone=d.requested.interaction.task==0xFFFF&&d.requested.interaction.leaf==0xFFFF;
+    if(critical)EmitPedStateDecision(np,d,PN_ISSUED);return d.span;
+}
+void EmitPedObservedLayers(NetPed&np,const NetPed::DiagnosticState&d,void*clump,uint8_t selected){
+    AnimationState requested[7];float weights[7]{1,1,1,1,1,1,1};requested[0]=d.requested.motion;
+    for(unsigned i=0;i<6;++i){requested[i+1]=d.requested.interaction.layers[i];weights[i+1]=d.requested.interaction.weights[i];}
+    bool wanted=false;for(unsigned i=0;i<7;++i)if(!(selected&(1u<<i)))requested[i]={};for(auto&s:requested)wanted|=s.Present();if(!wanted)return;
+    AnimationState observed[7];float blend[7]{};uint16_t flags[7]{};unsigned matched[7]{};unsigned count=0;void*a=clump?anim::First(clump):nullptr;
+    for(;a&&count<64;++count,a=anim::Next(a)){
+        auto state=anim::Capture(a);if(!state.Present())continue;
+        for(unsigned i=0;i<7;++i)if(requested[i].Present()&&requested[i].Same(state)){if(!matched[i]){observed[i]=state;blend[i]=anim::BlendAmount(a);flags[i]=anim::Flags(a);}++matched[i];}
+    }
+    for(unsigned i=0;i<7;++i){
+        if(!requested[i].Present())continue;const auto context=i?d.action:d.state;if(!context.msg)continue;
+        const int result=!clump?PN_NO_CLUMP:matched[i]&&(!std::isfinite(observed[i].time)||!std::isfinite(observed[i].speed)||!std::isfinite(blend[i]))?PN_INVALID_METRICS:
+            a?PN_ASSOC_LIMIT:!matched[i]?PN_NOT_OBSERVED:matched[i]>1?PS_ASSOC_AMBIGUOUS:PN_OBSERVED;
+        const bool changed=np.diagnosticLayerResult[i]!=result||np.diagnosticLayerBlock[i]!=requested[i].block||np.diagnosticLayerIndex[i]!=requested[i].index;
+        if(!d.critical&&result!=PN_OBSERVED&&!changed)continue;
+        auto e=PedStateNativeEvent(np,d,653,result,true,i!=0);e.context=context;if(result==PN_OBSERVED&&changed&&np.diagnosticLayerResult[i]>=0)e.reason=0x100;
+        flight::AddUnsigned(e,flight::Metric::LayerIndex,i);flight::AddUnsigned(e,flight::Metric::RequestedAnimBlock,requested[i].block);flight::AddUnsigned(e,flight::Metric::RequestedAnimIndex,requested[i].index);
+        flight::AddFloat(e,flight::Metric::RequestedAnimTime,requested[i].time);flight::AddFloat(e,flight::Metric::RequestedAnimSpeed,requested[i].speed);flight::AddFloat(e,flight::Metric::RequestedBlend,weights[i]);
+        flight::AddUnsigned(e,flight::Metric::StateClock,d.requested.time);flight::AddSigned(e,flight::Metric::NativeResult,result);(void)flight::Record(e);
+        if(matched[i]){
+            auto after=PedStateNativeEvent(np,d,653,result,true,i!=0);after.context=context;after.reason=e.reason;
+            flight::AddUnsigned(after,flight::Metric::LayerIndex,i);flight::AddUnsigned(after,flight::Metric::ObservedAnimBlock,observed[i].block);flight::AddUnsigned(after,flight::Metric::ObservedAnimIndex,observed[i].index);
+            if(result!=PN_INVALID_METRICS){flight::AddFloat(after,flight::Metric::ObservedAnimTime,observed[i].time);flight::AddFloat(after,flight::Metric::ObservedAnimSpeed,observed[i].speed);flight::AddFloat(after,flight::Metric::ObservedBlend,blend[i]);}
+            flight::AddUnsigned(after,flight::Metric::NativeFlags,flags[i]);flight::AddSigned(after,flight::Metric::NativeResult,result);(void)flight::Record(after);
+        }
+        np.diagnosticLayerResult[i]=result;np.diagnosticLayerBlock[i]=requested[i].block;np.diagnosticLayerIndex[i]=requested[i].index;
+    }
+}
+void ObservePedStateObservation(uint16_t id,uint64_t span,uint8_t branch,bool nativeAllowed){
+    if(!span||!flight::Enabled())return;auto*np=Peds::Instance().DiagnosticRecord(id);if(!np)return;auto&d=np->diagnosticNativeState;
+    if(!d.pending||d.span!=span)return;const auto now=NowMs();d.branch=branch;
+    auto fail=[&](int reason){if(d.result!=reason)EmitPedStateDecision(*np,d,reason,branch);d.result=reason;};
+    if(!PedDiagnosticCurrent(*np,d.state)||d.state.source!=np->owner||(d.action.msg&&(!PedDiagnosticCurrent(*np,d.action)||d.action.source!=np->owner))){fail(PN_CONTEXT);d.pending=false;return;}
+    if(now-d.issued>=12000){fail(PN_EXPIRED);d.pending=false;return;}
+    if(!nativeAllowed)return;
+    if(d.lastPoll&&now-d.lastPoll<100)return;d.lastPoll=now;np->diagnosticNativeLastPoll=now;
+    bool scalar=false,gait=false,layers=false,taskQuery=false;
+    auto admit=[&](const flight::Context&context,uint16_t stage,bool&done){
+        auto a=flight::AdmitNativeObservation(context,stage,Net().MyId(),d.critical);
+        if(a==flight::NativeAdmission::Admitted)return true;
+        if(a==flight::NativeAdmission::Busy||a==flight::NativeAdmission::Budget)fail(a==flight::NativeAdmission::Busy?PN_ADMISSION_BUSY:PN_ADMISSION_BUDGET);
+        else if(!d.critical)done=true;return false;
+    };
+    if(!d.scalarDone)scalar=admit(d.state,652,d.scalarDone);
+    if(!d.layersDone&&(d.critical||!np->diagnosticLayerLastPoll||now-np->diagnosticLayerLastPoll>=250)){
+        if(!d.gaitDone)gait=admit(d.state,653,d.gaitDone);
+        if(!d.actionLayersDone){if(!d.action.msg){fail(PN_CONTEXT);d.actionLayersDone=true;}else layers=admit(d.action,653,d.actionLayersDone);}
+        d.layersDone=d.gaitDone&&d.actionLayersDone;
+    }
+    if(!d.taskDone){if(!d.action.msg){fail(PN_CONTEXT);d.taskDone=true;}else taskQuery=admit(d.action,654,d.taskDone);}
+    if(scalar||gait||layers||taskQuery){
+        if(!IsAlive(*np)){fail(PN_BODY_CHANGED);return;}
+        if(d.body&&(d.body!=np->ped||d.handle!=np->handle)){fail(PN_BODY_CHANGED);d.pending=false;return;}
+        if(!d.body){d.body=np->ped;d.handle=np->handle;}
+        auto*p=np->ped;
+        if(scalar){
+            const float health=p->Health(),armour=p->Armour();const int move=p->MoveState(),state=p->PedState();
+            if(!std::isfinite(health)||!std::isfinite(armour)||move<0||move>7||state<0||state>255){fail(PN_INVALID_METRICS);return;}
+            const auto physical=p->PhysicalFlags(),flags=p->PedFlags(),entity=p->Flags();
+            auto e=PedStateNativeEvent(*np,d,652,PN_OBSERVED,true);e.health=d.requested.health;e.afterHealth=health;e.armour=armour;
+            flight::AddUnsigned(e,flight::Metric::StateClock,d.requested.time);flight::AddUnsigned(e,flight::Metric::ActionRevision,d.requested.interaction.revision);
+            flight::AddUnsigned(e,flight::Metric::RequestedMoveState,d.requested.moveState);flight::AddUnsigned(e,flight::Metric::ObservedMoveState,(unsigned)move);
+            flight::AddUnsigned(e,flight::Metric::RequestedPedFlags,d.requested.flags);flight::AddUnsigned(e,flight::Metric::ObservedPedState,(unsigned)state);flight::AddFloat(e,flight::Metric::RequestedHealth,d.requested.health);flight::AddFloat(e,flight::Metric::ObservedHealth,health);(void)flight::Record(e);
+            auto f=PedStateNativeEvent(*np,d,652,PN_OBSERVED,true);flight::AddUnsigned(f,flight::Metric::NativeFlags,physical);flight::AddUnsigned(f,flight::Metric::ObservedPedFlags,flags);flight::AddUnsigned(f,flight::Metric::ObservedMotionFlags,entity);flight::AddUnsigned(f,flight::Metric::Operation,branch);flight::AddFloat(f,flight::Metric::RequestedArmour,d.requested.armour);flight::AddFloat(f,flight::Metric::ObservedArmour,armour);(void)flight::Record(f);
+            d.scalarDone=d.scalarRead=true;
+        }
+        if(taskQuery){const auto task=d.requested.interaction.leaf!=0xFFFF?d.requested.interaction.leaf:d.requested.interaction.task;
+            auto t=PedStateNativeEvent(*np,d,654,PN_OBSERVED,true,true);flight::AddUnsigned(t,flight::Metric::Operation,branch);flight::AddSigned(t,flight::Metric::RequestedTask,task);
+            if(p->Intelligence())flight::AddSigned(t,flight::Metric::ObservedTask,FindTask(p,task)?task:-1);else{t.reason=PN_NO_INTELLIGENCE;flight::AddSigned(t,flight::Metric::NativeResult,PN_NO_INTELLIGENCE);}(void)flight::Record(t);d.taskDone=true;
+        }
+        if(gait||layers){np->diagnosticLayerLastPoll=now;EmitPedObservedLayers(*np,d,p->RwObject(),(gait?1u:0u)|(layers?0x7eu:0u));if(gait)d.gaitDone=true;if(layers)d.actionLayersDone=true;d.layersDone=d.gaitDone&&d.actionLayersDone;}
+    }
+    if(d.scalarDone&&d.layersDone&&d.taskDone){
+        if(d.scalarRead){np->diagnosticNativeEpisode=d.episode;np->diagnosticNativeEpisodeKnown=true;np->diagnosticNativeHandle=np->handle;np->diagnosticNativeBody=np->ped;}
+        np->diagnosticNativeStateSerial=d.stateSerial;np->diagnosticNativeActionSerial=d.actionSerial;d.result=PN_OBSERVED;d.pending=false;
+    }
+}
+struct PedStateObservationScope {
+    uint16_t id=0;uint64_t span=0;uint8_t branch=PS_GENERAL;bool nativeAllowed=false;
+    explicit PedStateObservationScope(NetPed&np):id(np.netId),span(BeginPedStateObservation(np)){}
+    ~PedStateObservationScope(){ObservePedStateObservation(id,span,branch,nativeAllowed);}
+};
+
+void RetirePedNativeDiagnostics(NetPed&np){
+    RetirePedStateObservation(np,PN_CANCELLED);
+    for(auto&d:np.diagnosticTasks)if(d.pending){EmitPedTaskDiagnostic(np,d,PN_CANCELLED);d.pending=false;}
+    RetirePedAnimationDiagnostic(np,PN_CANCELLED);
 }
 
 // The action animation the ped plays: anything but its own walk/run/idle set (CPed::m_nAnimGroup).
@@ -459,7 +857,8 @@ void ReplayBoundAction(NetPed&np,float age){
     else np.baseBlock=kNoAnim;
     if(st.animBlock!=kNoAnim){
         AnimationState pose;pose.block=st.animBlock;pose.index=st.animIdx;pose.flags=st.animFlags;pose.time=st.animTime;pose.speed=st.animSpeed;
-        ReplayInteractionPose(ped->RwObject(),pose,age);
+        auto*diagnosticAssociation=ReplayInteractionPose(ped->RwObject(),pose,age);
+        ObservePedAnimation(np,pose,age,diagnosticAssociation,true);
         if(st.interaction.partnerKind||(st.flags&PedSyncState::F_DEAD)){
             for(void*a=anim::First(ped->RwObject());a;a=anim::Next(a)){
                 auto present=anim::Capture(a);bool retained=pose.Same(present)||st.motion.Same(present);
@@ -578,6 +977,7 @@ int Peds::SpecialModelFor(const std::string& name) {
 }
 
 void Peds::OnInstallHooks() {
+    Net().SetAuthorityHandler(ENTITY_PED,[](authority::Notice&n){return Instance().HandleAuthority(n);});
     mem::HookFn(0x618B60,&PointArm,&originalPointArm,"IKChainManager::PointArm couple contact");
     mem::HookFn(0x409D10, &HookRequestSpecialModel, &g_origRequestSpecial, "CStreaming::RequestSpecialModel");
     mem::HookFn(0x608540, &HookGetVacantSlot, &g_origVacantSlot, "CPedScriptedTaskRecord::GetVacantSlot");
@@ -590,7 +990,7 @@ void Peds::OnInstallHooks() {
     Net().SetHandler(proto::G_RESYNC, [](uint8_t from, Reader& r) {
         WorldResync resync;
         if (!resync.Read(r)) return;
-        if (!core::IsPlayerReady()) return;
+        if (!flow::InSharedWorld() || !core::IsPlayerReady()) return;
         // its game started over: what it owned before is gone there
         Instance().DropMirrorsOf(from, false);
         Vehicles::Instance().ForgetOwnedBy(from, resync.vehicles);
@@ -613,12 +1013,204 @@ CPed* Peds::FindOwned(uint16_t netId) {
 }
 
 NetPed* Peds::EnsureNetworked(CPed* ped) {
-    if(!Net().Online()||!ped||!IsPedValid(ped)||ped->IsPlayer()||Players::Instance().FindByPed(ped))return nullptr;
-    if(auto*np=Find(ped))return np;
-    uint16_t id=m_ids.Take((uint16_t)((Net().MyId()+1)<<12),NowMs(),[&](uint16_t v){return m_byId.count(v)!=0;});if(!id)return nullptr;
+    if(!flow::InSharedWorld()||!ped||!IsPedValid(ped)||ped->IsPlayer()||Players::Instance().FindByPed(ped))return nullptr;
+    if(PrivateImpoundPed(ped))return nullptr;
+    if(auto*np=Find(ped))return np->awaitingLookup?nullptr:np;
+    uint16_t id=m_ids.Take((uint16_t)((Net().MyId()+1)<<12),NowMs(),[&](uint16_t v){return m_byId.count(v)!=0||m_retainedCrew.count(v)!=0;});if(!id)return nullptr;
     auto&n=m_byId[id];n.netId=id;n.ped=ped;n.handle=GetPedRef(ped);n.owner=Net().MyId();n.model=ped->ModelIndex();n.pedType=(uint8_t)ped->PedType();
     if(auto it=m_specialNames.find(n.model);it!=m_specialNames.end())n.special=it->second;
-    m_byPtr[ped]=id;Net().BeginEntity(ENTITY_PED,id);Announce(n);return &n;
+    m_byPtr[ped]=id;Net().BeginEntity(ENTITY_PED,id);
+    n.diagnosticWorld=Net().WorldEpoch();n.diagnosticGeneration=Net().EntityGeneration(ENTITY_PED,id);RecordPedDiagnostic(LocalPedDiagnostic(id,proto::G_PED_CREATE),641,PD_RETAINED,&n);
+    Announce(n);return &n;
+}
+
+void Peds::CaptureOwnerProofs(NetPed&np){
+    if(np.ownerProofsKnown||!Net().Online()||!Net().MyIncarnation()||np.owner!=Net().MyId()||!IsAlive(np))return;
+    constexpr uint32_t mask=CPhysical::PF_BULLET_PROOF|CPhysical::PF_FIRE_PROOF|CPhysical::PF_EXPLOSION_PROOF|CPhysical::PF_COLLISION_PROOF|CPhysical::PF_MELEE_PROOF;
+    np.ownerProofs=np.ped->PhysicalFlags()&mask;np.ownerProofsWorld=Net().WorldEpoch();np.ownerProofsConnection=Net().MyIncarnation();
+    np.ownerProofsGeneration=Net().EntityGeneration(ENTITY_PED,np.netId);np.ownerProofsHandle=np.handle;np.ownerProofsBody=np.ped;np.ownerProofsKnown=true;
+}
+
+void Peds::RestoreOwnerProofs(NetPed&np,bool ending){
+    constexpr uint32_t mask=CPhysical::PF_BULLET_PROOF|CPhysical::PF_FIRE_PROOF|CPhysical::PF_EXPLOSION_PROOF|CPhysical::PF_COLLISION_PROOF|CPhysical::PF_MELEE_PROOF;
+    if(np.ownerProofsKnown&&np.owner==Net().MyId()&&IsAlive(np)&&np.ped==np.ownerProofsBody&&np.handle==np.ownerProofsHandle&&
+       np.ownerProofsGeneration&&Net().EntityGeneration(ENTITY_PED,np.netId)==np.ownerProofsGeneration&&Net().WorldEpoch()==np.ownerProofsWorld&&
+       (Net().MyIncarnation()==np.ownerProofsConnection||(ending&&!Net().Online()))){
+        np.ped->PhysicalFlags()=(np.ped->PhysicalFlags()&~mask)|np.ownerProofs;
+    }
+    np.ownerProofsKnown=false;np.ownerProofsBody=nullptr;np.ownerProofsHandle=-1;
+}
+
+bool Peds::HandleAuthority(authority::Notice&n){
+    using Op=authority::ServerOp;bool ready=true;
+    if(n.op==Op::Lookup){
+        const auto&queried=n.members[0];
+        if(queried.ref.kind==ENTITY_VEHICLE){
+            for(auto&[id,saved]:m_retainedCrew)if(saved.vehicle==queried.ref.id&&saved.vehicleGeneration==queried.ref.generation){
+                bool listed=false;for(const auto&m:n.members)listed|=m.ref.kind==ENTITY_PED&&m.ref.id==id&&m.ref.generation==saved.generation;
+                if(!listed)Net().LookupAuthority({ENTITY_PED,255,id,saved.generation,0});
+            }
+        }
+        for(const auto&m:n.members){if(m.ref.kind!=ENTITY_PED)continue;
+            auto saved=m_retainedCrew.find(m.ref.id);auto row=m_byId.find(m.ref.id);
+            if(saved!=m_retainedCrew.end()&&saved->second.generation!=m.ref.generation)continue;
+            if(queried.ref.kind==ENTITY_PED&&(n.reason==authority::Reason::Missing||n.reason==authority::Reason::Retired)){
+                if(saved==m_retainedCrew.end())continue;
+                if(row!=m_byId.end()&&Net().EntityGeneration(ENTITY_PED,m.ref.id)==m.ref.generation){auto&np=row->second;
+                    if(IsAlive(np)){np.authorityHeld=np.awaitingLookup=np.lookupAwaitingState=false;
+                        if(np.ped->CreatedBy()==PED_GAME)Adopt(np);
+                        else np.ped->PhysicalFlags()=(np.ped->PhysicalFlags()&~0x2000u)|((np.state.entityFlags&4)?0x2000u:0u);m_byPtr.erase(np.ped);}
+                    m_byId.erase(row);
+                }
+                m_retainedCrew.erase(saved);continue;
+            }
+            if(n.reason!=authority::Reason::Ok||Net().EntityGeneration(ENTITY_PED,m.ref.id)!=m.ref.generation||row==m_byId.end())continue;
+            auto&np=row->second;
+            if(IsAlive(np)&&np.ped->ModelIndex()!=np.model)continue;
+            if(saved!=m_retainedCrew.end()&&saved->second.handle>=0){auto*original=GetPed(saved->second.handle);
+                if(original&&original->ModelIndex()==saved->second.model&&(!IsAlive(np)||np.ped!=original||saved->second.handle!=np.handle))continue;
+            }
+            if(np.owner==m.owner&&m.owner!=authority::NoOwner&&!np.awaitingLookup&&!np.lookupAwaitingState&&!np.authorityHeld){if(saved!=m_retainedCrew.end())m_retainedCrew.erase(saved);continue;}
+            np.owner=m.owner;np.awaitingLookup=false;np.lookupAwaitingState=m.owner!=authority::NoOwner;np.authorityHeld=true;
+            if(np.lookupAwaitingState)np.hasState=false; // A living owner must supply its current state, not the saved pose.
+            if(m.seat==authority::VehicleSeat){np.state.flags&=~PedSyncState::F_IN_VEHICLE;np.state.vehNetId=0;np.state.seat=-1;}
+            else for(const auto&car:n.members)if(car.ref.kind==ENTITY_VEHICLE){np.state.flags|=PedSyncState::F_IN_VEHICLE;np.state.vehNetId=car.ref.id;np.state.seat=m.seat;break;}
+            if(saved!=m_retainedCrew.end()){
+                saved->second.state=np.state;
+                if(m.seat==authority::VehicleSeat){saved->second.vehicle=0;saved->second.vehicleGeneration=0;}
+                else for(const auto&car:n.members)if(car.ref.kind==ENTITY_VEHICLE){saved->second.vehicle=car.ref.id;saved->second.vehicleGeneration=car.ref.generation;break;}
+                if(IsAlive(np))m_retainedCrew.erase(saved);
+            }
+            if(m.owner==authority::NoOwner&&m.seat==authority::VehicleSeat){auto member=m;member.transfer=true;Net().RequestAuthority({member},Net().MyId(),false);}
+        }
+        return true;
+    }
+    if(n.op==Op::Stop)for(const auto&m:n.members)if(m.ref.kind==ENTITY_PED&&m.transfer){
+        auto i=m_byId.find(m.ref.id);if(i!=m_byId.end()&&i->second.owner==Net().MyId()&&IsAlive(i->second)&&
+           (StoryPed(i->second.ped)||i->second.ped->CreatedBy()!=PED_GAME))return false;
+    }
+    if(n.op==Op::Commit&&n.transaction&&n.owner==Net().MyId())for(const auto&m:n.members)if(m.ref.kind==ENTITY_PED){
+        auto row=m_byId.find(m.ref.id);if(row==m_byId.end()||!IsAlive(row->second)||Net().EntityGeneration(ENTITY_PED,m.ref.id)!=m.ref.generation)return false;
+        auto&np=row->second;if(m.transfer&&np.model==285&&np.pedType==PED_TYPE_COP&&np.ped->PedType()!=PED_TYPE_COP)return false;
+        if(m.seat>=-1){const authority::Member*car=nullptr;for(const auto&c:n.members)if(c.ref.kind==ENTITY_VEHICLE){car=&c;break;}
+            auto*nv=car?Vehicles::Instance().Find(car->ref.id):nullptr;if(!nv||!CrewMemberReady({m.ref.id,m.ref.generation,m.seat},nv->veh,m.owner))return false;}
+        else if(np.ped->InVehicle())return false;
+    }
+    std::vector<uint16_t> displaced;
+    for(const auto&m:n.members){if(m.ref.kind!=ENTITY_PED||!m.transfer)continue;
+        auto i=m_byId.find(m.ref.id);if(i==m_byId.end()){ready=false;continue;}auto&np=i->second;
+        if(Net().EntityGeneration(ENTITY_PED,m.ref.id)!=m.ref.generation)return false;
+        if(!np.ped&&(n.op==Op::Commit||n.op==Op::Abort||n.op==Op::Reject)){
+            np.owner=m.owner;np.awaitingLookup=np.authorityHeld=true;np.lookupAwaitingState=false;
+            Net().LookupAuthority({ENTITY_PED,255,m.ref.id,m.ref.generation,0});continue;
+        }
+        if(n.op==Op::Stop){
+            if(n.owner!=Net().MyId()&&n.source!=Net().MyId())continue;
+            if(IsAlive(np)&&np.owner==Net().MyId()&&(StoryPed(np.ped)||np.ped->CreatedBy()!=PED_GAME))return false;
+            if(n.owner==Net().MyId()&&n.source==n.target&&m.seat==-1&&IsAlive(np)){
+                const authority::Member*cm=nullptr;for(const auto&c:n.members)if(c.ref.kind==ENTITY_VEHICLE){cm=&c;break;}
+                auto*car=cm?Vehicles::Instance().Find(cm->ref.id):nullptr;
+                if(!car||!Vehicles::Alive(*car)||Net().EntityGeneration(ENTITY_VEHICLE,cm->ref.id)!=cm->ref.generation)return false;
+                if(np.ped->VehicleIfIn()==car->veh&&car->veh->Driver()==np.ped){
+                    auto pos=np.ped->GetPosition();Cmd(0x0362).I(np.handle).F(pos.x).F(pos.y).F(pos.z).Run();
+                }
+                if(!IsAlive(np)||np.ped->InVehicle()||car->veh->Driver()==np.ped)return false;
+                Cmd(0x0687).I(np.handle).Run();
+                Announce(np); // Real native Foot, reliable and before StopAck.
+                displaced.push_back(np.netId);continue;
+            }
+            if(!np.authorityHeld&&IsAlive(np)){
+                CaptureOwnerProofs(np); // Before native task/decision-maker quiescence.
+                if(np.owner==Net().MyId()){np.state=Capture(np);np.hasState=true;Announce(np);}
+                // These are transferable ambient actors, never native script tasks.
+                Cmd(0x0687).I(np.handle).Run();Cmd(0x060B).I(np.handle).I(kEmptyDecisionMaker).Run();
+                np.ped->PhysicalFlags()|=0x2000u;np.ped->MoveSpeed()={};
+            }
+            np.authorityHeld=true;
+        }else if(n.op==Op::Prepare){
+            if(n.target!=Net().MyId())continue;
+            np.authorityHeld=true;
+            if(!IsAlive(np)&&!SpawnMirror(np)){ready=false;continue;}
+            if(!PrepareAdoptionBody(np)){ready=false;continue;}
+            if(m.seat==authority::VehicleSeat&&np.ped->InVehicle()){
+                if(np.ped->CreatedBy()!=PED_GAME||StoryPed(np.ped)){ready=false;continue;}
+                auto*oldCar=np.ped->VehicleIfIn();auto pos=np.ped->GetPosition();Cmd(0x0362).I(np.handle).F(pos.x).F(pos.y).F(pos.z).Run();
+                if(!IsAlive(np)||np.ped->InVehicle()||(IsVehicleValid(oldCar)&&PassengerSeatOf(oldCar,np.ped)>=-1)){ready=false;continue;}
+            }
+            if(m.seat!=authority::VehicleSeat){
+                const authority::Member*car=nullptr;for(const auto&c:n.members)if(c.ref.kind==ENTITY_VEHICLE){car=&c;break;}
+                auto*nv=car?Vehicles::Instance().Find(car->ref.id):nullptr;
+                if(!nv||!Vehicles::Alive(*nv)||Net().EntityGeneration(ENTITY_VEHICLE,car->ref.id)!=car->ref.generation||!Net().EntityLink(ENTITY_PED,m.ref.id,ENTITY_VEHICLE,car->ref.id)){ready=false;continue;}
+                VehicleCrewMember c{m.ref.id,m.ref.generation,m.seat};
+                if(!CrewMemberReady(c,nv->veh)){
+                    if(np.ped->InVehicle()){ready=false;continue;}
+                    if(m.seat==-1&&!nv->veh->Driver())Cmd(0x036A).I(np.handle).I(nv->handle).Run();
+                    else if(m.seat>=0&&m.seat<nv->veh->MaxPassengers()&&m.seat<8&&!nv->veh->Passengers()[m.seat])Cmd(0x0430).I(np.handle).I(nv->handle).I(m.seat).Run();
+                    if(!CrewMemberReady(c,nv->veh)){ready=false;continue;}
+                }
+            }
+            Cmd(0x060B).I(np.handle).I(kEmptyDecisionMaker).Run();np.ped->PhysicalFlags()|=0x2000u;np.ped->MoveSpeed()={};
+        }else{
+            const bool held=np.authorityHeld;np.owner=m.owner;np.authorityHeld=false;
+            if(n.transaction){np.poses.Clear();np.hasState=false;RetirePedDiagnostics(np);}
+            if(np.owner==Net().MyId()&&held&&IsAlive(np)){
+                np.pendingAdoption=false;np.adoptionWarm=false;Adopt(np);
+                if(n.op==Op::Abort||n.op==Op::Reject)RestoreOwnerProofs(np);
+                else{np.ownerProofsKnown=false;np.ownerProofsBody=nullptr;np.ownerProofsHandle=-1;}
+                np.firstAnnouncedMs=NowMs();np.lastSendMs=0;Announce(np);SendState(np);
+            }else if(IsAlive(np)){
+                // The giver is now an ordinary protected replica, exactly as
+                // in the previous peer handover path, with no native cop AI.
+                if(np.owner!=Net().MyId()&&np.owner!=authority::NoOwner&&np.model==285&&np.pedType==PED_TYPE_COP){
+                    PedRemovalDiagnostic removal(np,LocalPedDiagnostic(np.netId,proto::G_PED_REMOVE));m_byPtr.erase(np.ped);Cmd(0x009B).I(np.handle).Run();removal.Complete(true);np.ped=nullptr;np.handle=-1;continue;
+                }
+                if(np.owner!=Net().MyId()){
+                    Cmd(0x060B).I(np.handle).I(kEmptyDecisionMaker).Run();Cmd(0x02AB).I(np.handle).I(1).I(1).I(1).I(1).I(1).Run();Cmd(0x087E).I(np.handle).I(0).Run();
+                }
+                np.ped->PhysicalFlags()=(np.ped->PhysicalFlags()&~0x2000u)|((np.state.entityFlags&4)?0x2000u:0u);
+                if(np.owner==authority::NoOwner){np.authorityHeld=true;Cmd(0x0687).I(np.handle).Run();Cmd(0x060B).I(np.handle).I(kEmptyDecisionMaker).Run();np.ped->PhysicalFlags()|=0x2000u;}
+            }
+        }
+    }
+    if(!displaced.empty())n.members.erase(std::remove_if(n.members.begin(),n.members.end(),[&](const authority::Member&m){return m.ref.kind==ENTITY_PED&&std::find(displaced.begin(),displaced.end(),m.ref.id)!=displaced.end();}),n.members.end());
+    return ready;
+}
+
+bool Peds::CaptureCrewMember(CPed*ped,CVehicle*car,int8_t seat,VehicleCrewMember&out){
+    if(!IsPedValid(ped)||ped->IsPlayer()||Players::Instance().FindByPed(ped)||IsPedDead(ped)||
+       ped->VehicleIfIn()!=car||FindTask(ped,TASK_LEAVE_CAR)||FindTask(ped,TASK_ENTER_CAR_AS_DRIVER)||FindTask(ped,TASK_ENTER_CAR_AS_PASSENGER))return false;
+    if((seat==-1?car->Driver():seat>=0&&seat<8?car->Passengers()[seat]:nullptr)!=ped)return false;
+    auto*n=EnsureNetworked(ped);if(!n)return false;
+    const auto generation=Net().EntityGeneration(ENTITY_PED,n->netId);if(!generation)return false;
+    out={n->netId,generation,seat};return true;
+}
+
+bool Peds::HasUnresolvedCrew(CVehicle*car)const{
+    for(const auto&[id,np]:m_byId)if(IsAlive(np)&&np.ped->VehicleIfIn()==car){
+        if(np.awaitingLookup||np.lookupAwaitingState)return true;
+        if(np.hasState&&(!(np.state.flags&PedSyncState::F_IN_VEHICLE)||
+           (Vehicles::Instance().Find(np.state.vehNetId)&&Vehicles::Instance().Find(np.state.vehNetId)->veh!=car)))return true;
+    }
+    return false;
+}
+
+void Peds::PublishCrew(const VehicleCrew&crew){
+    for(unsigned i=0;i<crew.count;++i){const auto&m=crew.members[i];auto n=m_byId.find(m.ped);if(n!=m_byId.end()&&n->second.owner==Net().MyId()&&IsAlive(n->second)&&Net().EntityGeneration(ENTITY_PED,m.ped)==m.generation)Announce(n->second);}
+}
+
+void Peds::SetCrewVisibility(const VehicleCrew&crew,bool hidden){
+    for(unsigned i=0;i<crew.count;++i){const auto&m=crew.members[i];auto n=m_byId.find(m.ped);if(n==m_byId.end())continue;auto&np=n->second;
+        if(!IsAlive(np)||Net().EntityGeneration(ENTITY_PED,m.ped)!=m.generation)continue;
+        if(hidden){if(!np.crewHidden)np.crewWasVisible=np.ped->IsVisible();np.crewHidden=true;np.ped->Flags()&=~128u;}
+        else if(np.crewHidden){const bool visible=np.owner!=Net().MyId()&&np.hasState?(np.state.entityFlags&1)!=0:np.crewWasVisible;
+            np.ped->Flags()=(np.ped->Flags()&~128u)|(visible?128u:0u);np.crewHidden=false;}
+    }
+}
+
+bool Peds::CrewMemberReady(const VehicleCrewMember&m,CVehicle*car,uint8_t expectedOwner)const{
+    auto i=m_byId.find(m.ped);if(i==m_byId.end())return false;const auto&n=i->second;
+    if(!IsAlive(n)||!Net().EntityLive(ENTITY_PED,m.ped)||Net().EntityGeneration(ENTITY_PED,m.ped)!=m.generation||!Net().AuthorityLease(ENTITY_PED,m.ped,m.generation)||Net().AuthorityOwner(ENTITY_PED,m.ped,m.generation)!=(expectedOwner==authority::NoOwner?n.owner:expectedOwner)||n.ped->VehicleIfIn()!=car)return false;
+    return (m.seat==-1?car->Driver():m.seat>=0&&m.seat<car->MaxPassengers()&&m.seat<8?car->Passengers()[m.seat]:nullptr)==n.ped;
 }
 
 int Peds::HandleOf(uint16_t netId) {
@@ -648,7 +1240,7 @@ PedSyncState Peds::Capture(NetPed& np) {
     s.armour = std::clamp(ped->Armour(),0.f,1000000.f);
     s.weapon = (uint8_t)ped->ActiveWeapon().type;
     s.area = AreaOf(ped);
-    s.entityFlags=(ped->IsVisible()?1:0)|((ped->Flags()&1u)?2:0)|((ped->PhysicalFlags()&0x2000u)?4:0)|((Field<uint8_t>(ped,0x475)&1)?8:0)|(StoryPed(ped)?16:0);
+    s.entityFlags=((np.crewHidden?np.crewWasVisible:ped->IsVisible())?1:0)|((ped->Flags()&1u)?2:0)|((ped->PhysicalFlags()&0x2000u)?4:0)|((Field<uint8_t>(ped,0x475)&1)?8:0)|(StoryPed(ped)?16:0);
     if(s.entityFlags&4)s.vel={}; // native frozen peds can retain a stale falling velocity
     s.flags = (IsPedDead(ped) ? PedSyncState::F_DEAD : 0) | (ped->IsDucking() ? PedSyncState::F_DUCKING : 0);
 
@@ -735,6 +1327,8 @@ PedSyncState Peds::Capture(NetPed& np) {
 }
 
 void Peds::Announce(NetPed& np) {
+    if(np.authorityHeld||PrivateImpoundPed(np.ped))return;
+    if(np.pendingAdoption&&np.adoptionWarm)return;
     if(!np.firstAnnouncedMs)np.firstAnnouncedMs=NowMs();
     PedSyncState s = Capture(np);
     Writer w(proto::G_PED_CREATE);
@@ -755,9 +1349,13 @@ void Peds::Reannounce() {
 }
 
 void Peds::SendState(NetPed& np) {
+    if(np.authorityHeld||PrivateImpoundPed(np.ped))return;
+    if(np.pendingAdoption&&np.adoptionWarm)return;
     Writer w(proto::G_PED_SYNC);
     w.Entity(ENTITY_PED,np.netId,ENTITY_SNAPSHOT);
     auto state=Capture(np);WriteState(w,state);
+    passenger_trace::Publication diagnosticPublication(state.health,0,state.armour,0);
+    if(flight::Enabled()){flight::AddUnsigned(passenger_trace::publication,flight::Metric::RequestedMoveState,state.moveState);flight::AddUnsigned(passenger_trace::publication,flight::Metric::RequestedPedFlags,state.flags);if(state.interaction.task!=0xFFFF)flight::AddSigned(passenger_trace::publication,flight::Metric::RequestedTask,state.interaction.task);}
     bool actionActive=state.animBlock!=kNoAnim||state.interaction.parentKind||state.interaction.partnerKind||state.interaction.sequenceStep>=0;
     for(auto&layer:state.interaction.layers)actionActive|=layer.Present();
     if((actionActive||np.actionSentActive)&&state.interaction.revision!=np.actionSentRevision){
@@ -770,7 +1368,9 @@ void Peds::SendState(NetPed& np) {
 void Peds::RespawnCopiesOf(int model) {
     for (auto& [id, np] : m_byId) {
         if (np.owner == Net().MyId() || !IsAlive(np) || np.ped->ModelIndex() != model) continue;
+        PedRemovalDiagnostic removal(np,LocalPedDiagnostic(id,proto::G_PED_REMOVE));
         Cmd(0x009B).I(np.handle).Run();  // DELETE_CHAR: SpawnMirror makes it again
+        removal.Complete(true);
         m_byPtr.erase(np.ped);
         np.ped = nullptr;
         np.handle = -1;
@@ -782,8 +1382,11 @@ void Peds::Forget(uint16_t netId, bool deletePed) {
     auto it = m_byId.find(netId);
     if (it == m_byId.end()) return;
     NetPed& np = it->second;
+    auto diagnostic=np.diagnosticRemove.msg?np.diagnosticRemove:LocalPedDiagnostic(netId,proto::G_PED_REMOVE);
+    PedRemovalDiagnostic removal(np,diagnostic);RetirePedDiagnostics(np);
     if(!deletePed)HoldCorpseOutside(np,false);
     if (deletePed && IsAlive(np)) Cmd(0x009B).I(np.handle).Run();  // DELETE_CHAR
+    removal.Complete(deletePed);
     if(auto ptr=m_byPtr.find(np.ped);ptr!=m_byPtr.end()&&ptr->second==netId)m_byPtr.erase(ptr);
     m_ids.Retire(netId,NowMs());
     m_byId.erase(it);
@@ -798,7 +1401,7 @@ void Peds::ScanOwned() {
 
     // Interior changes do not always run ManagePed for the old area's population.
     for (auto& [id, np] : m_byId) {
-        if (np.owner != myId || !IsAlive(np) || np.ped->InVehicle()) continue;
+        if (np.owner != myId || (np.pendingAdoption&&np.adoptionWarm) || !IsAlive(np) || np.ped->InVehicle()) continue;
         CPed* ped = np.ped;
         const auto preferred=PopulationOwnerAt(ped->GetPosition(),AreaOf(ped));
         if(preferred==Net().HostId()&&preferred!=myId&&(np.netId>>12)==Net().HostId()+1)
@@ -816,12 +1419,25 @@ void Peds::ScanOwned() {
     // owned peds that vanished or went out of the partner's range
     std::vector<uint16_t> gone;
     for (auto& [id, np] : m_byId) {
-        if(np.owner!=myId)continue;
+        if(np.owner!=myId||np.authorityHeld)continue;
         // A missing native body is expected during a cold handover. Retain
         // only that bounded, generation-fenced retry; ordinary native removal
         // still retires an adopted ped immediately.
-        if(np.pendingAdoption){if(AdoptionCurrent(np)&&AdoptionVehicleCurrent(np)&&now<np.adoptionUntil&&(!np.adoptionSpawned||IsAlive(np)))continue;gone.push_back(id);continue;}
-        if (!IsAlive(np) || (PrivateInteriorPed(np.ped)||(!StoryPed(np.ped)&&now-np.firstAnnouncedMs>3000&&RemoteDistance(np.ped->VehicleIfIn()?np.ped->Vehicle()->GetPosition():np.ped->GetPosition(), np.ped->VehicleIfIn()?np.ped->Vehicle()->AreaCode():AreaOf(np.ped)) > SyncOut(np.ped))))
+        if(np.pendingAdoption){
+            const bool current=AdoptionCurrent(np)&&AdoptionVehicleCurrent(np);
+            if(np.adoptionWarm&&current&&IsAlive(np)&&now>=np.adoptionUntil){
+                RecordPedDiagnostic(LocalPedDiagnostic(id,proto::G_PED_OWNER),644,PD_ADOPTION_TIMEOUT,&np);
+                LOGI("Warm driver adoption cancelled id=%04X generation=%llu reason=timeout",id,(unsigned long long)np.adoptionGeneration);
+                np.state=Capture(np); // the actual body may have died while its car was unavailable
+                np.pendingAdoption=false;np.adoptionWarm=false;np.adoptionSpawned=false;
+                Adopt(np);
+                if(IsAlive(np)){np.firstAnnouncedMs=now;np.lastSendMs=0;np.handoverUntil=now+3000;Announce(np);SendState(np);}
+                continue;
+            }
+            if(current&&now<np.adoptionUntil&&(np.adoptionWarm?IsAlive(np):(!np.adoptionSpawned||IsAlive(np))))continue;
+            gone.push_back(id);continue;
+        }
+        if (!IsAlive(np) || (PrivateLocalPed(np.ped)||(!StoryPed(np.ped)&&now-np.firstAnnouncedMs>3000&&RemoteDistance(np.ped->VehicleIfIn()?np.ped->Vehicle()->GetPosition():np.ped->GetPosition(), np.ped->VehicleIfIn()?np.ped->Vehicle()->AreaCode():AreaOf(np.ped)) > SyncOut(np.ped))))
             gone.push_back(id);
     }
     for (uint16_t id : gone) {
@@ -840,7 +1456,7 @@ void Peds::ScanOwned() {
         auto* ped = (CPed*)(pool->objects + (size_t)i * kPedPoolElemSize);
         if (ped == me || ped->IsPlayer() || Players::Instance().FindByPed(ped)) continue;
         NetPed* np = Find(ped);
-        if(np&&np->pendingAdoption)continue; // do not publish a half-equipped recreated body
+        if(np&&(np->pendingAdoption||np->authorityHeld))continue; // do not publish a half-equipped recreated body
         if (np && np->owner != myId) continue;  // mirror
         auto*in=ped->VehicleIfIn();
         float d = RemoteDistance(in?in->GetPosition():ped->GetPosition(), in?in->AreaCode():AreaOf(ped));
@@ -851,7 +1467,7 @@ void Peds::ScanOwned() {
                 auto*v=ped->VehicleIfIn();auto*car=v?Vehicles::Instance().Find(v):nullptr;
                 if(!v||!car||(!car->playerUsed&&!car->script))continue;
             }
-            if(PrivateInteriorPed(ped))continue; // each local activity keeps its own native clerk/fighter script
+            if(PrivateLocalPed(ped))continue; // local activities/services keep their native actors and scripts
             if (!StoryPed(ped)&&d > SyncIn(ped)) continue;
             if (CVehicle* v = ped->VehicleIfIn(); v && !IsSyncableVehicle(v)) continue;
             uint16_t id=m_ids.Take((uint16_t)((myId+1)<<12),now,[&](uint16_t v){return m_byId.count(v)!=0;});
@@ -865,6 +1481,7 @@ void Peds::ScanOwned() {
             n.pedType = (uint8_t)ped->PedType();
             if (auto it = m_specialNames.find(n.model); it != m_specialNames.end()) n.special = it->second;
             m_byPtr[ped] = id;
+            n.diagnosticWorld=Net().WorldEpoch();n.diagnosticGeneration=Net().EntityGeneration(ENTITY_PED,id);RecordPedDiagnostic(LocalPedDiagnostic(id,proto::G_PED_CREATE),641,PD_RETAINED,&n);
             Announce(n);
             continue;
         }
@@ -875,32 +1492,32 @@ void Peds::ScanOwned() {
 
 CPed* Peds::SpawnMirror(NetPed& np) {
     profile::Scope timing(profile::ENTITY_CREATE);
-    if(m_spawnBudget<=0){np.spawnWait.Block("ped",np.netId,"creation_budget",np.spawnWait.priority);return nullptr;}
+    if(m_spawnBudget<=0){np.spawnWait.Block("ped",np.netId,"creation_budget",np.spawnWait.priority);PedDiagnosticWait(np,PD_BUDGET);return nullptr;}
     const PedSyncState& st = np.state;
     int model = np.model;
     if (model >= kSpecialFirst && model <= kSpecialLast) {
-        if (np.special.empty()){np.spawnWait.Block("ped",np.netId,"special_name_missing");return nullptr;}
+        if (np.special.empty()){np.spawnWait.Block("ped",np.netId,"special_name_missing");PedDiagnosticWait(np,PD_SPECIAL_NAME);return nullptr;}
         // in whichever slot holds that name here, or a free one: the owner's slot can belong to someone here (a
         // mission's person, another copy), and RequestSpecialModel took the model from under them
         model = SpecialModelFor(np.special);
-        if (model < 0){np.spawnWait.Block("ped",np.netId,"special_slot_pending",np.spawnWait.priority);return nullptr;}
+        if (model < 0){np.spawnWait.Block("ped",np.netId,"special_slot_pending",np.spawnWait.priority);PedDiagnosticWait(np,PD_SPECIAL_SLOT);return nullptr;}
     } else if (!IsPedModel(model)) {
-        return nullptr;
+        PedDiagnosticWait(np,PD_MODEL);return nullptr;
     }
     if (!IsModelLoaded(model)) {
         // streamed in the background, the spawn is retried (a blocking load per ped stalls the frame)
         RequestSharedModel(model,np.spawnWait.priority>0);
-        np.spawnWait.Block("ped",np.netId,"model_not_loaded",np.spawnWait.priority);return nullptr;
+        np.spawnWait.Block("ped",np.netId,"model_not_loaded",np.spawnWait.priority);PedDiagnosticWait(np,PD_MODEL_WAIT);return nullptr;
     }
-    if (!HasRoom(PedPool(), kKeepPeds, "ped")){np.spawnWait.Block("ped",np.netId,"ped_pool_full");return nullptr;}
-    if (!HasRoom(Ref<CPoolHeader*>(0xB744A8),64,"task")){np.spawnWait.Block("ped",np.netId,"task_pool_full");return nullptr;}
+    if (!HasRoom(PedPool(), kKeepPeds, "ped")){np.spawnWait.Block("ped",np.netId,"ped_pool_full");PedDiagnosticWait(np,PD_PED_POOL);return nullptr;}
+    if (!HasRoom(Ref<CPoolHeader*>(0xB744A8),64,"task")){np.spawnWait.Block("ped",np.netId,"task_pool_full");PedDiagnosticWait(np,PD_TASK_POOL);return nullptr;}
     // mirrors are civilians whatever the owner's type: cop/gang/emergency classes add their own AI and
     // the cop class even replaces the model
     int pedType = np.pendingAdoption&&np.model==285&&np.pedType==PED_TYPE_COP?PED_TYPE_COP:np.pedType == PED_TYPE_CIVFEMALE ? PED_TYPE_CIVFEMALE : PED_TYPE_CIVMALE;
     int handle = -1;
     if (st.flags & PedSyncState::F_IN_VEHICLE) {
         NetVehicle* nv = (Net().EntityLink(ENTITY_PED,np.netId,ENTITY_VEHICLE,st.vehNetId)?Vehicles::Instance().Find(st.vehNetId):nullptr);
-        if (!nv || !Vehicles::Alive(*nv)){np.spawnWait.Block("ped",np.netId,"vehicle_missing",np.spawnWait.priority);return nullptr;}
+        if (!nv || !Vehicles::Alive(*nv)){np.spawnWait.Block("ped",np.netId,"vehicle_missing",np.spawnWait.priority);PedDiagnosticWait(np,PD_VEHICLE);return nullptr;}
         if (st.seat < 0) {
             // A local ambient task can occupy a remote car before its streamed
             // driver arrives. That unrelated occupant must not block the real
@@ -913,11 +1530,11 @@ CPed* Peds::SpawnMirror(NetPed& np) {
                     auto p=d->GetPosition();Cmd(0x0362).I(GetPedRef(d)).F(p.x).F(p.y).F(p.z).Run();
                 }
             }
-            if (nv->veh->Driver()){np.spawnWait.Block("ped",np.netId,"driver_seat_occupied",np.spawnWait.priority);return nullptr;}
+            if (nv->veh->Driver()){np.spawnWait.Block("ped",np.netId,"driver_seat_occupied",np.spawnWait.priority);PedDiagnosticWait(np,PD_DRIVER_SEAT);return nullptr;}
             --m_spawnBudget;
             Cmd(0x0129).I(nv->handle).I(pedType).I(model).Out(&handle).Run();  // CREATE_CHAR_INSIDE_CAR
         } else {
-            if (st.seat >= nv->veh->MaxPassengers() || st.seat >= 8 || nv->veh->Passengers()[st.seat]){np.spawnWait.Block("ped",np.netId,"passenger_seat_unavailable",np.spawnWait.priority);return nullptr;}
+            if (st.seat >= nv->veh->MaxPassengers() || st.seat >= 8 || nv->veh->Passengers()[st.seat]){np.spawnWait.Block("ped",np.netId,"passenger_seat_unavailable",np.spawnWait.priority);PedDiagnosticWait(np,PD_PASSENGER_SEAT);return nullptr;}
             --m_spawnBudget;
             Cmd(0x01C8).I(nv->handle).I(pedType).I(model).I(st.seat).Out(&handle).Run();  // CREATE_CHAR_AS_PASSENGER
         }
@@ -926,17 +1543,28 @@ CPed* Peds::SpawnMirror(NetPed& np) {
         Cmd(0x009A).I(pedType).I(model).F(st.pos.x).F(st.pos.y).F(st.pos.z - 1.0f).Out(&handle).Run();  // CREATE_CHAR
     }
     CPed* ped = GetPed(handle);
-    if (!ped){np.spawnWait.Block("ped",np.netId,"native_creation_failed");return nullptr;}
+    if (!ped){np.spawnWait.Block("ped",np.netId,"native_creation_failed");PedDiagnosticWait(np,PD_NATIVE_FAILED);return nullptr;}
     np.spawnWait.Done("ped",np.netId);
     Cmd(0x060B).I(handle).I(kEmptyDecisionMaker).Run();  // SET_CHAR_DECISION_MAKER: reacts to nothing by itself
     Cmd(0x02AB).I(handle).I(1).I(1).I(1).I(1).I(1).Run();  // SET_CHAR_PROOFS: damage is decided by the owner
     Cmd(0x087E).I(handle).I(0).Run();                      // SET_CHAR_DROPS_WEAPONS_WHEN_DEAD false
     ped->CurrentRotation() = ped->AimingRotation() = st.heading;
     ped->AreaCode() = st.area;
+    // Publish a live native body only after its initial owner vitals are applied.
+    if(!(st.flags & PedSyncState::F_DEAD)){
+        ped->Health() = std::max<float>(1.0f, st.health);
+        ped->Armour() = st.armour;
+    }
     if(!(st.flags&PedSyncState::F_ENTERING))np.carContact=false;
     np.ped = ped;np.deadApplied=false;np.knockdownReplay=false;np.animFull=false;
     np.handle = handle;
+    if(st.flags&PedSyncState::F_IN_VEHICLE)if(auto*car=Vehicles::Instance().Find(st.vehNetId);car&&(car->crewStaged||car->authorityHeld)){
+        for(unsigned i=0;i<car->stagedCrew.count;++i)if(car->stagedCrew.members[i].ped==np.netId&&car->stagedCrew.members[i].generation==Net().EntityGeneration(ENTITY_PED,np.netId)){
+            np.crewWasVisible=ped->IsVisible();np.crewHidden=true;ped->Flags()&=~128u;break;}
+    }
     m_byPtr[ped] = np.netId;
+    RecordPedSpawn(np);
+    if(!np.awaitingLookup)m_retainedCrew.erase(np.netId);
     return ped;
 }
 
@@ -946,14 +1574,20 @@ void Peds::HandleCreate(uint8_t from, Reader& r) {
     uint8_t pedType = r.U8();
     std::string special = r.Str(16);
     PedSyncState st;
-    if(!ReadState(r,st))return;
-    if (!r.Ok() || from == Net().MyId() || !core::IsPlayerReady()) return;
+    const bool decoded=ReadState(r,st);auto diagnostic=IncomingPedDiagnostic(id,proto::G_PED_CREATE);
+    if(!decoded){RecordPedDiagnostic(diagnostic,644,PD_MALFORMED);return;}
+    if (!r.Ok() || from == Net().MyId() || !core::IsPlayerReady()){RecordPedDiagnostic(diagnostic,644,!r.Ok()?PD_MALFORMED:from==Net().MyId()?PD_SENDER:PD_NOT_READY);return;}
     if(auto it=m_byId.find(id);it!=m_byId.end()){
         auto&known=it->second;
         if(known.owner==from&&known.model==model&&(!known.hasState||((int32_t)(st.time-known.state.time)>=0&&
            (int32_t)(st.interaction.revision-known.state.interaction.revision)>=0))){
-            known.state=st;known.hasState=true;known.recvMs=NowMs();known.poses.Push({st.time,st.pos,st.vel,st.heading},known.recvMs);
-        }
+            AcceptPedStateDiagnostic(known,diagnostic);
+            known.state=st;if(auto saved=m_retainedCrew.find(id);saved!=m_retainedCrew.end()&&saved->second.generation==Net().EntityGeneration(ENTITY_PED,id))saved->second.state=st;known.hasState=true;if(known.lookupAwaitingState){known.lookupAwaitingState=false;known.authorityHeld=false;}known.recvMs=NowMs();known.poses.Push({st.time,st.pos,st.vel,st.heading},known.recvMs);
+            if(diagnostic.msg){
+                if(IsAlive(known)){if(known.diagnosticBirthPending)RecordPedSpawn(known);RecordPedDiagnostic(diagnostic,PedDiagnosticCurrent(known,diagnostic)?641:644,PedDiagnosticCurrent(known,diagnostic)?PD_RETAINED:PD_CONTEXT,&known);}
+                else{RetirePedBirthDiagnostic(known,PD_BIRTH_REPLACED);known.diagnosticBirth=diagnostic;known.diagnosticBirthPending=true;RecordPedDiagnostic(diagnostic,644,PD_PENDING,&known);}
+            }
+        }else RecordPedDiagnostic(diagnostic,644,known.owner!=from?PD_SENDER:known.model!=model?PD_CONFLICT:(int32_t)(st.time-known.state.time)<0?PD_OLD_TIME:PD_OLD_ACTION,&known);
         return;
     }
     NetPed& np = m_byId[id];
@@ -962,6 +1596,9 @@ void Peds::HandleCreate(uint8_t from, Reader& r) {
     np.model = model;
     np.pedType = pedType;
     np.special = special;
+    np.diagnosticWorld=Net().WorldEpoch();np.diagnosticGeneration=Net().ExpectedEntityGeneration(ENTITY_PED,id);np.diagnosticBirth=diagnostic;np.diagnosticBirthPending=diagnostic.msg!=0;
+    AcceptPedStateDiagnostic(np,diagnostic);
+    PedDiagnosticWait(np,PD_PENDING);
     if(np.hasState&&(int32_t)(st.interaction.revision-np.state.interaction.revision)<0){st.interaction=np.state.interaction;st.animBlock=np.state.animBlock;st.animIdx=np.state.animIdx;st.animTime=np.state.animTime;st.animSpeed=np.state.animSpeed;st.animFlags=np.state.animFlags;}
     np.state = st;
     np.hasState = true;
@@ -971,9 +1608,11 @@ void Peds::HandleCreate(uint8_t from, Reader& r) {
 
 void Peds::HandleRemove(uint8_t from, Reader& r) {
     uint16_t id = r.U16();
-    if (!r.Ok()) return;
+    auto diagnostic=IncomingPedDiagnostic(id,proto::G_PED_REMOVE);
+    if (!r.Ok()){RecordPedDiagnostic(diagnostic,644,PD_MALFORMED);return;}
     auto it = m_byId.find(id);
-    if (it == m_byId.end() || it->second.owner != from) return;
+    if (it == m_byId.end() || it->second.owner != from){RecordPedDiagnostic(diagnostic,644,it==m_byId.end()?PD_MISSING:PD_SENDER,it==m_byId.end()?nullptr:&it->second);return;}
+    it->second.diagnosticRemove=diagnostic;
     Forget(id, true);
 }
 
@@ -993,78 +1632,94 @@ bool Peds::QueueGiveAway(CPed* ped, uint8_t to) {
     return true;
 }
 
-void Peds::GiveAway(uint16_t netId, uint8_t to) {
-    auto it=m_byId.find(netId);
-    if(it==m_byId.end()||it->second.owner!=Net().MyId()||to==Net().MyId()||!Net().Peer(to)||!IsAlive(it->second))return;
-    auto&np=it->second;
-    HoldCorpseOutside(np,false);
-    np.state=Capture(np);
-    Writer w(proto::G_PED_OWNER);
-    w.Entity(ENTITY_PED,netId);
-    w.U8(to);
-    Net().Send(proto::CH_RELIABLE, w);
-    LOGD("Ped %04X handed over to player %d", netId, to);
-    np.owner=to;np.hasState=false;np.handoverUntil=NowMs()+3000;
-    if(np.model==285&&np.pedType==PED_TYPE_COP){m_byPtr.erase(np.ped);Cmd(0x009B).I(np.handle).Run();np.ped=nullptr;np.handle=-1;return;}
-    Cmd(0x060B).I(np.handle).I(kEmptyDecisionMaker).Run();
-    Cmd(0x02AB).I(np.handle).I(1).I(1).I(1).I(1).I(1).Run();
-    Cmd(0x087E).I(np.handle).I(0).Run();
+void Peds::GiveAway(uint16_t id,uint8_t to){
+    auto i=m_byId.find(id);if(i==m_byId.end())return;auto&np=i->second;
+    if(np.owner!=Net().MyId()||!IsAlive(np)||np.authorityHeld)return;
+    if(auto*v=np.ped->VehicleIfIn()){
+        if(auto*car=Vehicles::Instance().Find(v);car&&car->owner==Net().MyId())Vehicles::Instance().RequestCrewAuthority(*car,to,true);
+        return; // Occupants never move authority separately from their native car.
+    }
+    Announce(np);authority::Member m;m.ref={ENTITY_PED,255,id,Net().EntityGeneration(ENTITY_PED,id),0};m.seat=authority::VehicleSeat;
+    Net().RequestAuthority({m},to,true);
 }
 
 // The owner handed its ped over: the mirror is this game's own from now on, an ordinary ped (its own decision maker
 // and a wander task, CTheScripts::CleanUpThisPed); in a car handed over with it, it drives on.
-void Peds::HandleOwner(uint8_t from, Reader& r) {
-    uint16_t id = r.U16();
-    uint8_t to = r.U8();
-    if (!r.Ok()) return;
-    auto it = m_byId.find(id);
-    if (it == m_byId.end()) {
-        if (to == Net().MyId()) {
-            Writer gone(proto::G_PED_REMOVE);
-            gone.Entity(ENTITY_PED,id,ENTITY_REMOVE);
-            Net().Send(proto::CH_RELIABLE, gone);
-        }
-        return;
+void Peds::HandleOwner(uint8_t,Reader&r){
+    (void)r.U16();(void)r.U8(); // Protocol46: only server Commit changes ownership.
+}
+
+bool Peds::PrepareAdoptionBody(NetPed&np){
+    if(IsAlive(np)&&np.model==285&&np.pedType==PED_TYPE_COP&&np.ped->PedType()!=PED_TYPE_COP){
+        if(m_spawnBudget<=0)return false;--m_spawnBudget;
+        auto at=np.state.pos;auto old=np.ped;m_byPtr.erase(old);Cmd(0x009B).I(np.handle).Run();np.ped=nullptr;np.handle=-1;
+        int handle=-1;Cmd(0x009A).I(PED_TYPE_COP).I(285).F(at.x).F(at.y).F(at.z-1).Out(&handle).Run();
+        auto*p=GetPed(handle);if(!p)return false;
+        np.ped=p;np.handle=handle;m_byPtr[p]=np.netId;p->AreaCode()=np.state.area;
+        Cmd(0x060B).I(handle).I(kEmptyDecisionMaker).Run();Cmd(0x02AB).I(handle).I(1).I(1).I(1).I(1).I(1).Run();
+        if(np.authorityHeld)p->PhysicalFlags()|=0x2000u;
+        LOGI("Landed SWAT native AI adopted id=%04X owner=%u",np.netId,Net().MyId());
     }
-    if (it->second.owner != from) return;
-    NetPed& np = it->second;
-    np.owner = to;
-    np.pendingAdoption=false;
-    np.hasState = false;  // the next state comes from a different clock
-    np.poses.Clear();
-    if (to != Net().MyId()) return;  // a third player keeps the same mirror instead of deleting it
-    if (!IsAlive(np)) {
-        // The old viewer may have streamed the physical copy out. Retain the
-        // record and spawn it before adoption instead of globally removing it.
-        QueueAdoption(np);
-        return;
+    if(!IsAlive(np))return false;
+    if(!(np.state.flags&PedSyncState::F_DEAD)&&np.state.weapon&&np.ped->ActiveWeapon().type!=np.state.weapon){
+        if(!WeaponAnimationsReady(np.ped,np.state.weapon))return false;
+        int model=-1;Cmd(0x0781).I(np.state.weapon).Out(&model).Run();
+        if(model>0&&!IsModelLoaded(model)){RequestModel(model,0);return false;}
+        Cmd(0x01B2).I(np.handle).I(np.state.weapon).I(300).Run();Cmd(0x01B9).I(np.handle).I(np.state.weapon).Run();
     }
-    if (IsPedDead(np.ped)) {
-        np.state.flags|=PedSyncState::F_DEAD;np.state.health=0;
-    }
-    Adopt(np);
-    if(!IsAlive(np))return;
-    np.lastSendMs = 0;np.handoverUntil=NowMs()+2000;
-    Announce(np);  // preserve the id, including its vehicle's occupant references
-    SendState(np);
-    LOGD("Ped %04X taken over from player %d", id, from);
+    return true;
+}
+
+namespace {
+bool PassengerCleanupLayoutSupported(){
+    if(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr))!=0x400000)return false;
+    auto matches=[](uintptr_t address,const uint8_t*expected,size_t size){
+        uint8_t actual[47]{};SIZE_T read=0;
+        return size<=sizeof actual&&ReadProcessMemory(GetCurrentProcess(),reinterpret_cast<const void*>(address),actual,size,&read)&&
+            read==size&&std::memcmp(actual,expected,size)==0;
+    };
+    static constexpr uint8_t entry[]={0x64,0xA1,0x00,0x00,0x00,0x00,0x6A,0xFF,0x68,0x66,0x84,0x83,0x00,0x50};
+    static constexpr uint8_t mission_keep[]={0x8A,0x86,0x84,0x04,0x00,0x00,0x3C,0x02,0x0F,0x85,0x1E,0x03,0x00,0x00,0x6A,0x01,0x8B,0xCE,0xE8,0xA1,0xE4,0x15,0x00,0xF6,0x86,0x78,0x04,0x00,0x00,0x10,0x0F,0x85,0x02,0x03,0x00,0x00};
+    static constexpr uint8_t driver_split[]={0x8B,0x86,0x6C,0x04,0x00,0x00,0x55,0xBD,0x00,0x01,0x00,0x00,0x85,0xC5,0x57,0x0F,0x84,0x1E,0x01,0x00,0x00,0x8B,0x86,0x8C,0x05,0x00,0x00,0x85,0xC0,0x0F,0x84,0x10,0x01,0x00,0x00,0x3B,0xB0,0x60,0x04,0x00,0x00,0x0F,0x85,0x04,0x01,0x00,0x00};
+    static constexpr uint8_t bookkeeping[]={0xFF,0x0D,0x24,0xEC,0xC0,0x00,0x8B,0x4C,0x24,0x38,0x5E,0x5B,0x64,0x89,0x0D,0x00,0x00,0x00,0x00,0x83,0xC4,0x3C,0xC3};
+    return matches(0x486300,entry,sizeof entry)&&
+        matches(0x486328,mission_keep,sizeof mission_keep)&&
+        matches(0x48634C,driver_split,sizeof driver_split)&&
+        matches(0x48664E,bookkeeping,sizeof bookkeeping);
+}
 }
 
 void Peds::Adopt(NetPed& np) {
     if(np.knockdownReplay){np.animFull=false;np.baseBlock=kNoAnim;}
     np.knockdownReplay=false;
-    if(IsAlive(np)&&np.model==285&&np.pedType==PED_TYPE_COP&&np.ped->PedType()!=PED_TYPE_COP){
-        auto at=np.state.pos;auto old=np.ped;m_byPtr.erase(old);Cmd(0x009B).I(np.handle).Run();np.ped=nullptr;np.handle=-1;
-        int handle=-1;Cmd(0x009A).I(PED_TYPE_COP).I(285).F(at.x).F(at.y).F(at.z-1).Out(&handle).Run();
-        auto*p=GetPed(handle);if(!p){QueueAdoption(np);return;}
-        np.ped=p;np.handle=handle;m_byPtr[p]=np.netId;p->AreaCode()=np.state.area;
-        if(np.state.weapon>0&&np.state.weapon<=46){Cmd(0x01B2).I(handle).I(np.state.weapon).I(300).Run();Cmd(0x01B9).I(handle).I(np.state.weapon).Run();}
-        LOGI("Landed SWAT native AI adopted id=%04X owner=%u",np.netId,Net().MyId());
-    }
+    // Native class replacement and weapon streaming happen before readiness.
+    // Commit may only activate this already verified native body.
+    if(np.model==285&&np.pedType==PED_TYPE_COP&&np.ped->PedType()!=PED_TYPE_COP)return;
     if(IsAlive(np))np.ped->PhysicalFlags()&=~0x2000u;
     Cmd(0x02AB).I(np.handle).I(0).I(0).I(0).I(0).I(0).Run();  // SET_CHAR_PROOFS off
     Cmd(0x087E).I(np.handle).I(1).Run();                      // SET_CHAR_DROPS_WEAPONS_WHEN_DEAD
-    Cmd(0x01C2).I(np.handle).Run();                           // MARK_CHAR_AS_NO_LONGER_NEEDED
+    // Native 01C2 otherwise gives a mission-born passenger a leave-and-wander
+    // sequence. Preserve its current task only for this cleanup call, not its seat forever.
+    constexpr uint32_t keepTasks=0x10u;bool borrowedKeep=false;
+    auto*cleanupPed=np.ped;const int cleanupHandle=np.handle;
+    const auto pedGeneration=Net().EntityGeneration(ENTITY_PED,np.netId);
+    if(Net().Online()&&flow::InSharedWorld()&&Net().MyIncarnation()&&Net().WorldEpoch()&&np.owner==Net().MyId()&&
+       IsAlive(np)&&cleanupPed->CreatedBy()==2&&!IsPedDead(cleanupPed)&&cleanupPed->Health()>0&&
+       !(np.state.flags&PedSyncState::F_DEAD)&&(np.state.flags&PedSyncState::F_IN_VEHICLE)&&np.state.seat>=0&&np.state.seat<8&&
+       pedGeneration&&Net().EntityLive(ENTITY_PED,np.netId)&&Net().AuthorityOwner(ENTITY_PED,np.netId,pedGeneration)==np.owner&&Net().AuthorityLease(ENTITY_PED,np.netId,pedGeneration)){
+        auto*car=Vehicles::Instance().Find(np.state.vehNetId);
+        const auto generation=Net().EntityGeneration(ENTITY_VEHICLE,np.state.vehNetId);
+        if(car&&Vehicles::Alive(*car)&&generation&&Net().EntityLive(ENTITY_VEHICLE,car->netId)&&
+           Net().EntityLink(ENTITY_PED,np.netId,ENTITY_VEHICLE,car->netId)&&Net().AuthorityLease(ENTITY_VEHICLE,car->netId,generation)&&
+           Net().AuthorityOwner(ENTITY_VEHICLE,car->netId,generation)<proto::kMaxPlayers&&cleanupPed->VehicleIfIn()==car->veh&&
+           car->veh->Driver()!=cleanupPed&&np.state.seat<car->veh->MaxPassengers()&&car->veh->Passengers()[np.state.seat]==cleanupPed){
+            if(PassengerCleanupLayoutSupported()){
+                if(!(cleanupPed->PedFlags4()&keepTasks)){cleanupPed->PedFlags4()|=keepTasks;borrowedKeep=true;}
+            }else{static bool reported=false;if(!reported){reported=true;LOGW("NPC passenger cleanup task preservation disabled: unsupported native layout");}}
+        }
+    }
+    Cmd(0x01C2).I(np.handle).Run();                           // native cleanup/bookkeeping unchanged
+    if(borrowedKeep&&np.ped==cleanupPed&&np.handle==cleanupHandle&&GetPed(cleanupHandle)==cleanupPed)cleanupPed->PedFlags4()&=~keepTasks;
     // A streamed-out body recreated for handover starts at native health 100.
     // Ownership must retain the source's death/health rather than revive it.
     if(IsAlive(np)){
@@ -1082,11 +1737,31 @@ void Peds::Adopt(NetPed& np) {
     CallMethod<0x5E06E0>(np.ped);  // CPed::SetPedDefaultDecisionMaker: the one of its stats, now that no script holds it
 }
 
+bool Peds::QueueWarmDriverAdoption(NetPed&np){
+    if(np.pendingAdoption)return np.adoptionWarm; // never extend an existing lease
+    const auto&st=np.state;
+    if(!np.hasState||!IsAlive(np)||IsPedDead(np.ped)||np.ped->IsPlayer()||Players::Instance().FindByPed(np.ped)||
+       np.pedType<PED_TYPE_CIVMALE||np.pedType>31||np.pedType==PED_TYPE_COP||np.pedType==PED_TYPE_MEDIC||np.pedType==PED_TYPE_FIREMAN||
+       !(st.flags&PedSyncState::F_IN_VEHICLE)||(st.flags&(PedSyncState::F_DEAD|PedSyncState::F_ENTERING|PedSyncState::F_LEAVING))||st.seat!=-1||
+       (st.entityFlags&16)||!Net().EntityLive(ENTITY_PED,np.netId)||!Net().EntityGeneration(ENTITY_PED,np.netId)||
+       !Net().EntityGeneration(ENTITY_VEHICLE,st.vehNetId)||!Net().EntityLink(ENTITY_PED,np.netId,ENTITY_VEHICLE,st.vehNetId))return false;
+    auto*nv=Vehicles::Instance().Find(st.vehNetId);
+    if(nv&&(nv->script||Vehicles::ScriptControlled(nv->veh)))return false;
+    // A seated driver's existing adoption path is unchanged. Do not pull a
+    // native actor out of another seat/car to satisfy an old snapshot either.
+    if(np.ped->InVehicle())return false;
+    np.pendingAdoption=true;np.adoptionWarm=true;np.adoptionSpawned=false;
+    np.adoptionWorld=Net().WorldEpoch();np.adoptionGeneration=Net().EntityGeneration(ENTITY_PED,np.netId);
+    np.adoptionVehicleGeneration=Net().EntityGeneration(ENTITY_VEHICLE,st.vehNetId);np.adoptionUntil=NowMs()+15000;
+    LOGI("Warm driver adoption queued id=%04X generation=%llu vehicle=%04X",np.netId,(unsigned long long)np.adoptionGeneration,st.vehNetId);
+    return true;
+}
+
 void Peds::QueueAdoption(NetPed&np){
     if(auto i=m_byPtr.find(np.ped);i!=m_byPtr.end()&&i->second==np.netId)m_byPtr.erase(i);
     np.ped=nullptr;np.handle=-1;
     if(np.pendingAdoption)return; // a repeated failure must not extend its lease
-    np.pendingAdoption=true;np.adoptionSpawned=false;np.adoptionWorld=Net().WorldEpoch();
+    np.pendingAdoption=true;np.adoptionWarm=false;np.adoptionSpawned=false;np.adoptionWorld=Net().WorldEpoch();
     np.adoptionGeneration=Net().EntityGeneration(ENTITY_PED,np.netId);
     np.adoptionVehicleGeneration=(np.state.flags&PedSyncState::F_IN_VEHICLE)?Net().EntityGeneration(ENTITY_VEHICLE,np.state.vehNetId):0;
     np.adoptionUntil=NowMs()+15000;
@@ -1118,21 +1793,31 @@ bool Peds::AdoptionRelevant(const NetPed&np)const{
 
 void Peds::RetryAdoption(NetPed&np){
     if(!np.pendingAdoption||!AdoptionCurrent(np)||!AdoptionVehicleCurrent(np)||NowMs()>=np.adoptionUntil||!AdoptionRelevant(np))return;
-    if(!IsAlive(np)){
+    if(np.adoptionWarm){
+        if(!IsAlive(np)||IsPedDead(np.ped)||np.ped->IsPlayer()||Players::Instance().FindByPed(np.ped))return;
+        auto*nv=Vehicles::Instance().Find(np.state.vehNetId);
+        if(!nv||!Vehicles::Alive(*nv)||nv->owner!=Net().MyId()||nv->script||Vehicles::ScriptControlled(nv->veh))return;
+        const int area=np.state.area;
+        if((AreaOf(np.ped)!=area&&AreaOf(np.ped)!=13&&area!=13)||(nv->veh->AreaCode()!=area&&nv->veh->AreaCode()!=13&&area!=13))return;
+        bool seated=np.ped->VehicleIfIn()==nv->veh&&nv->veh->Driver()==np.ped;
+        if(!seated){
+            if(np.ped->InVehicle()||nv->veh->Driver()||NowMs()-np.lastTaskMs<1000)return;
+            np.lastTaskMs=NowMs();Cmd(0x036A).I(np.handle).I(nv->handle).Run();
+        }
+        // Native seating must succeed on the same current body/car before
+        // cleanup can initialise its driver AI or publication can capture it.
+        if(!IsAlive(np)||IsPedDead(np.ped)||!AdoptionCurrent(np)||!AdoptionVehicleCurrent(np)||!Vehicles::Alive(*nv)||nv->owner!=Net().MyId()||
+           np.ped->VehicleIfIn()!=nv->veh||nv->veh->Driver()!=np.ped)return;
+    }else if(!IsAlive(np)){
         if(np.adoptionSpawned)return; // a native deletion after creation is final
         if(!SpawnMirror(np))return;
         np.adoptionSpawned=true;
     }
     // Recreated copies start unarmed. Keep the native gun task behind the same
     // IFP/model readiness boundary as ordinary mirrors before publishing it.
-    if(!(np.state.flags&PedSyncState::F_DEAD)&&np.state.weapon&&np.ped->ActiveWeapon().type!=np.state.weapon){
-        if(!WeaponAnimationsReady(np.ped,np.state.weapon))return;
-        int model=-1;Cmd(0x0781).I(np.state.weapon).Out(&model).Run();
-        if(model>0&&!IsModelLoaded(model)){RequestModel(model,0);return;}
-        Cmd(0x01B2).I(np.handle).I(np.state.weapon).I(300).Run();Cmd(0x01B9).I(np.handle).I(np.state.weapon).Run();
-    }
+    if(!PrepareAdoptionBody(np))return;
     Adopt(np);if(!IsAlive(np))return;
-    np.pendingAdoption=false;np.adoptionSpawned=false;np.firstAnnouncedMs=NowMs();np.lastSendMs=0;np.handoverUntil=NowMs()+3000;
+    np.pendingAdoption=false;np.adoptionWarm=false;np.adoptionSpawned=false;np.firstAnnouncedMs=NowMs();np.lastSendMs=0;np.handoverUntil=NowMs()+3000;
     Announce(np);SendState(np);
     LOGI("Ped adoption ready id=%04X generation=%llu",np.netId,(unsigned long long)np.adoptionGeneration);
 }
@@ -1140,13 +1825,14 @@ void Peds::RetryAdoption(NetPed&np){
 void Peds::HandleSync(uint8_t from, Reader& r) {
     uint16_t id = r.U16();
     PedSyncState st;
-    if(!ReadState(r,st))return;
-    if (!r.Ok()) return;
+    const bool decoded=ReadState(r,st);auto diagnostic=IncomingPedDiagnostic(id,proto::G_PED_SYNC);if(decoded)diagnostic.wireTime=st.time;
+    if(!decoded||!r.Ok()){RecordPedDiagnostic(diagnostic,644,PD_MALFORMED);return;}
     auto it = m_byId.find(id);
-    if (it == m_byId.end() || it->second.owner != from) return;
+    if (it == m_byId.end() || it->second.owner != from){RecordPedDiagnostic(diagnostic,644,it==m_byId.end()?PD_MISSING:PD_SENDER,it==m_byId.end()?nullptr:&it->second);return;}
     NetPed& np = it->second;
-    if (np.hasState && (int32_t)(st.time - np.state.time) < 0) return;  // reordered
-    if(np.hasState&&(int32_t)(st.interaction.revision-np.state.interaction.revision)<0)return;
+    if (np.hasState && (int32_t)(st.time - np.state.time) < 0){RecordPedDiagnostic(diagnostic,644,PD_OLD_TIME,&np);return;}  // reordered
+    if(np.hasState&&(int32_t)(st.interaction.revision-np.state.interaction.revision)<0){RecordPedDiagnostic(diagnostic,644,PD_OLD_ACTION,&np);return;}
+    AcceptPedStateDiagnostic(np,diagnostic);
     np.state = st;
     np.hasState = true;
     np.recvMs = NowMs();
@@ -1154,13 +1840,16 @@ void Peds::HandleSync(uint8_t from, Reader& r) {
 }
 
 void Peds::HandleAction(uint8_t from,Reader&r){
-    auto id=r.U16();PedSyncState st;if(!st.Read(r))return;auto i=m_byId.find(id);if(i==m_byId.end()||i->second.owner!=from)return;
-    auto&n=i->second;if(n.hasState&&(int32_t)(st.interaction.revision-n.state.interaction.revision)<=0){LOGD("NPC action revision ignored id=%04X incoming=%u current=%u",id,st.interaction.revision,n.state.interaction.revision);return;}
+    auto id=r.U16();PedSyncState st;const bool decoded=st.Read(r);auto diagnostic=IncomingPedDiagnostic(id,proto::G_PED_ACTION);if(decoded)diagnostic.wireTime=st.time;
+    if(!decoded){RecordPedDiagnostic(diagnostic,644,PD_MALFORMED);return;}auto i=m_byId.find(id);if(i==m_byId.end()||i->second.owner!=from){RecordPedDiagnostic(diagnostic,644,i==m_byId.end()?PD_MISSING:PD_SENDER,i==m_byId.end()?nullptr:&i->second);return;}
+    auto&n=i->second;if(n.hasState&&(int32_t)(st.interaction.revision-n.state.interaction.revision)<=0){LOGD("NPC action revision ignored id=%04X incoming=%u current=%u",id,st.interaction.revision,n.state.interaction.revision);RecordPedDiagnostic(diagnostic,644,PD_OLD_ACTION,&n);return;}
+    AcceptPedActionDiagnostic(n,diagnostic);
     // A reliable action can overtake the preceding state-channel sample.
     // Advance its transform clock too, so that older samples cannot revive
     // the previous partner/task or overwrite the first contact pose.
     if(!n.hasState||(int32_t)(st.time-n.state.time)>=0){
-        Net().RememberEntityLinks(ENTITY_PED,id);n.state=st;n.hasState=true;n.recvMs=NowMs();
+        AcceptPedStateDiagnostic(n,diagnostic);n.diagnosticActionOwnsPose=true;
+        Net().RememberEntityLinks(ENTITY_PED,id);n.state=st;if(auto saved=m_retainedCrew.find(id);saved!=m_retainedCrew.end()&&saved->second.generation==Net().EntityGeneration(ENTITY_PED,id))saved->second.state=st;n.hasState=true;if(n.lookupAwaitingState){n.lookupAwaitingState=false;n.authorityHeld=false;}n.recvMs=NowMs();
         n.poses.Push({st.time,st.pos,st.vel,st.heading},n.recvMs);return;
     }
     Net().RememberEntityLinks(ENTITY_PED,id);n.state.interaction=st.interaction;n.state.animBlock=st.animBlock;n.state.animIdx=st.animIdx;n.state.animFlags=st.animFlags;
@@ -1180,7 +1869,10 @@ void Peds::ApplyMirror(NetPed& np) {
     }
     if(!np.hasState)return;
     const PedSyncState& st = np.state;
+    PedStateObservationScope diagnosticStateScope(np);
+    if(st.animBlock==kNoAnim)RetirePedAnimationDiagnostic(np,PN_CANCELLED);
     uint64_t now = NowMs();
+    ExpirePedNativeDiagnostics(np,now); // metadata-only, including streamed-out bodies
     auto*focus=FindPlayerPed(0);bool camera=Ref<uint8_t>(addr::TheCamera+0x2B)==0;
     int area=camera?Ref<int32_t>(0xB72914):focus->AreaCode();
     CVector centre=camera?cam::Source():focus->GetPosition();
@@ -1192,7 +1884,8 @@ void Peds::ApplyMirror(NetPed& np) {
     auto*sceneCar=story&&st.vehNetId?Vehicles::Instance().Find(st.vehNetId):nullptr;
     bool relevant=nearPlayer||((st.area==area||st.area==13)&&((st.pos-centre).Length2D()<(story?1100.f:280.f)||(sceneCar&&Vehicles::Alive(*sceneCar))));
     if(!relevant){
-        if(IsAlive(np)&&now-np.lastRelevantMs>5000){auto*old=np.ped;m_byPtr.erase(old);Cmd(0x009B).I(np.handle).Run();np.ped=nullptr;np.handle=-1;np.animBlock=np.baseBlock=kNoAnim;np.animFull=false;np.knockdownReplay=false;np.lastTaskMove=0;np.gunMode=0;}
+        PedDiagnosticWait(np,PD_INTEREST);
+        if(IsAlive(np)&&now-np.lastRelevantMs>5000){PedRemovalDiagnostic removal(np,LocalPedDiagnostic(np.netId,proto::G_PED_REMOVE));auto*old=np.ped;m_byPtr.erase(old);Cmd(0x009B).I(np.handle).Run();removal.Complete(true);np.ped=nullptr;np.handle=-1;np.animBlock=np.baseBlock=kNoAnim;np.animFull=false;np.knockdownReplay=false;np.lastTaskMove=0;np.gunMode=0;}
         return;
     }
     np.lastRelevantMs=now;
@@ -1205,21 +1898,27 @@ void Peds::ApplyMirror(NetPed& np) {
     }
     CPed* ped = np.ped;
     if (!IsAlive(np)) {  // deleted by the game (should not happen to mission peds): spawn again
-        m_byPtr.erase(ped);
+        PedRemovalDiagnostic(np,LocalPedDiagnostic(np.netId,proto::G_PED_REMOVE)).Complete(true);
+        // The native slot may already be indexed by its new occupant.
+        if(auto ptr=m_byPtr.find(ped);ptr!=m_byPtr.end()&&ptr->second==np.netId)m_byPtr.erase(ptr);
         np.ped = nullptr;
         np.knockdownReplay=false;np.animFull=false;np.baseBlock=kNoAnim;
         return;
     }
+    PollPedTaskDiagnostics(np,now);
+    diagnosticStateScope.nativeAllowed=true;
+    const float diagnosticBefore=np.diagnosticStatePending&&flight::Enabled()?ped->Health():0;
     ped->AreaCode() = st.area;
-    ped->Flags()=(ped->Flags()&~(1u|128u))|((st.entityFlags&1)?128u:0)|((st.entityFlags&2)?1u:0);
+    ped->Flags()=(ped->Flags()&~(1u|128u))|((st.entityFlags&1)&&!np.crewHidden?128u:0)|((st.entityFlags&2)?1u:0);
     Field<uint8_t>(ped,0x475)=(Field<uint8_t>(ped,0x475)&~1u)|((st.entityFlags&8)?1u:0u);
     ped->PhysicalFlags()=(ped->PhysicalFlags()&~0x2000u)|((st.entityFlags&4)?0x2000u:0);
     if(st.entityFlags&4)ped->MoveSpeed()={};
     if (st.flags & PedSyncState::F_DEAD) {
+        diagnosticStateScope.branch=PS_DEATH;
         if(np.interactionAttached&&!st.interaction.parentKind){if(ped->AttachedTo())CallMethod<0x5E7EC0>(ped);np.interactionAttached=false;}
         if(st.flags&PedSyncState::F_IN_VEHICLE){
             auto*nv=(Net().EntityLink(ENTITY_PED,np.netId,ENTITY_VEHICLE,st.vehNetId)?Vehicles::Instance().Find(st.vehNetId):nullptr);
-            if(!nv||!Vehicles::Alive(*nv))return; // retain death until its car exists
+            if(!nv||!Vehicles::Alive(*nv)){PedDiagnosticWait(np,PD_VEHICLE);return;} // retain death until its car exists
             bool inside=ped->InVehicle()&&ped->Vehicle()==nv->veh;
             if(!inside){
                 if(st.seat<0&&!nv->veh->Driver())Cmd(0x036A).I(np.handle).I(nv->handle).Run();
@@ -1248,11 +1947,14 @@ void Peds::ApplyMirror(NetPed& np) {
                 // Native death with the owner's actual hierarchy, rather than
                 // a generic fall underneath its partial knife animation.
                 CallMethod<0x62FAF0>(task,h,(int)(st.animFlags&~(anim::F_BLOCK_REFERENCED|anim::F_INDESTRUCTIBLE)),8.f,st.animSpeed);
-                CallMethod<0x681AF0>((uint8_t*)ped->Intelligence()+4,task,0,false);
+                // Native EventDeath replaces the non-temporary response in slot 2.
+                // A SimpleDie in physical slot 0 would keep terminal Dead from running.
+                CallMethod<0x681AF0>((uint8_t*)ped->Intelligence()+4,task,2,false);
                 np.deathBlock=st.animBlock;np.deathIndex=st.animIdx;
             }
         }
         ped->Health()=0;
+        RecordPedHealth(np,diagnosticBefore);
         float age=std::min(.2f,(now-np.recvMs)/1000.f);
         ApplyInteraction(np,age);ReplayBoundAction(np,age);
         if(!(st.flags&PedSyncState::F_IN_VEHICLE))AlignContactHeading(np,st.heading);
@@ -1260,6 +1962,7 @@ void Peds::ApplyMirror(NetPed& np) {
     }
     ped->Health() = std::max<float>(1.0f, st.health);
     ped->Armour() = st.armour;
+    RecordPedHealth(np,diagnosticBefore);
     if (CWeapon& w = ped->ActiveWeapon(); w.type == np.lastWeapon && w.ammoInClip < np.lastClip) ++m_mirrorShots;
     np.lastClip = ped->ActiveWeapon().ammoInClip;
     np.lastWeapon = (uint8_t)ped->ActiveWeapon().type;
@@ -1305,6 +2008,7 @@ void Peds::ApplyMirror(NetPed& np) {
     // repeatedly replaces the reaction and snaps the victim upright.
     bool knocked=!(st.flags&PedSyncState::F_IN_VEHICLE)&&!st.interaction.parentKind&&st.interaction.FallingOrGettingUp();
     if(knocked){
+        diagnosticStateScope.branch=PS_FALL;
         if(ped->InVehicle()){
             Cmd(0x0362).I(np.handle).F(st.pos.x).F(st.pos.y).F(st.pos.z-1).Run();
             np.enterVeh=0;np.enterTaskMs=np.leaveTaskMs=0;
@@ -1331,6 +2035,7 @@ void Peds::ApplyMirror(NetPed& np) {
         bool inside = ped->InVehicle() && ped->Vehicle() == nv->veh;
         if (inside && (st.flags & PedSyncState::F_LEAVING) && !np.leaveTaskMs) {
             Cmd(0x05CD).I(np.handle).I(nv->handle).Run();  // TASK_LEAVE_CAR
+            PedTaskIssued(np,TASK_LEAVE_CAR);
             np.leaveTaskMs = now;
         }
         if (inside && (st.flags & PedSyncState::F_DRIVEBY) && !(st.flags & PedSyncState::F_LEAVING)) {
@@ -1375,6 +2080,7 @@ void Peds::ApplyMirror(NetPed& np) {
     if (ped->InVehicle()) {
         if (!np.leaveTaskMs) {
             Cmd(0x05CD).I(np.handle).I(GetVehicleRef(ped->Vehicle())).Run();  // TASK_LEAVE_CAR
+            PedTaskIssued(np,TASK_LEAVE_CAR);
             np.leaveTaskMs = now;
         } else if (now - np.leaveTaskMs > kCarTaskGraceMs) {
             Cmd(0x0362).I(np.handle).F(st.pos.x).F(st.pos.y).F(st.pos.z - 1.0f).Run();  // WARP_CHAR_FROM_CAR_TO_COORD (feet)
@@ -1402,6 +2108,7 @@ void Peds::ApplyMirror(NetPed& np) {
         if (nv && Vehicles::Alive(*nv) && np.enterVeh != st.vehNetId) {
             if (st.seat < 0) Cmd(0x05CB).I(np.handle).I(nv->handle).I(10000).Run();  // TASK_ENTER_CAR_AS_DRIVER
             else Cmd(0x05CA).I(np.handle).I(nv->handle).I(10000).I(SeatOrAny(nv->veh, st.seat)).Run();  // TASK_ENTER_CAR_AS_PASSENGER
+            PedTaskIssued(np,st.seat<0?TASK_ENTER_CAR_AS_DRIVER:TASK_ENTER_CAR_AS_PASSENGER);
             np.enterVeh = st.vehNetId;
             np.enterTaskMs = now;
             np.lastTaskMove = 0;
@@ -1547,7 +2254,8 @@ void Peds::ApplyMirror(NetPed& np) {
         AnimationState action;
         action.block = st.animBlock; action.index = st.animIdx; action.flags = st.animFlags;
         action.time = st.animTime; action.speed = st.animSpeed;
-        anim::Replay(ped->RwObject(), action, age);
+        auto*diagnosticAssociation=anim::Replay(ped->RwObject(), action, age);
+        ObservePedAnimation(np,action,age,diagnosticAssociation);
     }
     if (np.animFull||np.extraFull) {  // a full-body action plays: hold the position without locomotion tasks
         if (d > 0.25f) SetEntityPosition(ped, cur + CVector{err.x * 0.2f, err.y * 0.2f, 0});
@@ -1559,6 +2267,7 @@ void Peds::ApplyMirror(NetPed& np) {
     // walking/running with the normal animations towards the owner's position
     float speed = st.vel.Length2D();
     if (speed > 0.4f || d > 1.2f) {
+        diagnosticStateScope.branch=PS_MOVE;
         uint8_t move = st.moveState >= 7 ? 7 : (st.moveState >= 6 ? 6 : 4);
         // Mirrors are mission civilians, so their default gait and random walk speed differ
         // from the real ped. Keep its animation clock alongside the positional correction.
@@ -1580,6 +2289,7 @@ void Peds::ApplyMirror(NetPed& np) {
         if (d > 0.02f || std::fabs(err.z) > 0.3f)
             SetEntityPosition(ped, cur + CVector{err.x * k, err.y * k, std::fabs(err.z) > 0.3f ? err.z * k : 0});
     } else {
+        diagnosticStateScope.branch=PS_STAND;
         if (np.lastTaskMove != 1 && !TaskPending(ped)) {
             Cmd(0x05BA).I(np.handle).I(1000).Run();  // TASK_STAND_STILL
             np.lastTaskMove = 1;
@@ -1607,7 +2317,7 @@ int Peds::RemoveSharedAmbient(const CVector& centre,int8_t area,int budget) {
 
 void Peds::OnPreProcess() {
     m_spawnBudget=2;
-    bool ready=Net().Online()&&core::IsPlayerReady();
+    bool ready=flow::InSharedWorld()&&core::IsPlayerReady();
     if(!ready)return;
     if(!m_wasReady){
         Writer w(proto::G_RESYNC);
@@ -1641,6 +2351,11 @@ void Peds::OnPreProcess() {
     }
     std::sort(order.begin(),order.end());
     for(auto[score,id]:order){auto&np=m_byId.at(id);
+        if(np.owner==authority::NoOwner&&IsAlive(np)&&!np.awaitingLookup&&!np.lookupAwaitingState&&!Net().AuthorityStopped(ENTITY_PED,id)&&
+           PopulationOwnerAt(np.ped->GetPosition(),AreaOf(np.ped))==Net().MyId()&&Net().AuthorityLease(ENTITY_PED,id)!=np.orphanAttemptLease){
+            np.orphanAttemptLease=Net().AuthorityLease(ENTITY_PED,id);np.awaitingLookup=true;Net().LookupAuthority({ENTITY_PED,255,id,Net().EntityGeneration(ENTITY_PED,id),0});
+        }
+        if(np.authorityHeld)continue;
         if(np.pendingAdoption){
             RetryAdoption(np);
             continue;
@@ -1676,7 +2391,8 @@ void Peds::OnPostProcess() {
     for(auto i=handContacts.begin();i!=handContacts.end();){auto*p=GetPed(i->second.handle);
         i=!p||!GetPed(i->second.target)||!CallStd<0x6182B0,bool>((int)i->second.arm,p)?handContacts.erase(i):std::next(i);
     }
-    bool ready = Net().Online() && core::IsPlayerReady();
+    bool ready = flow::InSharedWorld() && core::IsPlayerReady();
+    if(ready)for(auto&[id,np]:m_byId)if(np.crewHidden&&IsAlive(np))np.ped->Flags()&=~128u;
     if(ready)for(auto&[id,np]:m_byId)
         if(np.owner!=Net().MyId()&&np.pairedAction&&np.state.interaction.couple&&IsAlive(np)&&
            !(np.state.flags&(PedSyncState::F_DEAD|PedSyncState::F_IN_VEHICLE))){
@@ -1714,10 +2430,49 @@ void Peds::OnPostProcess() {
     }
 }
 
+void Peds::RetainUsedCrew(){
+    for(auto&[id,np]:m_byId)if(np.owner==Net().MyId()&&IsAlive(np)&&!IsPedDead(np.ped)&&!FindTask(np.ped,TASK_LEAVE_CAR)){
+        auto*car=np.ped->VehicleIfIn();uint16_t vehicle=0;uint64_t generation=0;
+        if(!car||!Vehicles::Instance().RetainedSource(car,vehicle,generation))continue;
+        auto state=Capture(np);state.flags|=PedSyncState::F_IN_VEHICLE;state.vehNetId=vehicle;state.seat=(int8_t)PassengerSeatOf(car,np.ped);
+        if(state.seat< -1||state.seat>=8)continue;
+        RetainedCrew saved;saved.state=state;saved.special=np.special;saved.model=np.model;saved.pedType=np.pedType;
+        saved.generation=Net().EntityGeneration(ENTITY_PED,id);saved.vehicle=vehicle;saved.vehicleGeneration=generation;saved.handle=np.handle;
+        if(saved.generation)m_retainedCrew[id]=std::move(saved);
+    }
+}
+
+VehicleCrew Peds::RetainedVehicleCrew(uint16_t vehicle,uint64_t generation)const{
+    VehicleCrew crew;
+    for(const auto&[id,saved]:m_retainedCrew)if(saved.vehicle==vehicle&&saved.vehicleGeneration==generation&&saved.generation&&crew.count<crew.members.size())
+        crew.members[crew.count++]={id,saved.generation,saved.state.seat};
+    return crew;
+}
+
+void Peds::RebindRetainedCrew(){
+    if(!Net().Online())return;
+    for(auto&[id,saved]:m_retainedCrew){
+        auto*body=saved.handle>=0?GetPed(saved.handle):nullptr;
+        if(body&&body->ModelIndex()!=saved.model)body=nullptr;
+        NetPed np;np.netId=id;np.model=saved.model;np.pedType=saved.pedType;np.special=saved.special;
+        np.ped=body;np.handle=body?saved.handle:-1;np.state=saved.state;np.hasState=true;np.owner=authority::NoOwner;
+        np.awaitingLookup=np.authorityHeld=true;
+        if(body){np.state=Capture(np);m_byPtr[body]=id;
+            if(body->CreatedBy()==PED_GAME){Cmd(0x0687).I(np.handle).Run();Cmd(0x060B).I(np.handle).I(kEmptyDecisionMaker).Run();}body->PhysicalFlags()|=0x2000u;}
+        m_byId[id]=std::move(np);Net().LookupAuthority({ENTITY_PED,255,id,saved.generation,0});
+    }
+}
+
+void Peds::OnSessionStart(){RebindRetainedCrew();}
+
 void Peds::OnSessionEnd() {
+    RetainUsedCrew();
     handContacts.clear();
     coupleClocks.clear();
-    for(auto&[id,np]:m_byId)HoldCorpseOutside(np,false);
+    for(auto&[id,np]:m_byId){
+        HoldCorpseOutside(np,false);
+        if(np.authorityHeld&&np.owner==Net().MyId()&&IsAlive(np)){np.authorityHeld=false;Adopt(np);RestoreOwnerProofs(np,true);}
+    }
     // Local disconnect ends this world's replicas. Turning them into native
     // ambient peds loses their identities: a reconnect then creates a second
     // copy beside every released body. Other clients retain real ownership
@@ -1726,6 +2481,7 @@ void Peds::OnSessionEnd() {
     for(auto&[id,np]:m_byId)
         if(np.pendingAdoption||np.owner!=Net().MyId())copies.push_back(id);
     for(auto id:copies)Forget(id,true);
+    for(auto&[id,np]:m_byId)RetirePedDiagnostics(np);
     m_byId.clear();
     m_byPtr.clear();
     m_giveAway.clear();
@@ -1734,18 +2490,9 @@ void Peds::OnSessionEnd() {
 
 // The player left: its people stay in this game as its own (deleted, they left its cars driverless in the street, as MTA
 // keeps the elements and picks a new syncer).
-void Peds::OnPeerLeave(uint8_t id) {
-    std::vector<uint8_t> survivors{Net().MyId()};
-    for(auto&[peerId,peer]:Net().Peers())if(peerId!=id)survivors.push_back(peerId);
-    uint8_t successor=VehicleSuccessor(Net().HostId(),id,survivors);
-    for(auto&[pid,np]:m_byId)if(np.owner==id){
-        np.owner=successor;np.hasState=false;np.poses.Clear();np.handoverUntil=NowMs()+2000;
-        np.pendingAdoption=false;
-        if(successor==Net().MyId()&&!IsAlive(np)){QueueAdoption(np);continue;}
-        if(successor==Net().MyId()&&IsAlive(np)&&!IsPedDead(np.ped)){
-            Adopt(np);np.lastSendMs=0;Announce(np);
-        }
-    }
+void Peds::OnPeerLeave(uint8_t id){
+    for(auto i=m_giveAway.begin();i!=m_giveAway.end();)i=i->second==id?m_giveAway.erase(i):std::next(i);
+    // Canonical server Stop/Prepare/Commit owns disconnected-owner succession.
 }
 
 void Peds::DropMirrorsOf(uint8_t id, bool keep) {
@@ -1763,13 +2510,17 @@ void Peds::DropMirrorsOf(uint8_t id, bool keep) {
 void Peds::OnGameStarted() {
     weaponAnimationBlocks.clear();
     coupleClocks.clear();
+    for(auto&[id,np]:m_byId)RetirePedDiagnostics(np);
     m_byId.clear();
     m_byPtr.clear();
+    for(auto&[id,saved]:m_retainedCrew){saved.handle=-1;saved.state.time=0;saved.state.interaction={};saved.state.motion={};saved.state.animBlock=kNoAnim;}
+    RebindRetainedCrew();
     m_giveAway.clear();
     m_wasReady = false;  // ask the partner for its peds again once the player is ready
 }
 
 void Peds::OnGameShutdown() {
+    RetainUsedCrew();
     // Owned native peds may remain after leaving a session. Retain their
     // weapon blocks until the native world and its tasks are actually unloaded.
     ReleaseWeaponAnimations();

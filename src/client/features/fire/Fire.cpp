@@ -12,6 +12,7 @@
 
 #include "common/api/protocol/Protocol.h"
 #include "common/lib/log/Log.h"
+#include "common/lib/diagnostics/PassengerTrace.h"
 #include "common/lib/util/Util.h"
 #include "entities/mission/Mission.h"
 #include "entities/ped/Peds.h"
@@ -39,6 +40,39 @@ enum : uint8_t { ON_SPOT = 0, ON_VEHICLE = 1, ON_PED = 2, ON_PLAYER = 3 };
 uint8_t SourceKind(uint8_t kind){return kind==ON_PED?ENTITY_PED:kind==ON_VEHICLE?ENTITY_VEHICLE:0;}
 void WriteSource(Writer&w,uint8_t kind,uint16_t id,bool optional=false,uint64_t generation=0){if(auto type=SourceKind(kind))w.Entity(type,id,optional?ENTITY_OPTIONAL:ENTITY_USE,255,generation);else w.U16(id);}
 bool SourceValid(uint8_t kind,uint16_t id,const std::vector<EntityRef>&refs){auto type=SourceKind(kind);if(!type)return true;for(auto ref:refs)if(ref.kind==type&&ref.id==id)return Net().EntityContextValid({ref});return false;}
+
+
+// Combat observations refer to existing packet tokens; those tokens and packet
+// fingerprints remain scoped correlation hints, never global event identities.
+enum CombatDiagnosticReason:uint16_t { CD_DECODED=0,CD_MALFORMED,CD_SENDER,CD_NOT_READY,CD_RANGE,CD_DUPLICATE,CD_WAIT_CREATOR,CD_WAIT_TARGET,CD_CAPACITY,CD_EXPIRED,CD_RETIRED,CD_CANCELLED,CD_NATIVE_TRUE,CD_NATIVE_FALSE,CD_NO_OBJECT,CD_CONTEXT_UNAVAILABLE,CD_SOURCE_UNAVAILABLE,CD_SHADOW_SUPPRESSED,CD_STATE_INTERPOLATED,CD_OBSERVATION_BUSY,CD_OBSERVATION_BUDGET,CD_OBSERVATION_FILTERED,CD_OBSERVATION_SAMPLED,CD_OBSERVATION_DISABLED,CD_REPLACED };
+flight::Context LocalCombatContext(uint8_t msg){flight::Context c{};if(flight::Enabled()){c.msg=msg;c.source=Net().MyId();c.incarnation=Net().MyIncarnation();c.world=Net().WorldEpoch();}return c;}
+flight::Context CombatContext(uint8_t from,uint8_t msg){
+    if(!flight::Enabled())return {};auto c=Net().DiagnosticContext();if(c.msg!=msg||c.source!=from){c={};c.msg=msg;c.source=from;}return c;
+}
+void CombatNumbers(flight::Event&e,uint32_t sequence,uint32_t projectile,uint8_t kind,uint16_t id,int weapon,const std::vector<EntityRef>*refs=nullptr){
+    flight::AddUnsigned(e,e.context.msg==proto::G_EXPLOSION?flight::Metric::ExplosionId:flight::Metric::RequestId,sequence);
+    if(projectile)flight::AddUnsigned(e,flight::Metric::ProjectileId,projectile);
+    flight::AddUnsigned(e,e.context.msg==proto::G_EXPLOSION?flight::Metric::ExplosionType:flight::Metric::Weapon,(uint32_t)weapon);
+    if(auto type=SourceKind(kind)){
+        flight::AddUnsigned(e,flight::Metric::ActorKind,type);flight::AddUnsigned(e,flight::Metric::ActorId,id);
+        if(refs)for(size_t n=0;n<refs->size()&&n<16;++n){const auto&r=(*refs)[n];if(r.kind==type&&r.id==id){if(r.generation)flight::AddUnsigned(e,flight::Metric::ActorGeneration,r.generation);break;}}
+    }
+}
+void CombatRecord(const flight::Context&context,uint16_t stage,uint16_t reason,uint32_t sequence,uint32_t projectile,uint8_t kind,uint16_t id,int weapon,const std::vector<EntityRef>*refs=nullptr,int handle=-1,int nativeResult=-1){
+    if(!flight::Enabled())return;flight::Event e{};e.context=context;e.stage=stage;e.reason=reason;e.localPeer=Net().MyId();CombatNumbers(e,sequence,projectile,kind,id,weapon,refs);if(handle>=0)e.nativeHandle=(uint32_t)handle;if(nativeResult>=0)flight::AddSigned(e,flight::Metric::NativeResult,nativeResult);(void)flight::Record(e);
+}
+uint16_t CombatAdmissionReason(flight::NativeAdmission a){return a==flight::NativeAdmission::Busy?CD_OBSERVATION_BUSY:a==flight::NativeAdmission::Budget?CD_OBSERVATION_BUDGET:a==flight::NativeAdmission::Filtered?CD_OBSERVATION_FILTERED:a==flight::NativeAdmission::Sampled?CD_OBSERVATION_SAMPLED:a==flight::NativeAdmission::Disabled?CD_OBSERVATION_DISABLED:CD_DECODED;}
+void CombatPose(const flight::Context&context,uint16_t reason,uint32_t token,uint32_t clock,const CVector&pos,const CVector&speed,bool observed){
+    if(!flight::Enabled())return;flight::Event e{};e.context=context;e.stage=812;e.reason=reason;e.localPeer=Net().MyId();
+    flight::AddUnsigned(e,flight::Metric::ProjectileId,token);flight::AddUnsigned(e,flight::Metric::StateClock,clock);
+    flight::AddFloat(e,observed?flight::Metric::ObservedX:flight::Metric::RequestedX,pos.x);flight::AddFloat(e,observed?flight::Metric::ObservedY:flight::Metric::RequestedY,pos.y);flight::AddFloat(e,observed?flight::Metric::ObservedZ:flight::Metric::RequestedZ,pos.z);
+    flight::AddFloat(e,observed?flight::Metric::ObservedVx:flight::Metric::RequestedVx,speed.x);flight::AddFloat(e,observed?flight::Metric::ObservedVy:flight::Metric::RequestedVy,speed.y);flight::AddFloat(e,observed?flight::Metric::ObservedVz:flight::Metric::RequestedVz,speed.z);(void)flight::Record(e);
+}
+bool CombatContextCurrent(const flight::Context&c,uint32_t localWorld){
+    if(localWorld!=Net().WorldEpoch()||!c.incarnation)return false;
+    if(c.source==Net().MyId())return c.incarnation==Net().MyIncarnation()&&c.world==Net().WorldEpoch();
+    auto*p=Net().Peer(c.source);return p&&p->incarnation==c.incarnation&&Net().PeerWorldEpoch(c.source)==c.world;
+}
 
 uintptr_t Fire(int i) { return kFireManager + (uintptr_t)i * 0x28; }
 bool Active(uintptr_t f) { return Ref<uint8_t>(f) & 1; }
@@ -389,6 +423,7 @@ struct Flight {
     uint32_t token=0;uint64_t created=0;
     CVector lastPos;
     int handle=-1;uint8_t from=255;uint64_t creatorGeneration=0;int weapon=0;uint64_t flightSent=0;uint8_t sentTargetKind=255;uint16_t sentTarget=0;
+    flight::Context diagnostic{};uint32_t diagnosticWorld=0;
 };
 void RetireProjectile(uint8_t from,uint32_t token);
 void SendFlightGone(const Flight&flight);
@@ -435,9 +470,10 @@ bool g_settingOff = false;  // a blast of the other game
 // CExplosion::AddExplosion(victim, creator, type, position, lifetime, sound, camera shake, visible)
 bool __cdecl HookAddExplosion(CEntity* victim, CEntity* creator, int type, CVector pos, uint32_t lifetime, uint8_t sound,
                               float shake, uint8_t visible) {
+    uint32_t diagnosticSequence=0,diagnosticProjectile=0;uint8_t diagnosticKind=ON_SPOT;uint16_t diagnosticId=0;
     if (Net().Online() && core::IsPlayerReady() && IsBlast(type) && !g_settingOff) {
         auto*flight=BlastFlight(victim,creator,pos);
-        if(flight?!flight->authority:OtherSide(creator)){if(flight)LOGD("Projectile shadow blast suppressed token %u source %u",flight->token,flight->from);return true;}
+        if(flight?!flight->authority:OtherSide(creator)){if(flight){CombatRecord(flight->diagnostic,810,CD_SHADOW_SUPPRESSED,0,flight->token,flight->kind,flight->id,type);LOGD("Projectile shadow blast suppressed token %u source %u",flight->token,flight->from);}return true;}
         uint8_t kind = ON_SPOT;
         uint16_t id = 0;
         if(flight){kind=flight->kind;id=flight->id;}
@@ -445,6 +481,7 @@ bool __cdecl HookAddExplosion(CEntity* victim, CEntity* creator, int type, CVect
         // Original simulator may now hold only a mirror of the thrower.
         Writer w(proto::G_EXPLOSION);
         if(++g_blastSequence==0)++g_blastSequence;w.U32(g_blastSequence);
+        diagnosticSequence=g_blastSequence;diagnosticProjectile=flight?flight->token:0;diagnosticKind=kind;diagnosticId=id;
         w.U8(kind);
         WriteSource(w,kind,id,true,flight?flight->creatorGeneration:0);
         w.U8((uint8_t)type);
@@ -453,19 +490,24 @@ bool __cdecl HookAddExplosion(CEntity* victim, CEntity* creator, int type, CVect
         w.U8(sound);
         w.F32(shake);
         w.U8(visible);w.U32(flight?flight->token:0);
+        passenger_trace::Publication diagnosticPublication(0,0,0,0);if(flight::Enabled()){passenger_trace::publication.context.msg=proto::G_EXPLOSION;CombatNumbers(passenger_trace::publication,g_blastSequence,flight?flight->token:0,kind,id,type);}
         Net().Send(proto::CH_RELIABLE, w);LOGD("Explosion authority token %u creator %04X peer %u",flight?flight->token:0,id,Net().MyId());
     }
-    return g_origAddExplosion(victim, creator, type, pos, lifetime, sound, shake, visible);
+    const bool nativeResult=g_origAddExplosion(victim,creator,type,pos,lifetime,sound,shake,visible);
+    if(diagnosticSequence)CombatRecord(LocalCombatContext(proto::G_EXPLOSION),811,nativeResult?CD_NATIVE_TRUE:CD_NATIVE_FALSE,diagnosticSequence,diagnosticProjectile,diagnosticKind,diagnosticId,type,nullptr,-1,nativeResult?1:0);
+    return nativeResult;
 }
 
-struct PendingBlast {uint8_t from,kind;uint16_t id;int type;CVector pos;uint32_t lifetime;uint8_t sound;float shake;uint8_t visible;uint64_t received;uint32_t projectile=0;std::vector<EntityRef> refs;};
+struct PendingBlast {uint8_t from,kind;uint16_t id;int type;CVector pos;uint32_t lifetime;uint8_t sound;float shake;uint8_t visible;uint64_t received;uint32_t projectile=0;std::vector<EntityRef> refs;flight::Context diagnostic{};uint32_t diagnosticWorld=0,sequence=0;};
 std::deque<PendingBlast> g_pendingBlasts;
 void ReplayBlast(const PendingBlast&b){
     // A missing/deleted thrower cannot suppress damage to locally owned entities.
     // Null is an ordinary native world explosion, with the same origin and type.
     RetireProjectile(b.from,b.projectile);
     auto*creator=SourceValid(b.kind,b.id,b.refs)?Resolve(b.kind,b.id):nullptr;
-    g_settingOff=true;g_origAddExplosion(nullptr,creator,b.type,b.pos,b.lifetime,b.sound,b.shake,b.visible);g_settingOff=false;
+    if(!creator&&b.kind!=ON_SPOT)CombatRecord(b.diagnostic,809,CD_SOURCE_UNAVAILABLE,b.sequence,b.projectile,b.kind,b.id,b.type,&b.refs);
+    g_settingOff=true;const bool nativeResult=g_origAddExplosion(nullptr,creator,b.type,b.pos,b.lifetime,b.sound,b.shake,b.visible);g_settingOff=false;
+    CombatRecord(b.diagnostic,811,!CombatContextCurrent(b.diagnostic,b.diagnosticWorld)?CD_CONTEXT_UNAVAILABLE:nativeResult?CD_NATIVE_TRUE:CD_NATIVE_FALSE,b.sequence,b.projectile,b.kind,b.id,b.type,&b.refs,-1,nativeResult?1:0);
     LOGD("Explosion replay from %u creator %04X wait %llu",b.from,b.id,(unsigned long long)(NowMs()-b.received));
 }
 void HandleExplosion(uint8_t from, Reader& r) {
@@ -478,12 +520,16 @@ void HandleExplosion(uint8_t from, Reader& r) {
     uint8_t sound = r.U8();
     float shake = r.F32();
     uint8_t visible = r.U8();uint32_t projectile=r.U32();
-    if (!r.Ok() || from>=3 || !core::IsPlayerReady() || !IsBlast(type) || kind>ON_PLAYER ||
-        lifetime>600000 || sound>1 || visible>1 || std::fabs(shake)>100 || !g_explosionsSeen[from].Accept(sequence)) return;
-    PendingBlast blast{from,kind,id,type,{p.x,p.y,p.z},lifetime,sound,shake,visible,NowMs(),projectile,Net().EntityContext()};
+    const auto diagnostic=CombatContext(from,proto::G_EXPLOSION);
+    auto reject=[&](uint16_t reason){CombatRecord(diagnostic,810,reason,sequence,projectile,kind,id,type);};
+    if(!r.Ok()){reject(CD_MALFORMED);return;}if(from>=3){reject(CD_SENDER);return;}if(!core::IsPlayerReady()){reject(CD_NOT_READY);return;}
+    if(!IsBlast(type)||kind>ON_PLAYER||lifetime>600000||sound>1||visible>1||std::fabs(shake)>100){reject(CD_RANGE);return;}
+    if(!g_explosionsSeen[from].Accept(sequence)){reject(CD_DUPLICATE);return;}
+    PendingBlast blast{from,kind,id,type,{p.x,p.y,p.z},lifetime,sound,shake,visible,NowMs(),projectile,Net().EntityContext(),diagnostic,Net().WorldEpoch(),sequence};
+    CombatRecord(diagnostic,809,CD_DECODED,sequence,projectile,kind,id,type,&blast.refs);
     if(kind!=ON_SPOT&&!Resolve(kind,id)){
-        if(g_pendingBlasts.size()>=64){ReplayBlast(g_pendingBlasts.front());g_pendingBlasts.pop_front();}
-        g_pendingBlasts.push_back(blast);
+        if(g_pendingBlasts.size()>=64){const auto&b=g_pendingBlasts.front();CombatRecord(b.diagnostic,810,CD_CAPACITY,b.sequence,b.projectile,b.kind,b.id,b.type,&b.refs);ReplayBlast(b);g_pendingBlasts.pop_front();}
+        g_pendingBlasts.push_back(blast);CombatRecord(diagnostic,809,CD_WAIT_CREATOR,sequence,projectile,kind,id,type,&blast.refs);
     }else ReplayBlast(blast);
 }
 
@@ -542,7 +588,7 @@ bool __cdecl HookAddProjectile(CEntity* creator, int weapon, CVector pos, float 
     uint32_t before = ActiveProjectiles();
     bool ok = g_origAddProjectile(creator, weapon, pos, force, dir, target);
     CPhysical* obj = ok && shared && Thrown(weapon) ? NewProjectile(before) : nullptr;
-    if (!obj) return ok;
+    if (!obj){if(shared&&Thrown(weapon))CombatRecord(LocalCombatContext(proto::G_PROJECTILE),811,ok?CD_NO_OBJECT:CD_NATIVE_FALSE,0,0,ON_SPOT,0,weapon,nullptr,-1,ok?1:0);return ok;}
     uint8_t kind = ON_SPOT, targetKind = ON_SPOT;
     uint16_t id = 0, targetId = 0;
     if (!Describe(creator, kind, id)) kind = ON_SPOT, id = 0;
@@ -559,10 +605,12 @@ bool __cdecl HookAddProjectile(CEntity* creator, int weapon, CVector pos, float 
     w.U8(targetKind);
     WriteSource(w,targetKind,targetId,true);
     w.U32((uint32_t)NowMs());
-    for(auto i=g_flights.begin();i!=g_flights.end();)i=i->object==obj?g_flights.erase(i):std::next(i);
+    for(auto i=g_flights.begin();i!=g_flights.end();)if(i->object==obj){CombatRecord(i->diagnostic,810,CD_REPLACED,i->token,i->token,i->kind,i->id,i->weapon);i=g_flights.erase(i);}else ++i;
     g_flights.push_back({obj,creator,kind,id,true,g_blastSequence,NowMs(),at,GetObjectRef((CObject*)obj),Net().MyId(),Net().EntityGeneration(SourceKind(kind),id)});
-    g_flights.back().weapon=weapon;
-    while(g_flights.size()>64)g_flights.pop_front();
+    g_flights.back().weapon=weapon;g_flights.back().diagnostic=LocalCombatContext(proto::G_PROJECTILE);g_flights.back().diagnosticWorld=Net().WorldEpoch();
+    CombatRecord(g_flights.back().diagnostic,811,CD_NATIVE_TRUE,g_blastSequence,g_blastSequence,kind,id,weapon,nullptr,g_flights.back().handle,1);
+    while(g_flights.size()>64){const auto&old=g_flights.front();CombatRecord(old.diagnostic,810,CD_CAPACITY,old.token,old.token,old.kind,old.id,old.weapon);g_flights.pop_front();}
+    passenger_trace::Publication diagnosticPublication(0,0,0,0);if(flight::Enabled()){passenger_trace::publication.context.msg=proto::G_PROJECTILE;CombatNumbers(passenger_trace::publication,g_blastSequence,g_blastSequence,kind,id,weapon);}
     Net().Send(proto::CH_RELIABLE, w);
     return ok;
 }
@@ -570,6 +618,7 @@ bool __cdecl HookAddProjectile(CEntity* creator, int weapon, CVector pos, float 
 struct PendingProjectile {
     uint8_t from=0,kind=0,targetKind=0;uint16_t id=0,targetId=0;
     uint32_t sequence=0,tick=0;int weapon=0;float force=0;CVector pos,speed;uint64_t received=0;std::vector<EntityRef> refs;
+    flight::Context diagnostic{};uint32_t diagnosticWorld=0;mutable uint8_t diagnosticWait=0;
 };
 std::deque<PendingProjectile> g_pendingProjectiles;
 void RemoveFlightCopy(Flight&f){
@@ -580,24 +629,24 @@ void RemoveFlightCopy(Flight&f){
 }
 void RetireProjectile(uint8_t from,uint32_t token){
     if(!token)return;
-    for(auto i=g_pendingProjectiles.begin();i!=g_pendingProjectiles.end();)i=i->from==from&&i->sequence==token?g_pendingProjectiles.erase(i):std::next(i);
-    for(auto i=g_flights.begin();i!=g_flights.end();)if(i->from==from&&i->token==token){RemoveFlightCopy(*i);i=g_flights.erase(i);}else ++i;
+    for(auto i=g_pendingProjectiles.begin();i!=g_pendingProjectiles.end();)if(i->from==from&&i->sequence==token){CombatRecord(i->diagnostic,810,CD_RETIRED,i->sequence,i->sequence,i->kind,i->id,i->weapon,&i->refs);i=g_pendingProjectiles.erase(i);}else ++i;
+    for(auto i=g_flights.begin();i!=g_flights.end();)if(i->from==from&&i->token==token){CombatRecord(i->diagnostic,810,CD_RETIRED,i->token,i->token,i->kind,i->id,i->weapon);RemoveFlightCopy(*i);i=g_flights.erase(i);}else ++i;
 }
 void ClearReplicaProjectiles(uint8_t from){
-    for(auto i=g_flights.begin();i!=g_flights.end();)if(i->from==from&&!i->authority){RemoveFlightCopy(*i);i=g_flights.erase(i);}else ++i;
+    for(auto i=g_flights.begin();i!=g_flights.end();)if(i->from==from&&!i->authority){CombatRecord(i->diagnostic,810,CD_CANCELLED,i->token,i->token,i->kind,i->id,i->weapon);RemoveFlightCopy(*i);i=g_flights.erase(i);}else ++i;
 }
 bool FlightEnded(uint8_t from,uint32_t token);
 bool ReplayProjectile(const PendingProjectile&p){
-    if(FlightEnded(p.from,p.sequence))return true;
+    if(FlightEnded(p.from,p.sequence)){CombatRecord(p.diagnostic,810,CD_RETIRED,p.sequence,p.sequence,p.kind,p.id,p.weapon,&p.refs);return true;}
     auto*creator=SourceValid(p.kind,p.id,p.refs)?Resolve(p.kind,p.id):nullptr;
     if(p.kind==ON_SPOT){auto*rp=Players::Instance().Get(p.from);creator=rp?rp->ped:nullptr;}
-    if(!creator)return false;
+    if(!creator){if(!(p.diagnosticWait&1)){CombatRecord(p.diagnostic,809,CD_WAIT_CREATOR,p.sequence,p.sequence,p.kind,p.id,p.weapon,&p.refs);p.diagnosticWait|=1;}return false;}
     auto*target=p.targetKind==ON_PLAYER&&p.targetId==Net().MyId()?(CEntity*)FindPlayerPed(0):p.targetKind==ON_SPOT?nullptr:SourceValid(p.targetKind,p.targetId,p.refs)?Resolve(p.targetKind,p.targetId):nullptr;
-    if(p.targetKind!=ON_SPOT&&!target&&NowMs()-p.received<300)return false;
+    if(p.targetKind!=ON_SPOT&&!target&&NowMs()-p.received<300){if(!(p.diagnosticWait&2)){CombatRecord(p.diagnostic,809,CD_WAIT_TARGET,p.sequence,p.sequence,p.targetKind,p.targetId,p.weapon,&p.refs);p.diagnosticWait|=2;}return false;}
     auto at=p.pos,speed=p.speed,dir=speed.Normalized();
     uint32_t before=ActiveProjectiles();g_throwing=true;
     bool ok=g_origAddProjectile(creator,p.weapon,at,p.force,&dir,target);g_throwing=false;
-    auto*obj=ok?NewProjectile(before):nullptr;if(!obj)return true;
+    auto*obj=ok?NewProjectile(before):nullptr;if(!obj){CombatRecord(p.diagnostic,811,!CombatContextCurrent(p.diagnostic,p.diagnosticWorld)?CD_CONTEXT_UNAVAILABLE:ok?CD_NO_OBJECT:CD_NATIVE_FALSE,p.sequence,p.sequence,p.kind,p.id,p.weapon,&p.refs,-1,ok?1:0);return true;}
     // Keep the fuse age. Do not launch an old grenade with a new full lifetime.
     const auto*sourcePeer=Net().Peer(p.from);
     uint64_t estimatedTransit=(Net().Rtt()+(sourcePeer?sourcePeer->ping:0))/2;
@@ -615,20 +664,25 @@ bool ReplayProjectile(const PendingProjectile&p){
         uint32_t gameNow=Ref<uint32_t>(0xB7CB84);int32_t left=(int32_t)(expires-gameNow);
         if(left>0)expires=gameNow+(uint32_t)std::max(1,left-(int)age);
     }
-    for(auto i=g_flights.begin();i!=g_flights.end();)i=i->object==obj?g_flights.erase(i):std::next(i);
+    for(auto i=g_flights.begin();i!=g_flights.end();)if(i->object==obj){CombatRecord(i->diagnostic,810,CD_REPLACED,i->token,i->token,i->kind,i->id,i->weapon);i=g_flights.erase(i);}else ++i;
     g_flights.push_back({obj,creator,p.kind,p.id,false,p.sequence,NowMs(),at,GetObjectRef((CObject*)obj),p.from});
-    g_flights.back().weapon=p.weapon;
-    while(g_flights.size()>64)g_flights.pop_front();
+    g_flights.back().weapon=p.weapon;g_flights.back().diagnostic=p.diagnostic;g_flights.back().diagnosticWorld=p.diagnosticWorld;
+    CombatRecord(p.diagnostic,811,!CombatContextCurrent(p.diagnostic,p.diagnosticWorld)?CD_CONTEXT_UNAVAILABLE:CD_NATIVE_TRUE,p.sequence,p.sequence,p.kind,p.id,p.weapon,&p.refs,g_flights.back().handle,1);
+    while(g_flights.size()>64){const auto&old=g_flights.front();CombatRecord(old.diagnostic,810,CD_CAPACITY,old.token,old.token,old.kind,old.id,old.weapon);g_flights.pop_front();}
     LOGI("Projectile replay from %u token %u wait %u creator %04X",p.from,p.sequence,age,p.id);
     return true;
 }
 void HandleProjectile(uint8_t from, Reader&r){
     PendingProjectile p;p.from=from;p.sequence=r.U32();p.kind=r.U8();p.id=r.U16();p.weapon=r.U8();p.force=r.F32();
     auto v=r.Vec(),speed=r.Vec();p.pos={v.x,v.y,v.z};p.speed={speed.x,speed.y,speed.z};p.targetKind=r.U8();p.targetId=r.U16();p.tick=r.U32();p.received=NowMs();p.refs=Net().EntityContext();
-    if(!r.Ok()||from>=3||!core::IsPlayerReady()||!Thrown(p.weapon)||p.kind>ON_PLAYER||p.targetKind>ON_PLAYER||
-       std::fabs(p.force)>100||p.speed.Length()>150||!g_projectilesSeen[from].Accept(p.sequence))return;
+    p.diagnostic=CombatContext(from,proto::G_PROJECTILE);p.diagnosticWorld=Net().WorldEpoch();
+    auto reject=[&](uint16_t reason){CombatRecord(p.diagnostic,810,reason,p.sequence,p.sequence,p.kind,p.id,p.weapon,&p.refs);};
+    if(!r.Ok()){reject(CD_MALFORMED);return;}if(from>=3){reject(CD_SENDER);return;}if(!core::IsPlayerReady()){reject(CD_NOT_READY);return;}
+    if(!Thrown(p.weapon)||p.kind>ON_PLAYER||p.targetKind>ON_PLAYER||std::fabs(p.force)>100||p.speed.Length()>150){reject(CD_RANGE);return;}
+    if(!g_projectilesSeen[from].Accept(p.sequence)){reject(CD_DUPLICATE);return;}
+    CombatRecord(p.diagnostic,809,CD_DECODED,p.sequence,p.sequence,p.kind,p.id,p.weapon,&p.refs);
     if(!ReplayProjectile(p)){
-        if(g_pendingProjectiles.size()>=64)g_pendingProjectiles.pop_front();
+        if(g_pendingProjectiles.size()>=64){const auto&old=g_pendingProjectiles.front();CombatRecord(old.diagnostic,810,CD_CAPACITY,old.sequence,old.sequence,old.kind,old.id,old.weapon,&old.refs);g_pendingProjectiles.pop_front();}
         g_pendingProjectiles.push_back(p);LOGD("Projectile queued dependency from %u token %u creator %04X",from,p.sequence,p.id);
     }
 }
@@ -643,7 +697,7 @@ void RetryCombat(){
         if(Resolve(i->kind,i->id)||NowMs()-i->received>=300){ReplayBlast(*i);i=g_pendingBlasts.erase(i);}else ++i;
     }
     for(auto i=g_pendingProjectiles.begin();i!=g_pendingProjectiles.end();){
-        if(NowMs()-i->received>1500){LOGD("Projectile dependency expired token %u",i->sequence);i=g_pendingProjectiles.erase(i);}
+        if(NowMs()-i->received>1500){CombatRecord(i->diagnostic,810,CD_EXPIRED,i->sequence,i->sequence,i->kind,i->id,i->weapon,&i->refs);LOGD("Projectile dependency expired token %u",i->sequence);i=g_pendingProjectiles.erase(i);}
         else if(ReplayProjectile(*i))i=g_pendingProjectiles.erase(i);else ++i;
     }
     // A creator reference can legitimately become null while its grenade is
@@ -654,7 +708,7 @@ void RetryCombat(){
     for(auto i=g_flights.begin();i!=g_flights.end();){
         bool active=false;
         for(int n=0;n<32;++n)if(Ref<CPhysical*>(kProjectiles+n*4)==i->object&&Ref<uint8_t>(kProjectileInfos+n*0x24+0x10)&&i->handle>=0&&GetObject(i->handle)==i->object)active=true;
-        if(!active||(i->weapon!=39&&NowMs()-i->created>30000)){if(i->authority)SendFlightGone(*i);i=g_flights.erase(i);}else {i->lastPos=i->object->GetPosition();++i;}
+        if(!active||(i->weapon!=39&&NowMs()-i->created>30000)){CombatRecord(i->diagnostic,810,CD_EXPIRED,i->token,i->token,i->kind,i->id,i->weapon);if(i->authority)SendFlightGone(*i);i=g_flights.erase(i);}else {i->lastPos=i->object->GetPosition();++i;}
     }
 }
 
@@ -664,16 +718,18 @@ void RetryCombat(){
 bool Guided(int weapon){return weapon==19||weapon==20||weapon==58;}
 using FlightKey=std::pair<uint8_t,uint32_t>;
 struct FlightPose{uint32_t time=0;CVector pos,speed;Quat rot;};
-struct FlightCopy{SnapshotBuffer<FlightPose>poses;uint64_t received=0;uint8_t targetKind=255;uint16_t target=0;};
+struct FlightCopy{SnapshotBuffer<FlightPose>poses;uint64_t received=0;uint8_t targetKind=255;uint16_t target=0;flight::Context diagnostic{};uint32_t diagnosticWorld=0,diagnosticClock=0;bool diagnosticObserved=false;};
 std::map<FlightKey,FlightCopy>g_flightCopies;std::map<FlightKey,uint64_t>g_flightEnded;
 bool FlightEnded(uint8_t from,uint32_t token){return g_flightEnded.count({from,token})!=0;}
-void SendFlightGone(const Flight&f){if(!Guided(f.weapon))return;Writer w(proto::G_PROJECTILE_FLIGHT);w.U8(2);w.U32(f.token);Net().Send(proto::CH_RELIABLE,w);}
+void SendFlightGone(const Flight&f){if(!Guided(f.weapon))return;Writer w(proto::G_PROJECTILE_FLIGHT);w.U8(2);w.U32(f.token);passenger_trace::Publication diagnosticPublication(0,0,0,0);if(flight::Enabled())flight::AddUnsigned(passenger_trace::publication,flight::Metric::ProjectileId,f.token);Net().Send(proto::CH_RELIABLE,w);}
 void FlightMessage(uint8_t from,Reader&r){
-    auto op=r.U8();auto token=r.U32();if(from>=3||!token)return;FlightKey key{from,token};
-    if(op==2){if(!r.Ok())return;LOGD("Guided flight retired source=%u token=%u",from,token);g_flightEnded[key]=NowMs();g_flightCopies.erase(key);RetireProjectile(from,token);return;}
-    if(op!=1)return;FlightPose pose;pose.time=r.U32();auto p=r.Vec(),v=r.Vec();pose.pos={p.x,p.y,p.z};pose.speed={v.x,v.y,v.z};pose.rot.Read(r);auto kind=r.U8();auto target=r.U16();
-    if(!r.Ok()||g_flightEnded.count(key)||kind>ON_PLAYER||!(pose.pos.Length()<25000)||!(pose.speed.Length()<150))return;
-    auto&copy=g_flightCopies[key];if(!copy.poses.Push(pose,NowMs()))return;copy.received=NowMs();if(copy.targetKind!=kind||copy.target!=target)LOGD("Guided flight target received source=%u token=%u target=%u:%04X",from,token,kind,target);copy.targetKind=kind;copy.target=target;
+    auto op=r.U8();auto token=r.U32();const auto diagnostic=CombatContext(from,proto::G_PROJECTILE_FLIGHT);
+    if(from>=3||!token){CombatRecord(diagnostic,810,from>=3?CD_SENDER:CD_MALFORMED,token,token,ON_SPOT,0,0);return;}FlightKey key{from,token};
+    if(op==2){if(!r.Ok()){CombatRecord(diagnostic,810,CD_MALFORMED,token,token,ON_SPOT,0,0);return;}CombatRecord(diagnostic,810,CD_RETIRED,token,token,ON_SPOT,0,0);LOGD("Guided flight retired source=%u token=%u",from,token);g_flightEnded[key]=NowMs();g_flightCopies.erase(key);RetireProjectile(from,token);return;}
+    if(op!=1){CombatRecord(diagnostic,810,CD_RANGE,token,token,ON_SPOT,0,0);return;}FlightPose pose;pose.time=r.U32();auto p=r.Vec(),v=r.Vec();pose.pos={p.x,p.y,p.z};pose.speed={v.x,v.y,v.z};pose.rot.Read(r);auto kind=r.U8();auto target=r.U16();
+    if(!r.Ok()||g_flightEnded.count(key)||kind>ON_PLAYER||!(pose.pos.Length()<25000)||!(pose.speed.Length()<150)){CombatRecord(diagnostic,810,!r.Ok()?CD_MALFORMED:g_flightEnded.count(key)?CD_RETIRED:CD_RANGE,token,token,kind,target,0);return;}
+    auto&copy=g_flightCopies[key];if(!copy.poses.Push(pose,NowMs())){CombatRecord(diagnostic,810,CD_DUPLICATE,token,token,kind,target,0);return;}copy.received=NowMs();copy.diagnostic=diagnostic;copy.diagnosticWorld=Net().WorldEpoch();
+    CombatPose(diagnostic,CD_DECODED,token,pose.time,pose.pos,pose.speed,false);if(copy.targetKind!=kind||copy.target!=target)LOGD("Guided flight target received source=%u token=%u target=%u:%04X",from,token,kind,target);copy.targetKind=kind;copy.target=target;
 }
 using ProjectileUpdateFn=void(__cdecl*)();ProjectileUpdateFn originalProjectileUpdate=nullptr;
 void __cdecl ProjectileUpdate(){
@@ -696,14 +752,22 @@ void SyncFlights(){
             for(int i=0;i<32;++i)if(Ref<CPhysical*>(kProjectiles+i*4)==f.object){target=Ref<CEntity*>(kProjectileInfos+i*0x24+8);break;}
             uint8_t kind=ON_SPOT;uint16_t id=0;if(!DescribeAny(target,kind,id))kind=ON_SPOT;
             if(f.sentTargetKind!=kind||f.sentTarget!=id){LOGD("Guided flight target sent token=%u target=%u:%04X",f.token,kind,id);f.sentTargetKind=kind;f.sentTarget=id;}
-            auto p=f.object->GetPosition(),v=f.object->MoveSpeed();Writer w(proto::G_PROJECTILE_FLIGHT);w.U8(1);w.U32(f.token);w.U32((uint32_t)NowMs());w.Vec({p.x,p.y,p.z});w.Vec({v.x,v.y,v.z});
-            Quat q;if(f.object->Matrix())q=Quat::FromMatrix(*f.object->Matrix());q.Write(w);w.U8(kind);WriteSource(w,kind,id,true);Net().Send(proto::CH_STATE,w);
+            auto p=f.object->GetPosition(),v=f.object->MoveSpeed();Writer w(proto::G_PROJECTILE_FLIGHT);w.U8(1);w.U32(f.token);const auto diagnosticClock=(uint32_t)NowMs();w.U32(diagnosticClock);w.Vec({p.x,p.y,p.z});w.Vec({v.x,v.y,v.z});
+            Quat q;if(f.object->Matrix())q=Quat::FromMatrix(*f.object->Matrix());q.Write(w);w.U8(kind);WriteSource(w,kind,id,true);passenger_trace::Publication diagnosticPublication(0,0,0,0);if(flight::Enabled()){flight::AddUnsigned(passenger_trace::publication,flight::Metric::ProjectileId,f.token);flight::AddUnsigned(passenger_trace::publication,flight::Metric::StateClock,diagnosticClock);}Net().Send(proto::CH_STATE,w);
         }else if(auto i=g_flightCopies.find({f.from,f.token});i!=g_flightCopies.end()&&NowMs()-i->second.received<1500){
             auto p=i->second.poses.At(NowMs(),[](const FlightPose&a,const FlightPose&b,float t){return FlightPose{b.time,a.pos+(b.pos-a.pos)*t,a.speed+(b.speed-a.speed)*t,Quat::Slerp(a.rot,b.rot,t)};},[](FlightPose&p,float dt,bool stale){if(!stale)p.pos=p.pos+p.speed*(dt*50);else p.speed={};});
             SetEntityPosition(f.object,p.pos);f.object->MoveSpeed()=p.speed;if(f.object->Matrix())p.rot.ToMatrix(*f.object->Matrix());
+            auto&diagnostic=i->second;
+            if(flight::Enabled()&&(!diagnostic.diagnosticObserved||diagnostic.diagnosticClock!=p.time)){
+                diagnostic.diagnosticObserved=true;diagnostic.diagnosticClock=p.time;
+                if(!CombatContextCurrent(diagnostic.diagnostic,diagnostic.diagnosticWorld))CombatRecord(diagnostic.diagnostic,812,CD_CONTEXT_UNAVAILABLE,f.token,f.token,ON_SPOT,0,f.weapon);
+                else if(auto reason=CombatAdmissionReason(flight::AdmitNativeObservation(diagnostic.diagnostic,812,Net().MyId(),false)))CombatRecord(diagnostic.diagnostic,812,reason,f.token,f.token,ON_SPOT,0,f.weapon);
+                else if(GetObject(f.handle)!=f.object)CombatRecord(diagnostic.diagnostic,812,CD_NO_OBJECT,f.token,f.token,ON_SPOT,0,f.weapon);
+                else CombatPose(diagnostic.diagnostic,CD_STATE_INTERPOLATED,f.token,p.time,f.object->GetPosition(),f.object->MoveSpeed(),true);
+            }
         }
     }
-    for(auto i=g_flightCopies.begin();i!=g_flightCopies.end();)i=NowMs()-i->second.received>5000?g_flightCopies.erase(i):std::next(i);
+    for(auto i=g_flightCopies.begin();i!=g_flightCopies.end();)if(NowMs()-i->second.received>5000){CombatRecord(i->second.diagnostic,810,CD_EXPIRED,i->first.second,i->first.second,ON_SPOT,0,0);i=g_flightCopies.erase(i);}else ++i;
     for(auto i=g_flightEnded.begin();i!=g_flightEnded.end();)i=NowMs()-i->second>30000?g_flightEnded.erase(i):std::next(i);
 }
 
@@ -866,8 +930,8 @@ public:
     void OnSessionEnd() override { while(!g_copies.empty())PutOut(g_copies.begin()->first);Forget(); }
     void OnPeerLeave(uint8_t peer)override{
         if(peer<3){g_explosionsSeen[peer]={};g_projectilesSeen[peer]={};ClearReplicaProjectiles(peer);}
-        for(auto i=g_pendingBlasts.begin();i!=g_pendingBlasts.end();)i=i->from==peer?g_pendingBlasts.erase(i):std::next(i);
-        for(auto i=g_pendingProjectiles.begin();i!=g_pendingProjectiles.end();)i=i->from==peer?g_pendingProjectiles.erase(i):std::next(i);
+        for(auto i=g_pendingBlasts.begin();i!=g_pendingBlasts.end();)if(i->from==peer){CombatRecord(i->diagnostic,810,CD_CANCELLED,i->sequence,i->projectile,i->kind,i->id,i->type,&i->refs);i=g_pendingBlasts.erase(i);}else ++i;
+        for(auto i=g_pendingProjectiles.begin();i!=g_pendingProjectiles.end();)if(i->from==peer){CombatRecord(i->diagnostic,810,CD_CANCELLED,i->sequence,i->sequence,i->kind,i->id,i->weapon,&i->refs);i=g_pendingProjectiles.erase(i);}else ++i;
         for(auto it=g_pendingFires.begin();it!=g_pendingFires.end();)it=it->second.from==peer?g_pendingFires.erase(it):std::next(it);
         for(auto it=g_copies.begin();it!=g_copies.end();){auto id=it->first;++it;if(g_copies[id].from==peer)PutOut(id);}
     }
@@ -925,6 +989,9 @@ public:
 
 private:
     static void Forget() {
+        for(const auto&b:g_pendingBlasts)CombatRecord(b.diagnostic,810,CD_CANCELLED,b.sequence,b.projectile,b.kind,b.id,b.type,&b.refs);
+        for(const auto&p:g_pendingProjectiles)CombatRecord(p.diagnostic,810,CD_CANCELLED,p.sequence,p.sequence,p.kind,p.id,p.weapon,&p.refs);
+        for(const auto&f:g_flights)CombatRecord(f.diagnostic,810,CD_CANCELLED,f.token,f.token,f.kind,f.id,f.weapon);
         g_blastSequence=0;for(auto&w:g_explosionsSeen)w={};for(auto&w:g_projectilesSeen)w={};
         g_flightCopies.clear();g_flightEnded.clear();
         g_pendingBlasts.clear();g_pendingProjectiles.clear();g_flights.clear();
